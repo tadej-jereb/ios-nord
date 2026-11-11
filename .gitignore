@@ -1,0 +1,7 @@
+src/
+tooling/opt/
+logs/
+refs/
+*.zip
+*.img
+*.bin
