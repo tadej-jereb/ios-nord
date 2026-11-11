@@ -25,12 +25,17 @@ WCN3990 icnss 0x18800000 + WLFW carve-out + IPA, SPMI arbiter 0xc440000.
 
 - Touch supplier (FTS vs Goodix) — live i2c read only.
 - RAM ranges and the high bank — live FDT only.
-- `boot_a` header base/offset/page-size — from the stock avicii boot.img header.
 - Whether `fastboot boot` accepts an unsigned recovery on this ABL revision (fajita precedent
   says yes, verify on the unit).
 - Widevine L3, no SEP, no cellular — accepted for bring-up.
 
-## Host tasks in flight (deliverables land in this repo)
+Resolved 2026-11-11 by the stock image: boot geometry and board DTB (header v2 / page 4096 /
+kernel 0x8000 / ramdisk 0x1000000 / tags 0x100; board DTB from `dtbo.img` entry `board-id 8 0`,
+`dtsi_no 0x5141`). Shim rebuilt against the real DTB and `--verify` PASSes at 356 KiB.
+v2 is stock-accepted on this ABL, so v1 is a deliberate conservative choice, not a
+requirement — see `docs/SHIM_BOOT.md`.
+
+## Host tasks delivered (2026-11-11, all present in the repo)
 
 | Task | Output |
 |---|---|
@@ -42,7 +47,7 @@ WCN3990 icnss 0x18800000 + WLFW carve-out + IPA, SPMI arbiter 0xc440000.
 | recovery, backups, provenance | `docs/RECOVERY.md`, `tooling/4*.sh`, `docs/IMAGE_PROVENANCE.md` |
 | WLAN map | `docs/WLAN_MAP.md`, `docs/WLAN_ORDER.md` |
 | USB SMMU + FTS adapt notes | `docs/USB_SMMU.md`, `docs/FTS_TOUCH.md` |
-| stock avicii image for header values | `src/e-avicii.zip` |
+| stock avicii image for header values | `src/los21-boot.img`, `src/dtbo.img` -> `src/avicii-board.dtb` |
 
 ## Tomorrow, in order
 
@@ -51,3 +56,16 @@ WCN3990 icnss 0x18800000 + WLFW carve-out + IPA, SPMI arbiter 0xc440000.
 3. Flash LineageOS + Magisk to `boot_b`, boot it, then `tooling/40-backup-by-name.sh` + pull.
 4. `avicii/tools/dump-live.sh` and fill every `UNVERIFIED` cell in `CONSTANTS.md`.
 5. Only then the first diag shim on `boot_a`.
+## Fixed after the first consolidation pass (2026-11-11 late)
+
+- `mkadt_avicii.py` unpacked ADT props as 2-tuples; `adt.parse` yields `(name, flags, value)`.
+  `/product` now lands in the ADT (63 props) and the no-`/product` warning is gone.
+- `mkadt_avicii.py` looked for `d22ap.adt` under `avicii/build`; path is now `../../build/ipsx`
+  (and `D22AP_ADT=` overrides).
+- `mkpayload.py` only understood `LC_UNIXTHREAD`; `LC_MAIN` is now accepted too, and the
+  `__TEXT` lookup skips `__PAGEZERO`.
+- New `avicii/tools/im4p-adt.py`: unwraps the IPSW `DeviceTree.d22ap.im4p` (BER + LZFSE) into
+  the ADT and validates `/product`. Needs `/usr/bin/python3` (the `lzfse` module lives there).
+- Proven end to end with a synthetic Mach-O: `fdt-mem` -> `mkadt` -> `mkpayload` -> `build.sh`
+  -> `--verify` PASS, image 417,792 B with a 62,912 B payload ramdisk. A real XNU kernel is
+  still only obtainable from the macOS CI run.

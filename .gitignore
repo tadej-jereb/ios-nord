@@ -1,7 +1,12 @@
 src/
 tooling/opt/
 logs/
+backup/
 refs/
 *.zip
 *.img
 *.bin
+build/
+__pycache__/
+*.adt
+*.dtb
