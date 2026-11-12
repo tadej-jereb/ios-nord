@@ -2,7 +2,7 @@ file            : /home/tadej/ios-nord/avicii/shim/out-diag/bisect-1/shim-boot.i
 magic           : b'ANDROID!' OK
 kernel_size     : 0x5257c (337276)
 kernel_addr     : 0x8000 (32768)
-ramdisk_size    : 0x62 (98)
+ramdisk_size    : 0x60 (96)
 ramdisk_addr    : 0x1000000 (16777216)
 second_size     : 0x0 (0)
 second_addr     : 0x0 (0)
@@ -15,14 +15,14 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : e7e8c561480497d84a085367264a31d8efd43e92000000000000000000000000
+id (sha1)       : 0fd526be969702b59d19a69322dcb498ea3d2f60000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
 ramdisk load adr: 0x1000000
 tags addr       : 0x100
 kernel section  : page 1 offset 0x1000 size 337276
-ramdisk section : offset 0x54000 size 98
+ramdisk section : offset 0x54000 size 96
 total needed    : 348160 bytes; file has 100663296
 avb footer      : present, original_image_size 22523495694991360, sections end 348160
 gzip ok         : 128 bytes decompressed, crc ok, tail 337226 bytes at 0x32

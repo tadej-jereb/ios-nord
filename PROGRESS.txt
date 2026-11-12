@@ -142,3 +142,13 @@ NEXT STEPS, IN ORDER
 3. Push a known-executable tiny Linux Image through our packer: if it runs, the packer is
    exonerated and the shim is at fault; if not, the packer still is.
 4. Then the diag ladder (docs/DIAG.md), then the XNU payload from CI, then the root.
+
+CONTROL TIMING (measured 2026-11-12 ~20:58, adb server killed before each run)
+-----------------------------------------------------------------------------
+  untouched stock boot.img   -> adb present after 16093 ms
+  Magisk backup (boot_b)     -> adb present after 22820 ms (includes 2 s flash)
+  any image of ours          -> back in fastboot after ~6000 ms, no adb at all
+
+A refusal is therefore 2.5x faster than the earliest userspace contact of a healthy
+kernel: ABL gives up before it would even have handed over. Use 6000 ms vs >16000 ms
+as the pass/fail discriminator in every later test.

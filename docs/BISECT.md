@@ -1,8 +1,8 @@
 # BISECT: the early-boot crash (shim dies before its first line of C)
 
 Scope: `avicii/shim` only. No flashing, no `adb`, no `fastboot` here — every image below
-is built, `mkbootimg_v1.sh --verify`-PASSed and sha256-recorded on the host, and the
-parent flashes. Written 2026-11-12 after the bisect result that a `for(;;) wfe` diag body
+is built, `mkbootimg_v1.sh --verify`-PASSed (except the 1u control, see §5) and
+sha256-recorded on the host, and the parent flashes. Written 2026-11-12 after the bisect result that a `for(;;) wfe` diag body
 **still** dies before it parks.
 
 Trust the bisect result: the fault is upstream of `diag.c`. The panel has never shown a
@@ -19,15 +19,23 @@ thing that kills a rung.
   whether the screen changed at all; both go in the report.
 * A fail is information, not a setback. **Stop at the first failing rung** — every later
   rung re-tests the same broken layer plus more, which only blurs it.
-* Order is fixed: **1u, 1**, 1b, 2, 3, 4, 5. `boot_a` only; `boot_b` untouched.
+* Order is fixed: **1u, 1**, 1b, **p1, p2, p3**, 2, 3, 4, 5. `boot_a` only; `boot_b`
+  untouched. The `p` rungs come third because the device evidence (§1) says the packaging
+  is the first thing to settle; the code-layer rungs (2-5) are pointless until an image
+  parks at all.
 * 1u is rung 1 with the AVB footer cut off and is the only rung whose `--verify` FAILs
   on purpose. 1u then 1 is one variable: the footer.
+* Every fail is reported with the sha256 of the exact image that failed (`out-diag/SHA256SUMS.bisect`)
+  and the seconds to fastboot. A rebuild does not reproduce a sha256, so name the file.
 
 ## 1. Facts the search is restricted to
 
 | fact | source |
 |---|---|
 | a diag body of nothing but `for(;;) wfe` still dies ~6 s in, before the park | bisect result (trusted) |
+| **the death is a constant ~6 s whatever the image does** — even a body that deliberately self-resets after a 30 s counter spin dies at 6 s, i.e. the CPU never reaches the code and the 6 s is a host-side refusal/timeout, not a shim crash | `PROGRESS.txt:36-43` |
+| an **untouched stock `boot.img` boots** (18 s to the ABL's next stage), while the **same stock kernel re-packed by our packer does not** → the slot, the partition, the flash path and the ABL hand-off all work; what differs is *our packaging* | `PROGRESS.txt:46-58` |
+| header v1 vs v2 and the cmdline change nothing on our images; an AVB footer alone is not sufficient | `PROGRESS.txt:48-50` |
 | the stock boot image carries an **unsigned AVB hash footer** (`AVBf`, algorithm NONE) and `mkbootimg_v1.sh` now pads to the 96 MiB partition and appends one; until 2026-11-12 20:40 it did not, so **every image that has crashed so far had no footer** | `avicii/tools/mkbootimg_v1.sh` (`add_hash_footer --algorithm NONE`), `out-diag/bisect-1u` vs `bisect-1` |
 | the AVB footer is big-endian (`original_image_size` = BE u64 at footer offset 12); the `--verify` code reads that field little-endian and so always compares a huge number (harmless, but say `'>Q'` if that check is ever tightened) | observed footer bytes of any built image |
 | no console text ever, no ring line ever → console and UFS log are unproven | every image so far |
@@ -44,16 +52,35 @@ watchdog, so it is an immediate trap/handoff failure, not a slow timeout.
 ## 2. Ranked hypotheses, with the code evidence for each
 
 Ranked by how well they explain "nothing printed, nothing logged, dead in 6 s, at the
-very first instructions, regardless of body". Each names the rung that kills it.
+very first instructions, regardless of body". The device evidence in §1 forces the order:
+because an image that *is* executed (the stock one) boots and our packaging of the same
+stock kernel does not, the whole "packaging and hand-off" class sits above every
+image-internal layer. Each hypothesis names the rung that kills it.
 
-**H0 — the image never gets executed because it has no AVB footer.** ABL validates
+**H0a — our packaging is refused before any of our code runs, and the AVB footer is the
+known instance of that.** ABL validates
 boot images by the AVB footer at the end of the partition; `fastboot` accepts a footer-less
 image happily, and then the bootloader declines to run it. Every crashing image so far
 was built before the footer was added to the packer, i.e. it was ~350 KB in a 96 MiB
 partition with nothing at the tail. This explains all four observations exactly: nothing
 prints, nothing logs, the failure is body-independent, and it is quicker than any
 watchdog. Rung **1u** (rung 1 with the footer cut off) is the deliberate reproduction and
-**N1** (identical code, footer present) the single-variable swap.
+**N1** (identical code, footer present) the single-variable swap. Note the parent's
+result that a footer alone is *not* sufficient (`PROGRESS.txt:50`) — H0a is a necessary
+piece, not the whole answer, which is exactly why 1u/1 are run before anything else.
+
+**H0b — the gzip carriage.** Our kernel section is a gzip member; the stock section is a
+raw `Image` and boots. If ABL hands the *compressed* bytes to the entry, the first
+instruction is `0x1f 0x8b ...` and nothing ever prints. Rung **P1** (rung 1 with the
+identical `Image`, raw instead of gzipped, DTB tail kept).
+
+**H0c — the v1 carriage itself: `tags_addr` 0x100 and the appended DTB.** Stock is v2
+with `dtb_size 0`; ours is v1 with a 337 KB tree appended to the kernel section.
+Rung **P2** (v2, raw `Image`, no dtb section — the stock shape at shim size).
+
+**H0d — the kernel section size.** The stock section is 43,876,368 B and the ABL may size
+something (a gunzip buffer, a memcpy, a copy-to-fit) from `kernel_size`. Rung **P3** (P2
+with the section zero-padded to exactly the stock length).
 
 **H1 — the first instruction never runs: the handoff traps (EL, MMU state, entry
 address, decompression).** Nothing exists to print with: a synchronous exception at
@@ -79,8 +106,8 @@ with byte-identical code (N1b's tail is a 64 KiB prefix with a patched totalsize
 proves the stream is a valid single-member gzip with an FDT right after it, but nothing
 proves avicii's ABL gunzips a v1 section at all. Evidence: the stock image needs no
 gunzip (raw `Image`), so this path has never been exercised on this device. N1 catches it
-(a 128-byte image executing gzip bytes traps at once). Control image: the same rung
-packed raw.
+(a 128-byte image executing gzip bytes traps at once). The clean control is **P1**, the
+same `Image` delivered raw; H0b is its packaging-side twin and P1 serves both.
 
 **H4 — the prologue itself: stack or BSS clear over live code.** `_stack_top` is
 `_bss_end + 0x8000` and the clear runs 0x7d10..0x3d000 (**176,880 B** of 8-byte stores)
@@ -155,33 +182,56 @@ table is stale by that rebuild.
 
 ## 5. The series
 
-All rungs build clean, pass `mkbootimg_v1.sh --verify` and were executed to a park at
-EL1 under QEMU before being handed over (§7). Everything lands in
-`out-diag/bisect-N/shim-boot.img`, hashes in `out-diag/SHA256SUMS.bisect`.
-`./bisect.sh` rebuilds the whole series; `./bisect.sh -s "1 2"` a subset.
+All rungs build clean and every rung **except 1u** passes `mkbootimg_v1.sh --verify`
+(1u is the footer-less control and fails exactly that one check on purpose). All ten
+were executed to a park at EL1 under QEMU before handover (§7). Everything lands in
+`out-diag/bisect-N/shim-boot.img`, hashes in `out-diag/SHA256SUMS.bisect`;
+`./bisect.sh` rebuilds the series, `./bisect.sh -s "1 2"` a subset.
+
+Parking images are padded to the 96 MiB partition and carry the AVB footer, so each file
+is 96 MiB (1u excepted) — that is expected, not a mistake. `avbtool` salts the vbmeta it
+hashes, so **a rebuild does not reproduce a sha256**: the value below names this exact
+artifact only.
 
 | rung | isolates | file | size | sha256 |
 |---|---|---|---|---|
-| **N1** | header + `b` + `wfe`, MMU off, no stack, no vectors, no BSS, no C | `bisect-1/shim-boot.img` | 348160 | `bb1e14e017b99894b5454fc8fc4d374440067f8a36140c301627520cea5e3f2c` |
-| **N1b** | N1 with a 64 KiB DTB tail instead of 337 KB — same image, only the append differs | `bisect-1b/shim-boot.img` | 77824 | `f555674931f8477ed4fd6234682d13ac179e780a2e356273b2bdf915fd9ecb43` |
-| **N2** | N1 + the real prologue: vectors, `vbar_el1`, BSS clear, stack — parks before C | `bisect-2/shim-boot.img` | 348160 | `3021745a17b222fe71e968ab4ec695d65ffee90331b99e9ec9c57d9557165c75` |
-| **N3** | N2 + MMU on, identity map over the image only, no fb block, no console | `bisect-3/shim-boot.img` | 348160 | `22498140af84be8b4b2238c4330284cb516fe63862ec9c1e420abeae4e4d4f79` |
-| **N4** | N3 + the splash block mapped NC (never touched), no console | `bisect-4/shim-boot.img` | 348160 | `10f0c33cd3ab63db6e8b71c3f98d5ec5cd93cbe93c7d5582f98a252678d2992b` |
-| **N5** | N4 + `con_clear(MAGENTA)` over the whole panel, then park | `bisect-5/shim-boot.img` | 352256 | `af1e9ca525173b3d1a71f8f61b82ea7959366c832a0887547f769900719fd724` |
+| **1u** | **control**: N1 with the AVB footer truncated back off — the shape of every previously crashing image. `--verify` FAILs on the footer by design | `bisect-1u/shim-boot.img` | 348160 | `67dc5468a9d9c74291fd1dc71ae29589238b53c4683b8f161205062f3a5816d7` |
+| **N1** | same code as 1u + footer + partition padding: header, `b`, `wfe`. MMU off, no stack, no vectors, no BSS, no C | `bisect-1/shim-boot.img` | 100663296 | `b7cf2d250d49808115767982c530172b3175c562e6b5055dd8372d930fe89fda` |
+| **N1b** | N1 with a 64 KiB DTB tail instead of 337 KB — same image, only the append differs | `bisect-1b/shim-boot.img` | 100663296 | `6f5c690228db2fbaade52ab5b91f3de40f2433182af3b31d08544c240779368b` |
+| **P1** | N1's exact `Image` (sha256 `cc83c139…`) delivered **raw** instead of gzipped, DTB tail kept, header v1 | `bisect-p1/shim-boot.img` | 100663296 | `857b589aca59aa4329002cd6aafe58444fccb93c81036631aabd5601d7f79aad` |
+| **P2** | P1 without the DTB tail and as **header v2** — the stock shape (raw `Image`, `dtb_size` 0) at shim size | `bisect-p2/shim-boot.img` | 100663296 | `6821c6e49f2f5e963be3c00eb159ed6a62126ffdb1379744ca796bb46e85c884` |
+| **P3** | P2 with the kernel section zero-padded to the stock 43,876,368 B | `bisect-p3/shim-boot.img` | 100663296 | `02cf807c5e395dc0486beda8a13f680853c258135dfcacfdee414915c54a5ed0` |
+| **N2** | N1 + the real prologue: vectors, `vbar_el1`, BSS clear, stack — parks before C | `bisect-2/shim-boot.img` | 100663296 | `b49a27d5baf63655115c36999b5bf30476962623cffadcbea9f2ce2ab2ed8b78` |
+| **N3** | N2 + MMU on, identity map over the image only, no fb block, no console | `bisect-3/shim-boot.img` | 100663296 | `e0b0e04b78d81f7f9235783ce82aafeee7a943c8441fcdc6ef91c5d5cfe1a580` |
+| **N4** | N3 + the splash block mapped NC (never touched), no console | `bisect-4/shim-boot.img` | 100663296 | `c420b4c205fb36d733fabac17c82d939db6ec4666a0e2924b85bf36c5efa27b4` |
+| **N5** | N4 + `con_clear(MAGENTA)` over the whole panel, then park | `bisect-5/shim-boot.img` | 100663296 | `4ff2973623fb15b77fd3d8db160687977a3a980bcbac0c778e236bffbb9ff5f9` |
 
-Every rung is expected to **park** (pass = off USB ≥ 90 s). Screen expectations are
-*not* pass criteria for N1-N4 — the panel is what N5 alone tests.
+P1-P3 carry the **same `Image` bytes as N1** (`cc83c139046157da3051d2463bf48ff5dbb0b08c2363f307d744211f52903a37`)
+and differ only in the container, so a pass/fail difference between them is packaging and
+nothing else. P2 and P3 print a `WARN` for header v2 — expected, they are the stock shape.
+
+Every rung is expected to **park** (pass = off USB ≥ 90 s), including 1u. Screen
+expectations are *not* pass criteria for N1-N4 — the panel is what N5 alone tests.
 
 | rung | pass | fail signature | if it fails: the next image |
 |---|---|---|---|
+| 1u | parks, screen unchanged — and reproduces the historical crash | back in fastboot ≤ 10 s, i.e. the pre-20:40 behaviour | **N1**, same code, footer restored. 1u dies and N1 passes → the missing AVB footer was the whole fault (H0a): stop here and rebuild every candidate with `mkbootimg_v1.sh` as it is now. 1u **parks** → the footer was never the problem, continue to N1 |
 | N1 | parks, screen unchanged | back in fastboot ≤ 10 s | **N1b**, byte-identical image, only the append changes (`bisect.sh`, `head -c 65536` → the full `$DTB`). N1b passes and N1 fails → the 337 KB tail at `tags_addr` is the killer (H2): next control is N1 with `text_offset` 0x80000 + `kernel_addr` 0 (`../tools/mkbootimg_v1.sh`), so the entry lands beyond the tags window |
-| N1b | parks as N1 | as N1 | N1 and N1b both fail → the tail is irrelevant and the handoff is (H1/H3). Next control: N1 packed **raw** (no gzip, `ARMd` at 0x38, `kernel_addr` 0x8000) to separate "ABL does not gunzip" from "the entry never runs" |
+| N1b | parks as N1 | as N1 | N1 and N1b both fail → the 337 KB tail is not the variable. Next image: **P1**, the same `Image` delivered raw — that separates "ABL does not gunzip" (H0b) from "the entry never runs" (H1) |
+| P1 | parks | back in fastboot ≤ 10 s while N1 passed | the gzip carriage (H0b). Next image: **P2**, which drops gzip and the DTB and switches to v2 in one step; if P2 also fails, bisect gzip vs v2 by building P1 with `--hdr 2` (`bisect.sh`, the `--hdr 2` argument) |
+| P2 | parks | back in fastboot ≤ 10 s while P1 passed | the v1/DTB carriage (H0c). Next image: **P3**, same shape with the stock kernel length — if P3 parks, the section size (H0d) is the lever and the packer must always pad to the stock length |
+| P3 | parks | back in fastboot ≤ 10 s while P2 passed | the section size (H0d): pad to the stock length unconditionally in `build.sh`/`bisect.sh` (`STOCK_KERNEL_SIZE`) and re-run the ladder from 1u |
 | N2 | parks, screen unchanged | back in fastboot ≤ 10 s while N1 passed | the prologue (H4). Next image: N2 with the BSS clear removed — delete the three lines `adr x1, _bss_start` / `adr x2, _bss_end` / the `1:`..`b 1b` loop in `start.S` |
 | N3 | parks, screen unchanged | back in fastboot ≤ 10 s while N2 passed | the table content (H5). Next image: `#define DEV_FLAGS` in `mmu.c` without `D_PXN \| D_UXN` — if that parks, the block attributes, not the walk, were wrong |
 | N4 | parks, screen unchanged | back in fastboot ≤ 10 s while N3 passed | the fb mapping (H6). Next image: the `l2[fb_block >> BLK_SHIFT]` line with `DEV_FLAGS` instead of `NC_FLAGS`, mapping the block but not as Normal non-cacheable |
 | N5 | parks **and the panel turns magenta** | back in fastboot ≤ 10 s, or a park with no colour change, while N4 passed | the write pattern (H6). Next image: `con_clear` reduced to one row — `for (int y = 0; y < FB_H; y++)` → `y < 1` in `console.c` |
 
-Reading the end state: N1-N5 all pass and N5 paints → CPU, prologue, MMU and console are
+Reading the end state: 1u parks → a footer alone is not the fix (expected, the parent already
+showed that) and the ladder proceeds on its own merits. A rung passes and the *next* one
+dies → the layer between them is the fault and the table above names the single line to
+change.
+
+N1-N5 all pass and N5 paints → CPU, prologue, MMU and console are
 all sound and the fault is in the layer the ladder skipped (UFS/`dlog_init`, then the
 FDT walkers): go to `out-diag/ro1` (stage 1, DIAG_LOG=0, writes nothing) and only then
 `stage-1`. N5 parks with no colour → the console path is the fault and the ring must
@@ -202,25 +252,26 @@ DTB=/home/tadej/ios-nord/src/avicii-board.dtb ./bisect.sh
 ```
 
 ```sh
-DTB=/home/tadej/ios-nord/src/avicii-board.dtb ./bisect.sh -s "1 1b"
+DTB=/home/tadej/ios-nord/src/avicii-board.dtb ./bisect.sh -s "1u 1"
 ```
 
-Each rung prints `PASS`, writes `out-diag/bisect-N/shim-boot.img` and appends its sha256
-to `out-diag/SHA256SUMS.bisect`. `bisect/` is only built by `bisect.sh`; the normal
+Each rung prints `PASS` (1u prints its expected footer FAIL instead), writes
+`out-diag/bisect-N/shim-boot.img` and appends its sha256 to
+`out-diag/SHA256SUMS.bisect`. `bisect/` is only built by `bisect.sh`; the normal
 `./build.sh` / `./build-diag.sh` are unaffected.
 
 ## 7. What the host-side execution proves, and what it does not
 
 Each rung was run before handover: raw `Image`, `-M virt,virtualization=off` (without it
 QEMU enters at EL2, `msr sctlr_el1` is inert and nothing is exercised), `-cpu cortex-a76`,
-`-m 4G`, `-d int`, 4 s each.
+`-m 4G`, `-d int`, 5 s each.
 
 ```
 qemu-system-aarch64 -M virt,virtualization=off -cpu cortex-a76 -m 4G -nographic \
-    -kernel out-diag/bisect-N/Image -d int -D /tmp/e.log
+    -kernel out-diag/bisect-N/Image -d int -D /tmp/e.log   # the raw Image, not the boot.img
 ```
 
-Result: all six rungs park at EL1 with **zero exceptions**, at a load address QEMU picks
+Result: all seven rungs park at EL1 with **zero exceptions**, at a load address QEMU picks
 itself (0x40200000) — i.e. at a base that is neither 0 nor 0x8000. An instrumented build
 (`bisect/dbg.c`, same recipe) confirmed `img_lo` = 0x40200000, `SCTLR_EL1.M` set, one L3
 table, and that `con_clear` really writes magenta (0xffff00ff at 0xa0000000 and

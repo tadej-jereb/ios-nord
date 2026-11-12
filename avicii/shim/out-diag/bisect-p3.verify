@@ -1,0 +1,31 @@
+file            : /home/tadej/ios-nord/avicii/shim/out-diag/bisect-p3/shim-boot.img (100663296 bytes)
+magic           : b'ANDROID!' OK
+kernel_size     : 0x29d8010 (43876368)
+kernel_addr     : 0x8000 (32768)
+ramdisk_size    : 0x63 (99)
+ramdisk_addr    : 0x1000000 (16777216)
+second_size     : 0x0 (0)
+second_addr     : 0x0 (0)
+tags_addr       : 0x100 (256)
+page_size       : 0x1000 (4096)
+header_version  : 0x2 (2)
+os_version_raw  : 0x22000236 (570425910)
+recovery_dtbo_size: 0x0 (0)
+recovery_dtbo_offset: 0x0 (0)
+header_size     : 0x67c (1660)
+name            : b''
+cmdline         : b'console=null'
+id (sha1)       : 3cf106dd51a62848f7b034bccc51cb822b1290c9000000000000000000000000
+extra_cmdline   : b''
+os version      : 17.0.0 patch 2035-06
+kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
+ramdisk load adr: 0x1000000
+tags addr       : 0x100
+kernel section  : page 1 offset 0x1000 size 43876368
+ramdisk section : offset 0x29da000 size 99
+total needed    : 43888640 bytes; file has 100663296
+avb footer      : present, original_image_size 49712227816570880, sections end 43888640
+kernel section : raw aarch64 Image (stock v2 style, no appended DTB)
+
+WARN: header_version 2 (stock avicii ships v2 and boots it; v1 Image.gz-dtb is what this port packs)
+PASS (geometry matches; stock-style v2 image, not a packed v1 one)

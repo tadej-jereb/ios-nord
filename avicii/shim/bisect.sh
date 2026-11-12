@@ -25,7 +25,10 @@ cd "$here"
 
 DTB=${DTB:-$repo/src/avicii-board.dtb}
 OUTDIR=${OUTDIR:-$here/out-diag}
-STAGES="1u 1 1b 2 3 4 5"
+STAGES="1u 1 1b p1 p2 p3 2 3 4 5"
+
+# Stock kernel section length, from the stock boot.img in docs/SHIM_BOOT.md (43,876,368 B).
+STOCK_KERNEL_SIZE=43876368
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -68,12 +71,15 @@ build_one() {
 	local out=$OUTDIR/bisect-$name
 	mkdir -p "$out"
 	echo "=== rung $name"
-	local srcs=() objs=() ld="" dtb="$DTB" defs=() ABS64=""
+	local srcs=() objs=() ld="" dtb="$DTB" defs=() ABS64="" raw="" pad="" hdr=${HDR:-1}
 	while [ $# -gt 0 ]; do
 		case $1 in
 		--ld) ld=$2; shift 2 ;;
 		--no-dtb) dtb=""; shift ;;
 		--short-dtb) dtb="$OUTDIR/short.dtb"; shift ;;
+		--raw) raw=1; shift ;;			# kernel section = raw Image, no gzip
+		--pad-kernel) pad=$STOCK_KERNEL_SIZE; shift ;;	# zero-pad to the stock kernel length
+		--hdr) hdr=$2; shift 2 ;;
 		--abs64-check) ABS64=1; shift ;;
 		-D*) defs+=("$1"); shift ;;
 		*) srcs+=("$1"); shift ;;
@@ -99,11 +105,13 @@ build_one() {
 	local size_hex; size_hex=$($NM "$out/shim.elf" | awk '$3=="_end"{print $1}')
 	[ -n "$size_hex" ] || { echo "error: no _end in rung $name" >&2; return 1; }
 	truncate -s "$((0x$size_hex))" "$out/Image"
-	gzip -9 -n -c "$out/Image" > "$out/Image.gz"
-	if [ -n "$dtb" ]; then cat "$out/Image.gz" "$dtb" > "$out/Image.gz-dtb"
-	else cp "$out/Image.gz" "$out/Image.gz-dtb"; fi
+	if [ -n "$raw" ]; then cp "$out/Image" "$out/section"
+	else gzip -9 -n -c "$out/Image" > "$out/section"; fi
+	[ -z "$pad" ] || truncate -s "$pad" "$out/section"
+	if [ -n "$dtb" ]; then cat "$out/section" "$dtb" > "$out/section+tail"
+	else cp "$out/section" "$out/section+tail"; fi
 	(cd "$out" && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
-	../tools/mkbootimg_v1.sh --kernel "$out/Image.gz-dtb" --ramdisk "$out/ramdisk.bin" \
+	HDR=$hdr ../tools/mkbootimg_v1.sh --kernel "$out/section+tail" --ramdisk "$out/ramdisk.bin" \
 		--os_version 17.0.0 --os_patch_level 2035-06 \
 		--cmdline "console=null" -o "$out/shim-boot.img" > "$out.pack" 2>&1 || {
 			echo "--- pack FAILED, tail of $out.pack:" >&2; tail -8 "$out.pack" >&2; return 1; }
@@ -143,6 +151,10 @@ for s in $STAGES; do
 	1)  build_one 1 --ld bisect/n1.ld bisect/n1.S ;;
 	1b) build_one 1b --ld bisect/n1.ld --short-dtb bisect/n1.S ;;
 	2)  build_one 2 --ld shim.ld start.S bisect/stubs.S -DPARK_AFTER_ENTRY ;;
+	# p1-p3: same N1 code, only the carriage differs. See docs/BISECT.md §5.
+	p1) build_one p1 --ld bisect/n1.ld --raw bisect/n1.S ;;
+	p2) build_one p2 --ld bisect/n1.ld --raw --no-dtb --hdr 2 bisect/n1.S ;;
+	p3) build_one p3 --ld bisect/n1.ld --raw --no-dtb --pad-kernel --hdr 2 bisect/n1.S ;;
 	3)  build_one 3 --ld shim.ld --abs64-check start.S bisect/stubs.S bisect/park.c mmu.c -DBISECT_N=3 -DBISECT_NO_FB ;;
 	4)  build_one 4 --ld shim.ld --abs64-check start.S bisect/stubs.S bisect/park.c mmu.c -DBISECT_N=4 ;;
 	5)  build_one 5 --ld shim.ld --abs64-check start.S bisect/stubs.S bisect/park.c mmu.c console.c -DBISECT_N=5 ;;
@@ -156,5 +168,5 @@ tac "$sums" | awk '!seen[$2]++' | tac > "$sums.tmp" && mv "$sums.tmp" "$sums"
 
 echo
 echo "images under $OUTDIR (bisect-<n>/shim-boot.img), sha256 in $sums"
-echo "order: 1u (control, no footer), 1, 1b, 2, 3, 4, 5 - every rung must park in wfe."
+echo "order: 1u (control), 1, 1b, p1, p2, p3, 2, 3, 4, 5."
 [ "$fails" = 0 ] || { echo "$fails rung(s) failed" >&2; exit 1; }
