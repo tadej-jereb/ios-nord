@@ -221,7 +221,8 @@ grep -qw rw /proc/mounts || true
 findmnt -no OPTIONS --target "$mnt" | grep -q '^rw\|,rw' || die "$mnt is not read-write"
 
 # --- volume state / space --------------------------------------------------
-entries=$(find "$mnt" -mindepth 1 -maxdepth 1 -not -name '.HFS+ Private Data' | wc -l)
+entries=$(find "$mnt" -mindepth 1 -maxdepth 1 \
+	-not -name '.HFS+ Private Data' -not -name 'lost+found' | wc -l)
 if [[ -s $state ]]; then
 	cur=$(sha256sum "$img" | cut -d' ' -f1)
 	# The recorded sha is from before fsck; an fsck pass can change it, so a

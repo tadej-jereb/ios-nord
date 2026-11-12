@@ -267,6 +267,13 @@ uint32_t ufs_part_find(const char *name, uint64_t *first_out, uint64_t *last_out
 				break;
 			}
 		}
+		/* then the entry name must end where ours does ("userdata" must
+		 * not match a "userdata2") */
+		int nl = 0;
+		while (name[nl])
+			nl++;
+		if (match && e[56 + 2 * nl])
+			match = 0;
 		if (!match)
 			continue;
 		*first_out = first;

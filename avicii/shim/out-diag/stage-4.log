@@ -1,10 +1,10 @@
-diag.c:185:12: warning: unused function 'dstrncmp' [-Wunused-function]
-  185 | static int dstrncmp(const char *a, const char *b, unsigned n)
+diag.c:187:12: warning: unused function 'dstrncmp' [-Wunused-function]
+  187 | static int dstrncmp(const char *a, const char *b, unsigned n)
       |            ^~~~~~~~
 1 warning generated.
 file            : /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/shim-boot.img (360448 bytes)
 magic           : b'ANDROID!' OK
-kernel_size     : 0x55f29 (352041)
+kernel_size     : 0x55f55 (352085)
 kernel_addr     : 0x8000 (32768)
 ramdisk_size    : 0x63 (99)
 ramdisk_addr    : 0x1000000 (16777216)
@@ -19,20 +19,20 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : 9c5db8fbfe99e0be2a78309527855bee996423df000000000000000000000000
+id (sha1)       : 5c7009a98d73ef06239d9acc83d787bbaaabeba6000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
 ramdisk load adr: 0x1000000
 tags addr       : 0x100
-kernel section  : page 1 offset 0x1000 size 352041
+kernel section  : page 1 offset 0x1000 size 352085
 ramdisk section : offset 0x57000 size 99
 total needed    : 360448 bytes; file has 360448
-gzip ok         : 311296 bytes decompressed, crc ok, tail 337226 bytes at 0x39df
+gzip ok         : 311296 bytes decompressed, crc ok, tail 337226 bytes at 0x3a0b
 board dtb       : totalsize 337226
 
 PASS: header v1, stock avicii geometry, gzip+DTB kernel
--rwxrwxr-x 1 tadej tadej 311296 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/Image
--rw-rw-r-- 1 tadej tadej 352041 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/Image.gz-dtb
--rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/shim-boot.img
+-rwxrwxr-x 1 tadej tadej 311296 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/Image
+-rw-rw-r-- 1 tadej tadej 352085 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/shim-boot.img
 flash: fastboot boot /home/tadej/ios-nord/avicii/shim/out-diag/stage-4/shim-boot.img   (or flash boot_a once the layout is confirmed)

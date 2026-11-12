@@ -177,8 +177,20 @@ D3 painted, ms=...
 D3 no MDP/DSI writes: ABL scan-out still showing
 ```
 
-Good: the whole screen turns magenta with the text on it; `ms` is the fill time
-(a hang inside the fill leaves the marker plus half a screen).
+Good: the whole screen turns magenta with the text on it. The lines printed
+before the fill (`begin`, `base`, `size`, `region matches`) are erased by it -
+that is the point of the rung - so on screen you will only see the two lines
+after it; the ring keeps all of them:
+
+```
+D3 painted, ms=...
+D3 no MDP/DSI writes: ABL scan-out still showing
+D4 psci cpu_on 0x100-0x700 begin
+...
+```
+
+`ms` is the fill time (roughly 100-400 ms; a hang inside the fill leaves the
+marker in the ring and a half-painted screen).
 
 Bad: `no cont_splash_region in live fdt` or `region != 0xa0000000/0x2300000, no
 paint` - the live tree disagrees with the dump, the rung refuses to paint and

@@ -217,3 +217,16 @@ before userspace exists. So: **flash, do not boot.**
   working slot.
 - `boot_a` holds the stock OOS kernel, backed up as `backup/64f70df8/boot_a.img`
   (md5 `e7be3c9267685382386daa17a9e820b0`), so slot a is also restorable to OOS boot.
+## A fallback to fastboot is not a rejection
+
+Corrected 2026-11-12 after reading the code path: a payload-less shim reaches
+`reset(40)` (`avicii/shim/shim.c:164`) and issues `PSCI_SYSTEM_RESET` 20 s after the
+banner. ABL therefore lands back in fastboot *because the shim asked it to*, not
+because it refused the image. Rules that follow:
+
+- Judge a shim run by what the **panel** shows in the first seconds, never by the
+  later fastboot prompt.
+- Test images must idle (or carry a real payload); a bare `reset()` writes a false
+  negative.
+- TWRP failing the same way is unexplained and independent — treat it as "TWRP is not
+  a usable log host on this firmware", not as evidence against self-built images.

@@ -185,7 +185,7 @@ ADAPT = {
     "0062-sweet-touch-power-battery.patch": [
         ('#define RH_RSC_PA       0x18220000u', '#define RH_RSC_PA       0x18200000u', 1),
         ('#define RH_TCS_PA       0x18220d00u', '#define RH_TCS_PA       0x18200d00u', 1),
-        ('#define RH_DICT_PA      0x0c3f000c',
+        ('#define RH_DICT_PA      0x0c3f000cu',
          '#define RH_DICT_PA      0x80860000u /* live FDT qcom,cmd-db */', 1),
         ('sweet_rpmh_vreg_enable("ldoc11", 3200)', 'sweet_rpmh_vreg_enable("ldo13", 3008)', 1),
         ('Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.',

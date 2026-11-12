@@ -12,6 +12,22 @@ preparation, reference harvest and the dump/backup tooling that runs the moment 
   a bootable LineageOS + Magisk as fallback and as the dump/log host.
 - iOS root: the existing `userdata` partition, HFS+ case-sensitive journaled, no GPT change.
 
+## Root image: everything unprivileged is done (2026-11-12)
+
+The 16 GiB volume `build/ios16-root.img` is fsck-clean, HFSX, journaled and empty;
+its baseline sha256 is recorded in `build/ios16-root.img.sha256.pre-populate`.
+Filling it is now a single root command, `tooling/33-populate-root.sh`.
+
+- `tooling/32-build-apfsfuse.sh` builds apfs-fuse from a pinned commit into
+  `tooling/opt/apfs-fuse` - unprivileged, re-runnable, verified with `--check`
+  (mount + unmount of a real DMG, no loop device, no root).
+- `tooling/33-populate-root.sh --dry-run` reaches the loop mount and stops:
+  144 341 files / 11.30 GB measured through the DMG mounts, 68.5 % of the volume.
+- Verified: apfs-fuse build and all three DMG mounts, image header/fsck/sha gate,
+  `00-check-host.sh` exit 0, `31-mkiosroot.sh --phase-image` unaffected.
+- Unverified: the `sudo` half (modprobe, loop mount, rsync, links, tweaks, fsck)
+  - no sudo password on the build host. Transcript: `docs/ROOTFS_READY.md`.
+
 ## Proven on paper (cited in `avicii/CONSTANTS.md`)
 
 SoC 0x190/0x1b8, MPIDR split, GIC 0x17a00000/0x17a60000 (same as sweet), timer virtual INTID 19

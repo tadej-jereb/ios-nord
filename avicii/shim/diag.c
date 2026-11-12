@@ -113,6 +113,7 @@ static void hex8(char *out, uint32_t v)
 		out[i] = d[v & 15];
 		v >>= 4;
 	}
+	out[8] = 0;
 }
 
 static unsigned append(char *dst, unsigned n, const char *s)
@@ -160,7 +161,8 @@ static void rung(int n, const char *name)
 	char label[3] = { 'D', (char)('0' + n), 0 };
 	char text[64];
 	unsigned k = append(text, 0, name);
-	append(text, k, " begin");
+	k = append(text, k, " begin");
+	text[k] = 0;
 	say('B', label, text);
 }
 
@@ -359,6 +361,7 @@ static void stage4(void)
 		hex8(b, (uint32_t)(uint64_t)r);
 		for (int k = 0; k < 8; k++)
 			t[n++] = b[k];
+		t[n] = 0;
 		if (!r)
 			on++;
 		say(r ? 'X' : 'K', "D4", t);
@@ -492,19 +495,20 @@ static void stage5(uintptr_t fdt)
 			say('X', "D5", "extent below MIN_MEM_SIZE");
 			bad++;
 		}
-		for (unsigned c = 0; c < MT_N_CARVEOUTS; c++) {
-			if (!overlaps(&m, co[c].base, co[c].size))
-				continue;
-			if (co[c].tag == 's')
-				/* reserved-memory carves out of /memory, so the
-				 * splash sitting inside dram is the done thing */
-				say('K', "D5", "splash carve inside dram, expected");
-			else {
-				char w[40] = "extent overlaps ";
-				append(w, 16, co_name(co[c].tag));
-				say('X', "D5", w);
-				bad++;
-			}
+	}
+	/* carve-outs are a set question, not a per-extent one */
+	for (unsigned c = 0; c < MT_N_CARVEOUTS; c++) {
+		if (!overlaps(&m, co[c].base, co[c].size))
+			continue;
+		if (co[c].tag == 's')
+			/* reserved-memory carves out of /memory, so the splash
+			 * sitting inside dram is the done thing */
+			say('K', "D5", "splash carve inside dram, expected");
+		else {
+			char w[40] = "extent overlaps ";
+			append(w, 16, co_name(co[c].tag));
+			say('X', "D5", w);
+			bad++;
 		}
 	}
 	con_hex2("D5 total", "hi=", (uint32_t)(total >> 32), "lo=", (uint32_t)total);

@@ -129,7 +129,7 @@
 +#define RH_RSC_PA       0x18200000u
 +#define RH_TCS_PA       0x18200d00u
 +#define RH_TCS_SIZE     0x3000u
-+#define RH_DICT_PA      0x80860000u /* live FDT qcom,cmd-db */u
++#define RH_DICT_PA      0x80860000u /* live FDT qcom,cmd-db */
 +#define RH_DRV          2u
 +#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
 +#define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */

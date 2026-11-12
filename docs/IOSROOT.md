@@ -17,14 +17,14 @@ Everything below is a literal command, in order. Steps 0–8 need no device.
 
 | # | Stage | State |
 |---|-------|-------|
-| 0 | host check | **verified** (`tooling/00-check-host.sh`; exit 1 today for `apfs-fuse` and the unloaded `hfsplus` module, `fastboot` present in `tooling/opt/platform-tools`) |
+| 0 | host check | **verified** (`tooling/00-check-host.sh` now exits 0: `apfs-fuse` built in `tooling/opt/apfs-fuse`, `hfsplus` loaded, `fastboot` in `tooling/opt/platform-tools`) |
 | 1 | IPSW member enumeration (range requests) | **verified** (91 members listed from the pinned IPSW) |
 | 2 | BuildManifest identity → member mapping | **verified** (`OS`, `Cryptex1,SystemOS`, `Cryptex1,AppOS`) |
 | 3 | member fetch + size/CRC verify | **verified** — all 4 members fetched (5,830,956,212 B over the wire) and CRC-32-matched against the IPSW's own central directory, and again by an independent checker |
 | 4 | sparse volume + `mkfs.hfsplus` (HFSX, journaled) | **verified** at 1 GiB and at the real 16 GiB size from the real payload; `fsck.hfsplus -n` clean, header `HX`, 114 MiB on disk of 16 GiB |
-| 5 | `apfs-fuse` mounts (three DMGs) | **unverified** — binary not installed on this host |
-| 6 | HFS+ loop mount + `rsync` populate | **unverified** — needs root + the `hfsplus` module loaded |
-| 7 | dyld cache / cryptex links / log dirs / keybag | **unverified** — same reason (logic is a 1:1 port of upstream) |
+| 5 | `apfs-fuse` mounts (three DMGs) | **verified** — built by `tooling/32-build-apfsfuse.sh`, all three DMGs mounted unprivileged with no loop device, `root/` readable |
+| 6 | HFS+ loop mount + `rsync` populate | **scripted, not run** — `tooling/33-populate-root.sh`, one command, see `docs/ROOTFS_READY.md` |
+| 7 | dyld cache / cryptex links / log dirs / keybag | **scripted, not run** — stages of `tooling/33-populate-root.sh` with a hard-link probe and copy fallback |
 | 8 | `fsck.hfsplus -fy` + re-check | **verified** on empty volumes (fy exit 0, following `-n` clean); unverified with real content |
 | 9 | raw → Android sparse `.simg` | **verified**, byte-identical round trip (`sparse.py decode` + `compare`) |
 | 10 | `fastboot flash userdata` + first boot | **unverified** — no phone |
@@ -40,17 +40,19 @@ sudo tooling/00-host-deps.sh
 ```
 
 `apfs-fuse` is the one thing no distro packages (noble has none; verified: no
-`apt-cache policy` entry, no search hit). Build it once:
+`apt-cache policy` entry, no search hit). It is already built into
+`tooling/opt/apfs-fuse` by the unprivileged, pinned script - no root, no system
+install. Re-run it or verify the binary with:
 
 ```
-git clone https://github.com/sgan81/apfs-fuse ~/apfs-fuse
-cd ~/apfs-fuse
-git submodule update --init
-cmake -B build
-cmake --build build -j 32
-sudo cmake --install build
-sudo modprobe hfsplus
+tooling/32-build-apfsfuse.sh --rebuild
+tooling/32-build-apfsfuse.sh --check
 ```
+
+The populate half below is one script now: `tooling/33-populate-root.sh`, with a
+`--dry-run` that needs no root. The current, ordered transcript with the size
+budget and the verification lines is `docs/ROOTFS_READY.md`; the sections below
+remain the explanation of what each stage does.
 
 `fastboot` lives in `tooling/opt/platform-tools`; job scripts get it from
 `PATH` when you source `tooling/env.sh` first:
