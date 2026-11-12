@@ -125,8 +125,10 @@ fi
 # --os_version / --os_patch_level are not passed here: mkbootimg_v1.sh appends
 # the stock values (12.0.0 / 2023-09) itself, because serial-boot ABL refuses a
 # boot image with os_version 0 and the stock tuple is the one known accepted.
-../tools/mkbootimg_v1.sh --kernel "$OUT/Image.gz-dtb" --ramdisk "$OUT/ramdisk.bin" \
-	--cmdline "${CMDLINE:-console=null}" -o "$OUT/shim-boot.img"
+# Stock shape: header v2, raw Image as the kernel section, board DTB as its own
+# section (the packer supplies --dtb/--dtb_offset and the stock os_version).
+../tools/mkbootimg_v1.sh --header_version 2 --kernel "$OUT/Image" --ramdisk "$OUT/ramdisk.bin" \
+	--cmdline "${CMDLINE:-$(cat /tmp/stock_cmdline.txt 2>/dev/null || echo console=null)}" -o "$OUT/shim-boot.img"
 
 # Host render of the console layout (x86 gcc, host_test only).
 if command -v gcc >/dev/null; then

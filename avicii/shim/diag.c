@@ -175,8 +175,14 @@ static void rung(int n, const char *name)
 
 static void park(void)
 {
-	say('-', "END", "all rungs done; hold power ~10 s to reset");
+	/* wall-clock guard: a parked image must not need the power button */
+	uint64_t deadline = ticks() + (60ULL * (freq ? freq : 19200));
+	say('-', "END", "park 60 s, then self-reset");
 	say('-', "END", "log: tooling/42-log-pull.sh, docs/DIAG.md");
+	while (ticks() < deadline)
+		__asm__ volatile("wfe");
+	say('-', "END", "60 s park over: PSCI reset");
+	__asm__ volatile("mov x0, #0\n\tldr x1, =0x84000009\n\tsmc #0" ::: "x0", "x1");
 	for (;;)
 		__asm__ volatile("wfe");
 }

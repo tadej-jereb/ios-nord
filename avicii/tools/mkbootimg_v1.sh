@@ -190,14 +190,16 @@ PART_SIZE=${PART_SIZE:-100663296}
 # 0x1c000185, which decodes to Android 14.0.0 / patch 2024-05 (imm26-style packing:
 # major<<25 | minor<<18 | patch<<11 | (year-2000)<<4 | month). OS_VERSION below is a
 # floor, not the stock tuple - docs/HYBRID.md packs stock's exact bytes.
-OS_VERSION=${OS_VERSION:-12.0.0}
-OS_PATCH_LEVEL=${OS_PATCH_LEVEL:-2023-09}
+OS_VERSION=${OS_VERSION:-14.0.0}
+OS_VERSION_RAW=${OS_VERSION_RAW:-0x1c000185}
+DTB_FILE=${DTB_FILE:-/home/tadej/ios-nord/src/avicii-board.dtb}
+OS_PATCH_LEVEL=${OS_PATCH_LEVEL:-2024-05}
 "$PYTHON" "$MKBOOTIMG_PY" --header_version "$HDR" \
 	--kernel "$KERNEL" --ramdisk "$RAMDISK" \
 	--base "$BASE" --kernel_offset "$KERNEL_OFFSET" \
 	--ramdisk_offset "$RAMDISK_OFFSET" --second_offset "$SECOND_OFFSET" \
 	--tags_offset "$TAGS_OFFSET" --pagesize "$PAGESIZE" \
-	"${EXTRA[@]}" --os_version "$OS_VERSION" --os_patch_level "$OS_PATCH_LEVEL" -o "$OUT"
+	--dtb "$DTB_FILE" --dtb_offset 0x1f00000 "${EXTRA[@]}" --os_version "$OS_VERSION" --os_patch_level "$OS_PATCH_LEVEL" -o "$OUT"
 
 # Pad the sections to the partition and append the AVB footer, then verify.
 AVBTOOL="${AVBTOOL:-$(dirname "$0")/avbtool.py}"
