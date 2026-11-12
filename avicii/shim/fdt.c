@@ -82,3 +82,102 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 		}
 	}
 }
+
+static uint32_t be32_at(uintptr_t a, uintptr_t end, int *ok)
+{
+	if (a + 4 > end) {
+		*ok = 0;
+		return 0;
+	}
+	return be32(a);
+}
+
+/*
+ * Walk every reg entry two levels down. Node names live inside the struct
+ * block, so the callback can read them directly; they stay points into the
+ * tree, which is fine for the duration of the call.
+ */
+int fdt_reg_walk(uintptr_t fdt, fdt_reg_cb cb, void *ctx)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return -1;
+	uintptr_t end = fdt + be32(fdt + 4);		/* totalsize */
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	int depth = 0, ac = 2, sc = 1, seen = 0, ok = 1;
+	char parent[64], node[64] = "";
+
+	if (!be32(fdt + 4) || be32(fdt + 4) < 256)
+		return -1;
+
+	while (ok) {
+		if (p + 4 > end)
+			break;
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			uintptr_t start = p;
+			p = align4(skip_str(p));
+			if (p > end)
+				return seen;
+			if (depth == 1 || depth == 2) {
+				char *dst = depth == 1 ? parent : node;
+				int i = 0;
+				for (; i < (int)sizeof(parent) - 1 && *(volatile char *)(start + i); i++)
+					dst[i] = *(volatile char *)(start + i);
+				dst[i] = 0;
+			}
+			depth++;
+			break;
+		}
+		case FDT_END_NODE:
+			depth--;
+			if (!depth)
+				return seen;
+			break;
+		case FDT_PROP: {
+			if (p + 8 > end)
+				return seen;
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			const char *pn = (const char *)(strings + nameoff);
+			p = align4(val + len);
+			if (p > end)
+				return seen;
+			if (depth == 1 && pn[0] == '#') {
+				uint32_t v = len == 4 ? be32(val) : 0;
+				if (streq(pn, "#address-cells") && v && v <= 2)
+					ac = (int)v;
+				if (streq(pn, "#size-cells") && v <= 2)
+					sc = (int)v;
+				break;
+			}
+			if (depth != 2 || streq(pn, "reg") == 0)
+				break;
+			unsigned cells = (unsigned)(ac + sc) * 4;
+			if (!cells || len < cells || len % cells)
+				break;
+			for (uint32_t o = 0; o + cells <= len; o += cells) {
+				uint64_t base = 0, size = 0;
+				int good = 1;
+				for (int i = 0; i < ac; i++)
+					base = base << 32 | be32_at(val + o + (uint64_t)i * 4, end, &good);
+				for (int i = 0; i < sc; i++)
+					size = size << 32 | be32_at(val + o + (uint64_t)(ac + i) * 4, end, &good);
+				if (!good)
+					break;
+				seen++;
+				if (!cb(ctx, parent, node, base, size))
+					return seen;
+			}
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return seen;
+		}
+	}
+	return seen;
+}

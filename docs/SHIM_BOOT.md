@@ -183,3 +183,31 @@ Rebuild after any change to these facts:
 
     DTB=/home/tadej/ios-nord/src/avicii-board.dtb ./build.sh
     ../tools/mkbootimg_v1.sh --verify out/shim-boot.img
+
+## `fastboot boot` is unreliable on this ABL — verified 2026-11-12
+
+Four attempts, four failures, so the port does not depend on it:
+
+| Image | Result |
+|---|---|
+| `src/twrp_v2.img` (TWRP, FBEv2) | `Booting OKAY`, fell back to bootloader |
+| `src/twrp.img` (TWRP, FBEv1) | `Booting FAILED (usb_read failed)`, device vanished from USB |
+| `out/shim-boot.img` (v1, Image.gz-dtb) | `Booting OKAY`, fell back to bootloader ~20 s later |
+| `out/shim-boot-v2.img` (v2, raw Image + `--dtb`) | same: boot taken, then USB dropped, then off the bus |
+
+Neither header version helps, which rules out the v1/v2 question as the cause. The
+pattern is that ABL accepts the image (`Booting` prints) and then dies or reboots
+before userspace exists. So: **flash, do not boot.**
+
+## Slot policy (observed behaviour)
+
+- Experiments go to **`boot_a`**, then `fastboot --set-active=a` and reboot.
+- `boot_b` is the working LineageOS 21 + Magisk and is never written.
+- When an experiment fails, ABL **switches the active slot to `a` by itself** (observed
+  once) and lands in the stock recovery with "can't load Android system". Recovery is
+  therefore not evidence of a brick: check `fastboot getvar current-slot`, then
+  `fastboot --set-active=b`.
+- Always read `current-slot` before flashing anything. A stale assumption writes the
+  working slot.
+- `boot_a` holds the stock OOS kernel, backed up as `backup/64f70df8/boot_a.img`
+  (md5 `e7be3c9267685382386daa17a9e820b0`), so slot a is also restorable to OOS boot.
