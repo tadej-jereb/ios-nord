@@ -181,3 +181,16 @@ Meaning: the entry convention was the second fault. Stock's stub branches to +0x
 ABL evidently uses that shape; our own header's near branch to +0x800 never ran.
 The H/F series now walks back which element (header vs stub vs text_offset) is the culprit
 so the shim can be built natively rather than through a stock-stub transplant.
+
+MILESTONE 6 CLOSED 2026-11-12 ~21:45 — the shim runs from OUR OWN image
+-----------------------------------------------------------------------
+S6.img (our header + our stub, but stock cmdline, stock os_version, stock ramdisk and the
+real dtb section) PARKED for 94 s. h1 (stock stub transplant) parked before it. So the two
+gates were, in order: header os_version = 0 (anti-rollback), and a missing dtb section.
+The branch-target theory was wrong: stock's code0 branches to +0x2480000, not +0x92000.
+
+Packer now: v2, raw Image, --dtb + --dtb_offset 0x1f00000, os_version 14.0.0/2024-05
+(= 0x1c000185, stock-exact), AVB footer enforced, verify rejects os_version 0. park()
+self-resets after 60 s so a parked run no longer needs the power button.
+
+Next: diag stage 1 (v2s1) with the UFS ring to read the first GIC probe.
