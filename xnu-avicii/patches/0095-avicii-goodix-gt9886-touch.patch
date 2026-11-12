@@ -1,0 +1,387 @@
+Subject: avicii Goodix GT9886 touch -- GPIO quadrant windows, rail vote, flips
+From: ios-nord bring-up
+Target: bsd/dev/sweet_touch.c, bsd/dev/sweet_rpmh.c
+Base: xnu-avicii/patches after 0060-sweet-keys-touch-drivers,
+      0062-sweet-touch-power-battery, 0063-sweet-goodix-geni-packing
+      (applies with patch -p1 or git apply)
+Status: skeleton. Not built, not booted. See docs/GOODIX_GT9886.md.
+Numbers: lito-pinctrl.dtsi:2-4, pinctrl-lito.c:20-23,1339-1345,1505,
+         gcc-lito.c:542,1799-1804,1917-1933, lito-regulators.dtsi:35-49,353-366,
+         lito.dtsi:3995,3998-3999,4004,4011-4012,4026, mtp.dtsi:350-351,359-360,383.
+
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,9 +1,14 @@
+ /*
+  * SWEET SE7 FIFO I2C / GT9886 (GT885) / Focaltech 54:52 bring-up.
+  * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L13 through sweet_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9886's event status after reading a report. See touch2/report.md.
++ * Requires ABL-loaded GENI I2C firmware; votes the touch rails through
++ * sweet_rpmh.c. No firmware/config upload or direct PMIC writes. Only IC data
++ * write: zero to GT9886's event status after reading a report.
++ *
++ * avicii rails are PM8150 L13 (2.8 V, RPMH ldo13/ldoa13) and S4 (1.8 V, smpa4).
++ * The panel glass is mounted 180 deg rotated, so both axes are mirrored before
++ * the coordinates reach SweetHID. Docs: docs/GOODIX_GT9886.md and
++ * xnu-patch-notes/0095-avicii-goodix-gt9886-touch.patch.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -24,12 +29,43 @@
+ 
+ #define TOUCH_SE_PA      0x00984000u /* lito qupv3_se7 = i2c4 */
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x0f000000u /* lito TLMM: one flat window */
+-#define TOUCH_GCC_VOTE   0x52008u /* wrap1 S1 branch enable */
+-#define TOUCH_RCG       0x18140u    /* wrapper1 LOCAL S1 = global SE7 */
++/*
++ * GPIO config blocks are per quadrant (pinctrl-lito.c:20-23): 6/7/8/9 are WEST
++ * (0x500000), 90 is SOUTH (0x100000). One window each from TLMM 0x0f000000
++ * (lito-pinctrl.dtsi:2). The old flat 0x0f000000 base missed both by 0x500000.
++ */
++#define TOUCH_NORTH_PA   0x0f500000u
++#define TOUCH_SOUTH_PA   0x0f100000u
++#define TOUCH_GCC_VOTE   0x52008u /* wrap1 vote word, all branches */
++/* wrap1 m-ahb (BIT 20), s-ahb (BIT 21), S1 (BIT 23): gcc-lito.c:1917-1933,1799 */
++#define TOUCH_GCC_VOTE_MASK ((1u << 20) | (1u << 21) | (1u << 23))
++/*
++ * wrapper1 LOCAL S1 (global SE7) clock. TOUCH_RCG is cmd_rcgr (gcc-lito.c:542);
++ * CFG_RCGR sits at cmd_rcgr + 4 and holds src_sel, the HID divider and the
++ * update bit, so every CFG access below adds it explicitly. The DFS offsets
++ * keep the base's cmd_rcgr-relative values and only matter in DFS mode (lito
++ * has no DFS RCG, so that branch should be dead).
++ */
++#define TOUCH_RCG        0x18140u
++#define TOUCH_RCG_CFG    (TOUCH_RCG + 4u)
++#define TOUCH_RCG_DFS    (TOUCH_RCG + 0x14u)
++#define TOUCH_RCG_DFS0   (TOUCH_RCG + 0x1cu)
++#define TOUCH_RCG_S1_HALT 0x1813cu  /* its CBCR: gcc-lito.c:1800 */
++#define TOUCH_ADDR      0x5du
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
++#define TOUCH_PANEL_W    1080u
++#define TOUCH_PANEL_H    2400u
++/*
++ * Handedness: the touch flex sits on the opposite side of the panel glass. The
++ * FTS node for the same assembly declares st,x-flip/y-flip = <1>
++ * (mtp.dtsi:359-360) and the Goodix vendor driver is fed the same by its panel
++ * config. Mirror in panel space; SweetHID then adds the 1125x2436 presentation
++ * offset (base patch 0061).
++ */
++#define TOUCH_XFLIP      1
++#define TOUCH_YFLIP      1
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+ /* GT9886 shares the 0x5d Goodix protocol; no Yellowstone quirks. */
+@@ -72,7 +108,7 @@
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio, gpio_s;
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -121,31 +157,33 @@
+ static void
+ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
++	/* GPIO config blocks are per quadrant: 6/7/8/9 south-west, 90 south. */
++	vm_offset_t base = pin >= 90u ? st.gpio_s : st.gpio;
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(base, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(base, TOUCH_GPIO_IO(pin),
++		    (touch_rd(base, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(base, off, cfg);
+ }
+ 
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	/* Vote on only the wrapper1 AHBs and SE7, preserving other clock users. */
++	touch_wr(st.gcc, TOUCH_GCC_VOTE,
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE) | TOUCH_GCC_VOTE_MASK);
++	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG_DFS);
++	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG_CFG);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG_CFG), cfg, dfs);
+ 	if (dfs & 1u) {
+ 		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
++		cfg = touch_rd(st.gcc, TOUCH_RCG_DFS0);
+ 		if ((cfg & 0x371fu) != 1u) {
+ 			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+ 			return false;
+@@ -153,14 +191,14 @@
+ 	} else {
+ 		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+ 		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++		touch_wr(st.gcc, TOUCH_RCG_CFG, cfg);
++		touch_wr(st.gcc, TOUCH_RCG_CFG, touch_rd(st.gcc, TOUCH_RCG_CFG) | 1u);
++		if (!touch_wait_clear(st.gcc, TOUCH_RCG_CFG, 1u)) {
+ 			printf("SWEET TOUCH: RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, TOUCH_RCG_S1_HALT};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+@@ -321,7 +359,7 @@
+ touch_goodix_ack(void)
+ {
+ 	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
++	return touch_msg(TOUCH_ADDR, ack, sizeof(ack), NULL, 0, false);
+ }
+ 
+ /* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+@@ -331,7 +369,7 @@
+ touch_probe_info(uint16_t reg, uint8_t *buf)
+ {
+ 	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
++	int err = touch_read(TOUCH_ADDR, reg, true, buf, 32);
+ 	printf("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+ 	    reg, err, st.irq_last, st.irq_status);
+ 	if (!err) {
+@@ -365,6 +403,18 @@
+ 	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+ }
+ 
++/* Panel-native coordinates -> the handedness SweetHID expects. */
++static void
++touch_map(unsigned *px, unsigned *py)
++{
++	if (TOUCH_XFLIP) {
++		*px = TOUCH_PANEL_W - 1u - *px;
++	}
++	if (TOUCH_YFLIP) {
++		*py = TOUCH_PANEL_H - 1u - *py;
++	}
++}
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+@@ -389,7 +439,7 @@
+ 	uint8_t buf[90];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
++	int err = touch_read(TOUCH_ADDR, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -409,7 +459,7 @@
+ 		return EIO;
+ 	}
+ 	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
++		err = touch_read(TOUCH_ADDR, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+ 		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+ 		if (err) {
+ 			return err;
+@@ -425,10 +475,11 @@
+ 		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+ 		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+ 		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
++		    (mask & (1u << id)) || px >= TOUCH_PANEL_W || py >= TOUCH_PANEL_H) {
+ 			(void)touch_goodix_ack();
+ 			return EIO;
+ 		}
++		touch_map(&px, &py);
+ 		mask |= 1u << id;
+ 		x[id] = (int)px;
+ 		y[id] = (int)py;
+@@ -472,9 +523,10 @@
+ 		}
+ 		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
++		if (px >= TOUCH_PANEL_W || py >= TOUCH_PANEL_H) {
+ 			return EIO;
+ 		}
++		touch_map(&px, &py);
+ 		mask |= 1u << id;
+ 		x[id] = (int)px;
+ 		y[id] = (int)py;
+@@ -561,26 +613,41 @@
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.gpio_s = ml_io_map(TOUCH_SOUTH_PA, 0x5b000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
++	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L13 through RPMh\n",
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting smpa4 then ldo13\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
++	    touch_rd(st.gpio_s, TOUCH_GPIO_IO(90)));
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+ 	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
++	/*
++	 * IO rail first, then analog, both as RPMH votes: S4 is the FTS node's vdd
++	 * (mtp.dtsi:350) and L13 its avdd (mtp.dtsi:351) at 1.8 V / 3.008 V
++	 * (lito-regulators.dtsi:43-49,359-366); L13 is the Goodix vdd_2v8
++	 * (lito.dtsi:3998-3999). "ldo13" is the live-tree resource spelling,
++	 * "ldoa13" the DT one: retry the second if the cmd-db lookup misses.
++	 */
++	int power_error = sweet_rpmh_vreg_enable("smpa4", 1800);
++	if (!power_error) {
++		power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
++	}
++	if (power_error == ENODEV) {
++		power_error = sweet_rpmh_vreg_enable("ldoa13", 3008);
++	}
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L13 RPMh enable failed %d; probes skipped\n", power_error);
++		printf("SWEET TOUCH: touch rail RPMh enable failed %d; probes skipped\n",
++		    power_error);
+ 		goto out;
+ 	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
++	touch_gpio(90, 0, 0, 0, true, true); /* SOUTH pin, UNVERIFIED on avicii */
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+ 	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+ 	touch_gpio(7, 1, 0, 0, false, false);
+@@ -592,15 +659,17 @@
+ 	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+ 	st.probing = true;
+ 	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
++	printf("SWEET TOUCH: probe %#x err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
++	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
++	    st.irq_status);
+ 	(void)touch_probe_info(0x8240, legacy);
+ 	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+ 	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+ 	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+ 	    fe1, fe2, fid1, fid2, st.irq_status);
+ 	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '8' && gid[3] == '6';
++	/* "9886" is expected; accept the GT98xx family and log what came back. */
++	bool goodix = !ge && gid[0] == '9' && gid[1] == '8';
+ 	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+ 	if (st.dead || goodix == fts) {
+ 		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+@@ -608,8 +677,15 @@
+ 		goto out;
+ 	}
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9886" : "Focaltech 54:52", st.irq_hint);
++	printf("SWEET TOUCH: selected %s, %ux%u flip=%d/%d, poll=10ms irq-hint=%d\n",
++	    goodix ? "Goodix GT9886" : "Focaltech 54:52", TOUCH_PANEL_W, TOUCH_PANEL_H,
++	    TOUCH_XFLIP, TOUCH_YFLIP, st.irq_hint);
++	int probe_only = 0;
++	(void)PE_parse_boot_argn("sweettouchprobe", &probe_only, sizeof(probe_only));
++	if (probe_only) {
++		printf("SWEET TOUCH: sweettouchprobe set; ident only, no reporting\n");
++		goto out;
++	}
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -234,7 +234,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -266,7 +266,7 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	/* HPM (raw 7) is valid for a PMIC5 LDO and for an HF SMPS; enable last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+ 	const uint32_t values[3] = {mv, 7, 1};
+ 	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+@@ -320,16 +320,44 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete at %#x (rail voltage still unverified)\n",
++	    address);
+ 	return 0;
+ }
+ 
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: do not apply a rail policy to arbitrary
++	 * resources. sweet: PM6150L ldoc11 at 3200 mV (touch 2.8 V).
++	 * avicii: S4 = smpa4, fixed 1800 mV (lito-regulators.dtsi:43-49, touch IO)
++	 * and L13 = ldoa13, up to 3304000 uV (lito-regulators.dtsi:359-366, touch
++	 * 2.8 V). The live cmd-db spells the LDO "ldo13", the DT "ldoa13": accept
++	 * both, one address, same policy.
++	 */
++	if (!res) {
++		printf("SWEET RPMH: null resource\n");
++		return EINVAL;
++	}
++	if (!strcmp(res, "ldoc11")) {
++		if (mv < 2950 || mv > 3400) {
++			printf("SWEET RPMH: ldoc11 expects 2950..3400 mV\n");
++			return EINVAL;
++		}
++	} else if (!strcmp(res, "ldo13") || !strcmp(res, "ldoa13")) {
++		if (mv < 2856 || mv > 3304) {
++			printf("SWEET RPMH: %s expects 2856..3304 mV\n", res);
++			return EINVAL;
++		}
++	} else if (!strcmp(res, "smpa4")) {
++		/* Fixed 1.8 V rail; the DT has no usable range below/above it. */
++		if (mv != 1800) {
++			printf("SWEET RPMH: smpa4 is fixed, expects 1800 mV\n");
++			return EINVAL;
++		}
++	} else {
++		printf("SWEET RPMH: unknown resource %s\n", res);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {

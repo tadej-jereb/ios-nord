@@ -90,3 +90,4 @@ apply 0084-fajita-panel-console.patch
 apply 0085-fajita-sync-console.patch
 apply 0086-fajita-cpu-match.patch
 apply 0094-fajita-panic-log.patch
+apply 0095-avicii-goodix-gt9886-touch.patch

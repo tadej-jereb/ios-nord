@@ -22,10 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
 # Fallback dram only for --qemu (no live FDT there) and for a sanity cross-check
-# of what the JSON says. 0xb0000000 is above every low-bank XPU carve-out, as on
+# of what the JSON says. The fallback sits wholly inside the live low bank and below the
+# 0xa0000000 splash carve-out, so it never straddles the 0xbbb00000..0xc0000000 hole, as on
 # sweet; avicii's own numbers are whatever the live FDT reports.
-DEFAULT_PHYS_BASE = 0xb0000000
-DEFAULT_MEM_SIZE = 0x4d000000
+DEFAULT_PHYS_BASE = 0x90000000
+DEFAULT_MEM_SIZE = 0x0f000000
 # Smallest dram we believe from an FDT; below this the JSON is probably empty.
 MIN_MEM_SIZE = 0x10000000
 # Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
