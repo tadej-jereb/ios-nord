@@ -37,9 +37,7 @@ on:
       - "xnu-avicii/tools/check-hunk-counts.py"
       - ".github/workflows/xnu.yml"
 
-concurrency:
-  group: xnu-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: true
+# concurrency removed for diagnosis 2026-11-12: every dispatch was cancelled in 2 s
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
