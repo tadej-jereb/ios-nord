@@ -97,11 +97,20 @@ cluster split for the ADT is 6 little + 2 big, **not** 4+4.
 | ESD check | `reg_read` on DCS `0x0A`, expect `0x9C`, 1 byte, LP mode | | `panel.dtsi:70-75` |
 | **Panel selection conflict** | `panel.dtsi:897` marks the AMS644 active, but `mtp.dtsi:486` still sets `sde_dsi` default to `dsi_sw43404_amoled_video`, and the ST touch node's `panel` list (`mtp.dtsi:362-363`) names only sw43404 panels | the AMS644 is the avicii panel; treat sw43404 as the MTP leftover. Which panel a given retail unit actually has is a **live-only** value (§9) | `panel.dtsi:897`, `mtp.dtsi:362-363,416,486` |
 
-## 4. Touch — **supplier-dependent, unresolved**
+## 4. Touch — **RESOLVED on this unit: Goodix GT9886**
 
-avicii shipped with two different touch controllers on the same bus, same
-IRQ GPIO, same reset GPIO. Both nodes are present and both are `status = "ok"`;
-which one is populated depends on the supplier/list. **Do not hardcode one.**
+avicii shipped with two different touch controllers on the same bus, same IRQ
+GPIO, same reset GPIO. Both nodes are present in the DT and both instantiate.
+**On this device the Goodix is the bound one** — live dump 2026-11-12:
+`/sys/bus/i2c/devices/4-005d/driver -> ../../bus/i2c/drivers/Goodix-gt9886`,
+while `4-0049` has `of_node` but **no `driver` symlink**, i.e. the ST FTS client
+sits unbound. The `qcom,i2c-touch-active = "st,fts"` property is a board default,
+not what this unit runs. Port the Goodix GT9886 path; keep FTS only as fallback.
+Citation: `logs/dumps/run-20261112-195027/50-i2c-4-005d.txt`, `50-i2c-4-0049.txt`.
+
+Porting note: the base tree's `sweet_touch.c` is already a Goodix driver
+(GT9896), so the avicii delta is the chip id/`0x5D` address, the `register-is-16bit`
+flag and the `0x2002` IRQ flag cell — not a new vendor protocol.
 
 | Item | Value | Notes | Citation |
 |---|---|---|---|
@@ -191,7 +200,7 @@ healthy. All must come from `avicii/tools/dump-live.sh` output or the live FDT.
    XNU maps a phantom bank. Guess 8 GiB: adds a bank past the real top and
    panics on the first page beyond it, usually inside the pmap bootstrap with no
    message. Take it from `/proc/device-tree/memory/reg` + `/proc/iomem`.
-2. **Touch controller identity** — `0x49` (ST) vs `0x5D` (Goodix), `§4`. Wrong
+2. **Touch controller identity** — `0x5D` Goodix on this unit (resolved, `§4`). Wrong
    guess = the driver probes, gets no ACK, and the bring-up "just has no touch".
    Worse: the two use different IRQ flag cells (`0x2008` vs `0x2002`), so a
    mismatched config can leave the line latched and storm the GIC.
