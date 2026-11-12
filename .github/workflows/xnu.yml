@@ -207,3 +207,5 @@ jobs:
           path: build.log
           if-no-files-found: ignore
           retention-days: 7
+
+# registered 2026-11-12: touch to make GitHub index this workflow.
