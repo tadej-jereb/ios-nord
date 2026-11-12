@@ -453,10 +453,20 @@ static void stage4(void)
 		hexline(e, "entry=", entry);
 		say('-', "D4", e);
 	}
-	/* Only the A76 sibling 0x700: same cluster as core 0, so no cluster
-	 * power-up is involved (2026-11-12 probe). */
-	for (int i = 7; i < 8; i++) {
-		int64_t r = smc(PSCI_CPU_ON, (uint64_t)i << 8, stub, (uint64_t)i);
+	/* Only the caller's own sibling: same cluster, so no cluster rail vote is
+	 * involved (2026-11-12 probe). */
+	uint64_t self;
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(self));
+	self &= 0xffff;
+	{
+		char m[40];
+		hexline(m, "self mpidr=", self);
+		say('-', "D4", m);
+	}
+	int i = (int)((self & 0x100) ? (self >> 8) - 1 : (self >> 8) + 1);
+	uint64_t target = (uint64_t)i << 8;
+	for (int once = 0; once < 1; once++) {
+		int64_t r = smc(PSCI_CPU_ON, target, stub, (uint64_t)i);
 		char t[48] = "mpidr=0x";
 		char b[12];
 		hex8(b, (uint32_t)i << 8);
@@ -475,7 +485,7 @@ static void stage4(void)
 		/* Read the probe before any delay: the run aborts during the spin on
 		 * this unit (2026-11-12), so an ack must be captured immediately. */
 		char p[40];
-		hexline(p, "probe now=", sec_probe[7]);
+		hexline(p, "probe now=", sec_probe[i]);
 		say('-', "D4", p);
 	}
 	say('-', "D4", "spin 200 ms");
@@ -484,9 +494,8 @@ static void stage4(void)
 	while (ms_since(start) < 200)
 		;
 	uint32_t mask = 0;
-	for (int i = 7; i < 8; i++)
-		if (sec_probe[i])
-			mask |= 1u << i;
+	if (sec_probe[i])
+		mask |= 1u << i;
 	sec_stop = 1;
 
 	con_hex2("D4", "released=", (uint32_t)on, "ackmask=", mask);

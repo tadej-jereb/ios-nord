@@ -267,3 +267,6 @@ which is where adb lands; recovery adbd is root but has no `su`, so ring pulls t
 
 Open: which state the released core starts in. Handoff with hypotheses, discriminators and
 reproduction: `HANDOFF-RUNG4.md`.
+
+| `out-diag/l14` | `ce42870a…` | stub with guarded `vbar_el2`/`vbar_el1` install first: still dies at the same instant -> target code and vectors ruled out |
+| `out-diag/l15` | `0676f9b5…` | verify PASS, **not booted**: prints caller `MPIDR_EL1`, releases only its sibling (`caller ^ 0x100`) |

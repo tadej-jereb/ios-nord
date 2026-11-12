@@ -67,9 +67,19 @@ Boot chain facts you inherit (all fixed, all in the tree):
 5. Released **only `0x700`** instead of all seven: `CPU_ON` now **returns** (`ret=0`) and the
    run dies right after, before the next `say()` — even with the probe read moved ahead of the
    200 ms spin. (`l12` `7d860cbe…`, `l13` `51c3deb9…`)
+6. Installed the exception vectors on the released core *first* (`vbar_el2`/`vbar_el1` chosen by
+   `CurrentEL`) in case a null `VBAR` was sending it through address 0. Still dies at the same
+   instant. (`l14` `ce42870a…`) **So the target code — including vectors — is ruled out; the
+   death is in the release or in the state the core starts in, before our first instruction.**
 
 Conclusion: the release itself, or the state the core starts in, is fatal. The address is no
 longer in question.
+
+`l15` (`0676f9b5…`, verify PASS, **not booted yet**) is the next measurement rather than another
+target-side guess: it prints the caller's own `MPIDR_EL1` and releases only that core's sibling
+(`caller ^ 0x100`), the one release that stays inside the caller's cluster. Read its ring like any
+other; if the sibling also dies, cluster power is out and hypothesis 3 is next; if it acks, the
+split is by cluster, not by code.
 
 ## Hypotheses, in the order to test them, with the discriminator for each
 

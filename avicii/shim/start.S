@@ -106,6 +106,18 @@ secondary_entry:
 	.globl	sec_stub
 sec_stub:
 	msr	daifset, #0xf
+	/* Vectors first: with VBAR null, any exception on the fresh core fetches
+	 * from address 0 and the SoC dies before the probe can be read. */
+	mrs	x2, CurrentEL
+	and	x2, x2, #0xc
+	cmp	x2, #0x8
+	b.ne	6f
+	adr	x1, vectors
+	msr	vbar_el2, x1
+	b	7f
+6:	adr	x1, vectors
+	msr	vbar_el1, x1
+7:	isb
 	adr	x1, sec_probe
 	add	x1, x1, x0, lsl #3
 	str	x0, [x1]
