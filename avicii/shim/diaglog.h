@@ -18,6 +18,7 @@
  * userdata partition is ever written.
  */
 int dlog_init(void);		/* 0 = logging on; else a code (see diaglog.c) */
+int dlog_warn(void);		/* non-fatal code from the last dlog_init(): 4 = hdr write/sync lied, 5 = hdr read-back mismatched */
 int dlog_on(void);
 void dlog_line(char kind, const char *text);
 void dlog_off(const char *why);

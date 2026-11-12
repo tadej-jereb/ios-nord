@@ -140,7 +140,7 @@ below on one and diff before flashing anything.
   that ramdisk, so the payload tail (`$1` → `out/ramdisk.bin`) is what actually
   boots anything.
 * The console is the panel at `0xa0000000` (cont_splash_region), 1080x2400,
-  stride 4800, until a payload takes over.
+  stride 4320 (= width*4, unpadded), until a payload takes over.
 
 ## Known gaps
 
@@ -165,7 +165,8 @@ Parsed from `src/los21-boot.img` (LineageOS 21, 20240619, archive.org mirror,
 | `tags_addr` | `0x100` | matches |
 | kernel section | raw, uncompressed `Image`, 43,876,368 B, ARM64 magic at `0x38` | we pack gzip on purpose; `--verify` reports raw instead of failing |
 | appended DTB in `boot.img` | **none** | the board DTB must come from elsewhere |
-| `dtbo.img` | 1-entry `dt_table`, big-endian, dtb 337,226 B at `0x40`, `board-id 8 0`, `oplus,dtsi_no 0x5141`, `pcb_range 0 0x37` | this entry is the board DTB, extracted to `src/avicii-board.dtb` and used for the build |
+| `dtb` section of `boot.img` | 406,620 B at `0x2bab000` (after kernel+ramdisk, `dtb_size` `0x670` = 406,620), 0 fragments, `qcom,msm-id <190 10000 1b8 10000>` | **this is the tree ABL needs**; extracted to `src/avicii-soc.dtb`, sha256 `48b0902a…40ce` |
+| `dtbo.img` | 1-entry `dt_table`, big-endian, dtb 337,226 B at `0x40`, `board-id 8 0`, `oplus,dtsi_no 0x5141`, `pcb_range 0 0x37` | a **fragment overlay** (620 `fragment@` nodes, no `qcom,msm-id`), kept as `src/avicii-board.dtb` |
 | boot partition | image padded to 96 MiB | 356 KiB shim has ample room; a 43 MiB kernel also fits |
 
 `dtc` on that DTB gives `model = "Qualcomm Technologies, Inc. Lito MTP 20801"`,
@@ -173,15 +174,18 @@ Parsed from `src/los21-boot.img` (LineageOS 21, 20240619, archive.org mirror,
 
 Two consequences for the ladder:
 
-* The stock DTB is a **fragment overlay** (`fragment@0`, `target = <0xffffffff>`), so it
-  has no `/memory`; the live FDT in `x0` remains the only RAM source. `fdt_print_memory()`
-  will report a miss on the appended copy — that is expected, not a bug.
+* The `dtbo.img` overlay has no `qcom,msm-id` and is built of `__overlay__` nodes, so it
+  cannot serve as the image's dtb section: ABL wants the SoC base tree. `--verify` now
+  fails an image whose dtb section lacks `qcom,msm-id` or contains `__overlay__`, which
+  is the gate for exactly that mix-up (`DTB_FILE` default: `src/avicii-soc.dtb`).
+* Neither tree has `/memory`; the live FDT in `x0` remains the only RAM source.
+  `fdt_print_memory()` will report a miss on the appended copy — expected, not a bug.
 * ABL prefers the image's own DTB when one is appended. That is what we want, but it
-  means an image packed without `board.dtb` silently gets a different tree.
+  means an image packed without a DTB silently gets a different tree.
 
 Rebuild after any change to these facts:
 
-    DTB=/home/tadej/ios-nord/src/avicii-board.dtb ./build.sh
+    DTB=/home/tadej/ios-nord/src/avicii-soc.dtb ./build.sh
     ../tools/mkbootimg_v1.sh --verify out/shim-boot.img
 
 ## `fastboot boot` is unreliable on this ABL — verified 2026-11-12

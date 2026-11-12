@@ -1,0 +1,3 @@
+00000000000814c8 <shim_main>:
+   814c8:      	wfe
+   814cc:      	b	0x814cc <shim_main+0x4>

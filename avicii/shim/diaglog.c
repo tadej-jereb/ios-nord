@@ -10,9 +10,11 @@
  *   1  UFS host not ours (see ufs_takeover())
  *   2  no GPT / no userdata entry
  *   3  userdata too small for the ring
- *   4  header write failed
- *   5  header read-back did not match
  *   6  ring wipe failed
+ * 4 and 5 are warnings, not stops (dlog_warn(), reported as a panel line):
+ *   4  header write or sync reported an error, block landed anyway
+ *   5  header read-back mismatched - measured on avicii: the read-back lies
+ *      while Linux reads the same block correctly, so the ring stays on
  */
 #include <stdint.h>
 #include "diaglog.h"
@@ -32,6 +34,12 @@ static uint32_t total;			/* bytes ever written into the ring */
 static uint32_t cur_blk = 0xffffffffu;	/* ring block mirrored in blk[] */
 static uint64_t start_ticks, ticks_per_ms;
 static int on, fails;
+static int warn;			/* non-fatal init code, see dlog_warn() */
+
+int dlog_warn(void)
+{
+	return warn;
+}
 
 static uint64_t ticks(void)
 {
@@ -91,7 +99,13 @@ static int write_hdr(uint64_t seq)
 	const char note[] = "avicii diag ladder, DIAG_STAGE image, last 1024 blocks of userdata";
 	for (unsigned i = 0; i < sizeof(note); i++)
 		hdr[32 + i] = (uint8_t)note[i];
-	return ufs_write(header_lba, 1, hdr) || ufs_sync();
+	int wr = ufs_write(header_lba, 1, hdr);
+	int sy = wr ? 0 : ufs_sync();
+	/* Non-fatal on this medium: the block lands even when sync or the
+	 * read-back disagrees (measured on avicii, 2026-11-12). */
+	if (wr || sy)
+		warn = warn ? warn : 4;
+	return wr || sy;
 }
 
 int dlog_init(void)
@@ -99,6 +113,7 @@ int dlog_init(void)
 	uint64_t first = 0, last = 0;
 	uint32_t rc;
 
+	warn = 0;
 	__asm__ volatile("isb; mrs %0, cntfrq_el0" : "=r"(ticks_per_ms));
 	ticks_per_ms /= 1000;
 	start_ticks = ticks();
@@ -124,11 +139,12 @@ int dlog_init(void)
 	}
 	if (ufs_sync())
 		return 6;
-	if (write_hdr(0))
-		return 4;
-	/* Prove the header is readable where we will look for it later. */
+	write_hdr(0);		/* non-fatal: the block lands even when sync/readback lies */
+	/* Prove the header is readable where we will look for it later - but a
+	 * mismatch is a warning, not a stop: on avicii the read-back disagrees
+	 * while Linux reads the same block fine (measured 2026-11-12). */
 	if (ufs_read(header_lba, 1, chk) || __builtin_strcmp((const char *)chk, "SWEETLOG"))
-		return 5;
+		warn = warn ? warn : 5;
 
 	on = 1;
 	total = 0;

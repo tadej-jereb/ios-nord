@@ -4,7 +4,10 @@
 #define FB_BASE		0xa0000000UL	/* avicii cont_splash_region (35 MiB) */
 #define FB_W		1080
 #define FB_H		2400
-#define FB_STRIDE	4800		/* avicii panel stride (a8r8g8b8), 1200 px padded */
+/* a8r8g8b8, one row is exactly the visible width: nothing pads an ABL splash
+ * row (1080*4 = 4320 is already 32 B aligned), exactly as in every other port
+ * of this tree. 4800 ("1200 px padded") shears every scanline by 120 px. */
+#define FB_STRIDE	(FB_W * 4)
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

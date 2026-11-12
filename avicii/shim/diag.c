@@ -64,13 +64,17 @@ void *memcpy(void *dst, const void *src, unsigned long n)
 #define STAGE_S "stage " STR(DIAG_STAGE) " of " STR(STAGE_TOTAL)
 
 #define GICD_BASE	0x17a00000UL
-#define GICD_PIDR2	(GICD_BASE + 0xfe8)
+/* 0xfe8 is the 4 KiB-frame offset; the GICD frame is 64 KiB and its ID space
+ * starts at 0xffd0, so 0xfe8 reads RAZ (measured on avicii 2026-11-12:
+ * pidr2=0 while typer answered 0x7b041d). PIDR2 is 0xffe8. */
+#define GICD_PIDR2	(GICD_BASE + 0xffe8)
 #define GICD_TYPER	(GICD_BASE + 0x004)
 #define UFSHCI_BASE	0x1d84000UL
 #define UFS_PHY_PCS	0x1d87008UL	/* PHY PCS status, MPHY lane state */
 
-#define HCI_VERSION	0x00
-#define HCI_CAP		0x08
+#define HCI_CAP		0x00		/* UFSHCI: CAP is at 0x00, VER at 0x08 */
+#define HCI_VERSION	0x08
+#define HCI_HCS		0x30		/* bit0 DP, bit3 UCRDY */
 
 #define PSCI_CPU_ON	0xc4000003UL
 
@@ -175,14 +179,33 @@ static void rung(int n, const char *name)
 
 static void park(void)
 {
-	/* wall-clock guard: a parked image must not need the power button */
-	uint64_t deadline = ticks() + (60ULL * (freq ? freq : 19200));
+	/* wall-clock guard: a parked image must not need the power button.
+	 * `freq` is ticks per *millisecond* (cntfrq/1000), so the ms factor is
+	 * 60000, not 60 - with 60 the "60 s" park lasted 58 ms (measured
+	 * 2026-11-12: deadline-tick 1 109 313 instead of 1.15e9). */
+	uint64_t deadline = ticks() + (60000ULL * (freq ? freq : 19200));
+	{
+		/* deadline math vs reality: cntfrq claims 19.2 MHz, the park ends
+		 * after ~4.5 s of its own stamps (2026-11-12). Print both halves. */
+		char b[48];
+		hexline(b, "park freq=", freq);
+		say('-', "DBG", b);
+		hexline(b, "park ticks=", ticks());
+		say('-', "DBG", b);
+		hexline(b, "park deadline=", deadline);
+		say('-', "DBG", b);
+	}
 	say('-', "END", "park 60 s, then self-reset");
 	say('-', "END", "log: tooling/42-log-pull.sh, docs/DIAG.md");
 	while (ticks() < deadline)
 		__asm__ volatile("wfe");
 	say('-', "END", "60 s park over: PSCI reset");
-	__asm__ volatile("mov x0, #0\n\tldr x1, =0x84000009\n\tsmc #0" ::: "x0", "x1");
+	/* The shim runs at EL2, where the PSCI conduit is HVC; only EL3 sees SMC.
+	 * The bare `smc` never reset this unit (measured 2026-11-12: printed, then
+	 * hung), so try HVC first and keep SMC as the fallback. */
+	__asm__ volatile("mov x0, #0\n	ldr x1, =0x84000009\n	hvc #0" ::: "x0", "x1");
+	say('-', "END", "HVC reset returned; trying SMC");
+	__asm__ volatile("mov x0, #0\n	ldr x1, =0x84000009\n	smc #0" ::: "x0", "x1");
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -249,23 +272,57 @@ static void stage2(void)
 	rung(2, "ufs probe read-only");
 	uint32_t ver = *(volatile uint32_t *)(UFSHCI_BASE + HCI_VERSION);
 	uint32_t cap = *(volatile uint32_t *)(UFSHCI_BASE + HCI_CAP);
+	uint32_t hcs = *(volatile uint32_t *)(UFSHCI_BASE + HCI_HCS);
 	uint32_t pcs = *(volatile uint32_t *)UFS_PHY_PCS;
 	char t[40];
+	/* UFSHCI VER is major in [15:8], minor in [7:0]: 0x300 is HCI 3.0, so
+	 * comparing it against 0x00010000 reads 3.0 as implausible. */
+	uint32_t major = (ver >> 8) & 0xff, minor = ver & 0xff;
+	(void)minor;
 
 	con_hex2("D2 hci", "version=", ver, "cap=", cap);
 	hexline(t, "version=", ver);
 	say('K', "D2", t);
+	hexline(t, "cap=", cap);
+	say('K', "D2", t);
+	hexline(t, "hcs=", hcs);
+	say('K', "D2", t);
+	if (hcs & 1)
+		say('K', "D2", "hcs DP set, device present");
+	else
+		say('X', "D2", "hcs DP clear: no device seen by the host");
 
 	con_hex2("D2 phy", "pcs=", pcs, "rx_lane=", (pcs >> 16) & 3);
 	hexline(t, "pcs=", pcs);
 	say('K', "D2", t);
+	{
+		/* 0x1d87008 has no precedent in any sibling port, so scan the PHY
+		 * window read-only instead of trusting one offset. The QMP PCS-ready
+		 * status sits high in the serdes block in Qualcomm's own driver. */
+		static const uint32_t phy_off[] = { 0x00, 0x08, 0x160, 0x16c, 0x1c0, 0x1d4 };
+		for (unsigned i = 0; i < sizeof(phy_off) / sizeof(phy_off[0]); i++) {
+			unsigned n = 0;
+			t[n++] = 'p'; t[n++] = 'h'; t[n++] = 'y'; t[n++] = '+';
+			t[n++] = '0'; t[n++] = 'x';
+			static const char hx[] = "0123456789abcdef";
+			t[n++] = hx[(phy_off[i] >> 8) & 15];
+			t[n++] = hx[(phy_off[i] >> 4) & 15];
+			t[n++] = hx[phy_off[i] & 15];
+			t[n++] = '=';
+			t[n] = 0;
+			hexline(t + n, "", *(volatile uint32_t *)(0x1d87000UL + phy_off[i]));
+			say('K', "D2", t);
+		}
+	}
 
-	if (ver >= 0x00010000 && ver < 0x00040000)
-		say('K', "D2", "hci version plausible");
+	if (major >= 1 && major <= 3)
+		say('K', "D2", major == 3 ? "hci 3.0 plausible" : "hci major 1-3 plausible");
 	else
 		say('X', "D2", "hci version implausible");
 	if (pcs && pcs != 0xffffffffU)
 		say('K', "D2", "phy pcs not stuck");
+	else if (!pcs && (hcs & 1))
+		say('K', "D2", "pcs 0 with DP set: PHY idle or offset, not a fault");
 	else
 		say('X', "D2", "phy pcs stuck at 0/all-ones");
 }
@@ -329,6 +386,20 @@ static void stage3(uintptr_t fdt)
 	hex8(b, ms_since(start));
 	append(m, 12, b);
 	say('K', "D3", m);
+	/* Geometry ruler, camera-tolerant: three 4-px vertical bars at x=8,
+	 * FB_W/2 and FB_W-8, all FB_H rows. Straight bars = FB_STRIDE is the
+	 * panel's real row pitch; each bar slants by FB_H*(error)/4 px if not. */
+	for (uint64_t y = 0; y < FB_H; y++) {
+		volatile uint32_t *r = (volatile uint32_t *)FB_BASE + y * (FB_STRIDE / 4);
+		for (int i = 0; i < 4; i++) {
+			r[8 + i] = RED;
+			r[FB_W / 2 + i] = WHITE;
+			r[FB_W - 8 + i] = BLUE;
+		}
+	}
+	hexline(t, "ruler stride=", FB_STRIDE);
+	say('K', "D3", t);
+	say('K', "D3", "ruler: 3 bars, straight = correct stride");
 	say('-', "D3", "no MDP/DSI writes: ABL scan-out still showing");
 }
 #endif
@@ -631,6 +702,17 @@ int diag_run(uintptr_t fdt)
 		hexline(b, "load base=", kimg_base);
 		say('-', "SHIM", b);
 	}
+	{
+		/* cntfrq_el0 is what every ms stamp and the park deadline derive
+		 * from. Print it raw so the ratio can be measured against a wall
+		 * clock instead of trusted (measured 2026-11-12: the stamps run
+		 * ~13x fast here, i.e. the register disagrees with the counter). */
+		char b[40];
+		uint64_t f;
+		__asm__ volatile("isb; mrs %0, cntfrq_el0" : "=r"(f));
+		hexline(b, "cntfrq=", f);
+		say('-', "SHIM", b);
+	}
 	if (!DIAG_LOG) {
 		con_str("LOG", "off (DIAG_LOG=0): image writes nothing");
 	} else if (lrc) {
@@ -638,6 +720,11 @@ int diag_run(uintptr_t fdt)
 		dlog_line('-', "SHIM log init failed, console only");
 	} else {
 		con_str("LOG", "on: last 1024 blocks of userdata");
+		if (dlog_warn()) {
+			char wb[40];
+			hexline(wb, "LOG warn rc=", (uint64_t)dlog_warn());
+			say('-', "SHIM", wb);
+		}
 		dlog_line('-', "SHIM console up (pre-console marker present = it crashed here)");
 	}
 

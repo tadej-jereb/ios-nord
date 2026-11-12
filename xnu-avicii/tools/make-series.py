@@ -138,19 +138,20 @@ ADAPT = {
     ],
     # 0x9c000000 -> 0xa0000000 is the whole avicii splash delta. The FB block is
     # 35 MiB at a fresh 32 MiB-aligned base (CONSTANTS §6); the 20 MiB offset and
-    # fajita's 0x9d400000 arithmetic do not carry over. Stride 4800 is the ADT
-    # value the shim publishes (UNVERIFIED on the panel, see CONSTANTS §6).
+    # fajita's 0x9d400000 arithmetic do not carry over. The stride stays sweet's
+    # 4320 = panel width * 4: nothing pads an ABL splash row (1080*4 is already
+    # 32 B aligned). The earlier 4800 sheared every scanline by 120 px.
     "0010-sweet-early-framebuffer-debug.patch": [
         ('0x9c000000', '0xa0000000', 3),
-        ('2368 * 4320', '2368 * 4800', 1),
-        ('#define EARLY_STRIDE (4320u / 4)', '#define EARLY_STRIDE (4800u / 4)', 1),
+        ('2368 * 4320', '2368 * 4320', 1),
+        ('#define EARLY_STRIDE (4320u / 4)', '#define EARLY_STRIDE (4320u / 4)', 1),
         ('Redmi Note 10 Pro bootstrap console', 'avicii bootstrap console', 1),
     ],
     "0012-sweet-keep-debug-console-after-ttbr0.patch": [
         ('0x9c000000', '0xa0000000', 3),
         # 0012 quotes 0010's file header; it must match the adapted 0010.
         ('Redmi Note 10 Pro bootstrap console', 'avicii bootstrap console', 1),
-        ('#define EARLY_STRIDE (4320u / 4)', '#define EARLY_STRIDE (4800u / 4)', 1),
+        ('#define EARLY_STRIDE (4320u / 4)', '#define EARLY_STRIDE (4320u / 4)', 1),
     ],
     "0018-sweet-boot-cpu-driver.patch": [
         ('qcom,kryo470', 'qcom,kryo475', 1),

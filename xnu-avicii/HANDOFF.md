@@ -69,8 +69,8 @@ Notes on individual verbatim files worth knowing:
 | patch | what changed |
 |---|---|
 | `0004-sweet-machine-config.patch` | header comment Redmi/SM7150/Kryo 470 → avicii/SM7250/Kryo 475. |
-| `0010-sweet-early-framebuffer-debug.patch` | `0x9c000000` → `0xa0000000` (start.s band paint, start.s bootstrap block TTE, `EARLY_FB`); `2368 * 4320` → `2368 * 4800`; `EARLY_STRIDE` 4320 → 4800; header comment. |
-| `0012-sweet-keep-debug-console-after-ttbr0.patch` | `0x9c000000` → `0xa0000000` (final VA=PA block TTE, `early_fb`); `EARLY_STRIDE` 4320 → 4800; quotes 0010's header comment. |
+| `0010-sweet-early-framebuffer-debug.patch` | `0x9c000000` → `0xa0000000` (start.s band paint, start.s bootstrap block TTE, `EARLY_FB`); header comment; `2368 * 4320` and `EARLY_STRIDE` 4320 kept as sweet had them - nothing pads an ABL row, the earlier 4800 sheared every scanline by 120 px. |
+| `0012-sweet-keep-debug-console-after-ttbr0.patch` | `0x9c000000` → `0xa0000000` (final VA=PA block TTE, `early_fb`); `EARLY_STRIDE` kept at 4320; quotes 0010's header comment. |
 | `0018-sweet-boot-cpu-driver.patch` | `IONameMatch` `qcom,kryo470` → `qcom,kryo475`. |
 | `0038-sweet-applekeystore.patch` | `qcom,kryo470` → `qcom,kryo475` (context line). |
 | `0060-sweet-keys-touch-drivers.patch` | touch: `TOUCH_SE_PA` 0xa84000 → 0x984000 (lito qupv3_se7 = i2c4), `TOUCH_NORTH_PA` 0x3900000 → 0xf000000 (lito TLMM is one flat window), `TOUCH_RCG` 0x18148 → 0x18140, `TOUCH_GCC_VOTE` 0x5200c → 0x52008 (gcc-lito wrap1 S1), chip id `'9','8','9','6'` → `'9','8','8','6'`. keys: one `KEYS_GPIO_RT 0xc110` block becomes `KEYS_VOLUP_RT 0xc510` (PM8150L SID 4 gpio5) + `KEYS_VOLDN_RT 0xc310` (PM7250B SID 2 gpio3); PPIDs 0x4c1 / 0x4b1 (UNVERIFIED, printed at probe). Unchanged: `0x5d`, IRQ gpio 9, reset gpio 8, PON PPID 0x008, PON RT 0x0810. |
@@ -139,9 +139,10 @@ stage comes up:
 
 **Unverified — hardware settles these:**
 
-* `EARLY_STRIDE` 4800 (`0010`/`0012`) — matches `FB_STRIDE` in
-  `mkadt_avicii.py` and the ADT node, so both move together, but the panel's
-  real scanout stride has never been read;
+* `EARLY_STRIDE` 4320 (`0010`/`0012`) — matches `FB_STRIDE` in
+  `mkadt_avicii.py` and the ADT node, so all three move together. 4320 =
+  panel width * 4 with no padding: the shim console proved it on the panel
+  (4800 sheared every scanline by 120 px, 4320 rasterises pixel-exact);
 * keys PPIDs 0x4c1 (PM8150L gpio5) and 0x4b1 (PM7250B gpio3) and the derived
   block offsets — no PMIC datasheet on hand; the driver logs every APID it
   resolves, so one boot settles it. Keys are non-blocking: `sweetkeys=0`;

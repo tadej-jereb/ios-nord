@@ -131,3 +131,57 @@ page and localise the entry convention. Measured while building it: stock's `cod
 to **+0x2480000** (`imm26` counts words, so the earlier "+0x92000" reading was 4x short) and
 stock's `os_version` `0x1c000185` is **14.0.0 / 2024-05**, not 12.0.0/2023-09.
 
+
+---
+
+# 2026-11-12 late — the ladder runs, and two doc claims are wrong
+
+**`fastboot boot` works on this ABL.** The earlier "4/4 fallbacks, flash only" was not a `boot`
+limitation: every one of those images carried a dtbo *overlay* in the dtb section and ABL refused
+them ~6 s. With the stock SoC base tree in the section, `fastboot boot` sends 98 MiB in 2.2 s and
+the code runs. The whole ladder ran this way, ~20 boots, nothing flashed, `boot_b` never touched.
+
+Root cause of every refusal to date: `mkbootimg_v1.sh` defaulted `DTB_FILE` to
+`src/avicii-board.dtb`, which is the dtbo overlay (620 fragments, no `qcom,msm-id`). ABL needs the
+base tree: `src/avicii-soc.dtb`, 406620 B, `48b0902a…`, extracted from `src/los21-boot.img`
+`0x2bab000`. `--verify` now fails on a missing `qcom,msm-id` or any `__overlay__`, and T1 vs stock
+differs in `kernel_size`/`ramdisk_size` only — every other header field is stock's. Proven on
+hardware: T1 (park at 0x80000) and L0 (park inside `shim_main`) both hold >200 s / >60 s with no
+USB re-enumeration, where a refusal re-enumerates in ~6 s.
+
+## Rungs 1, 2, 3, 5 green (ring reads)
+
+| rung | result |
+|---|---|
+| 1 GIC | `pidr2=0x3b` arch nibble 3, `typer=0x7b041d`, gicv3 ok, itlines sane |
+| 2 UFS | `version=0x300` (HCI 3.0), `cap=0x1587031f`, `hcs=0x10f` **DP set**, PHY answers (`+0x160=0x7f`, `+0x16c=0xa`) |
+| 3 splash | base `0xa0000000`, size `0x2300000`, `region matches`, painted 97 ms, screen turns magenta off ABL scan-out |
+| 5 memory | three extents as tabled, `dram reaches above 4 GiB`, `RESULT mismatch=00` |
+
+Rung 4 is the one open finding: `PSCI CPU_ON` is accepted for every MPIDR 0x100-0x700 (`ret=0`) but
+`ack mask=0` and each spin slot holds a different non-zero value — cores released, none acked. The
+HVC conduit itself is proven (it is also what resets a parked image now).
+
+## Four bugs the ladder found in the shim, all fixed
+
+1. `dlog_init` returned 5 when the header read-back mismatched — the read-back lies on this medium
+   while Linux reads the same block fine. Now a warning (`dlog_warn()`, panel `LOG warn rc=`).
+2. `GICD_PIDR2` was `0xfe8` (4 KiB-frame offset) in a 64 KiB frame, which is RAZ — now `0xffe8`.
+3. `HCI_VERSION`/`HCI_CAP` were swapped vs UFSHCI (CAP 0x00, VER 0x08, as `ufs.c` has it) and the
+   version test compared a major/minor-packed VER against 0x10000.
+4. `park()`'s deadline was `60 * freq` with `freq` in ticks/ms → every "60 s" park was 58 ms; now
+   `60000 * freq`, measured 60 s. `smc` never resets at EL2, `hvc` does — reset is HVC-then-SMC.
+
+Console: `FB_STRIDE` was 4800 B for a 1080-px row (4320 B), shearing every scanline 120 px. Fixed
+and confirmed on the panel with a bar ruler (`ruler stride=0x10e0`, bars straight, glyphs resolve).
+
+## Next
+
+1. Rung 4: the secondary entry contract. The cores take the `CPU_ON` entry, so check EL at the
+   entry (PSCI starts a core at EL1 unless EL2 is set up), the stack per core, and whether the ack
+   word address is the one the secondaries actually write.
+2. Then the XNU payload on this shape (`fastboot boot`, `boot_b` untouched) and the iOS root.
+
+Notes for whoever continues: LineageOS lands in **recovery** after a ring write, and recovery adbd
+is root without `su`, so pull with `adb exec-out dd` (skip `size/4096-1025`), not `42-log-pull.sh`.
+`park()` needs the power button only if the HVC reset itself fails.

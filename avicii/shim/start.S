@@ -18,7 +18,13 @@ _head:
 
 	.text
 	.globl _start
-_start:
+	_start:
+	#if defined(PARK_C1)
+	/* C1: park on the very first instruction. Reaching 0x80000 at all means
+	 * the header code0 branch and the ABL jump worked. */
+	5:	wfe
+	b	5b
+	#endif
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
 	/*
@@ -29,14 +35,26 @@ _start:
 	 * actually put us. Header kernel_addr wants 0x8000.
 	 */
 	adr	x20, _head
-	msr	spsel, #1
+	#if !defined(PARK_C2)
+	msr	spsel, #1		/* C2 drops it: park happens with SP_EL0 vs SP_EL1 */
+	#endif
 	adr	x21, kimg_base
 	str	x20, [x21]
 	adr	x1, _stack_top
 	mov	sp, x1
+	#if defined(PARK_C2)
+	/* C2: whole stack/spsel/daif path done, park before vbar_el1. */
+	6:	wfe
+	b	6b
+	#endif
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
+	#if defined(PARK_C3)
+	/* C3: vectors installed, park before the bss clear loop. */
+	7:	wfe
+	b	7b
+	#endif
 	/* zero .bss */
 	adr	x1, _bss_start
 	adr	x2, _bss_end

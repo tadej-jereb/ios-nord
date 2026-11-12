@@ -134,9 +134,9 @@ def main():
 
         fb = props(find(root, 'sweet-fbcon'))
         check('/sweet-fbcon reg 0xa0000000', struct.unpack_from('<Q', fb['reg'], 0)[0] == 0xa0000000)
-        check('framebuffer 1080x2400 stride 4800',
+        check('framebuffer 1080x2400 stride 4320',
               (struct.unpack('<I', fb['width'])[0], struct.unpack('<I', fb['height'])[0],
-               struct.unpack('<I', fb['stride'])[0]) == (1080, 2400, 4800))
+               struct.unpack('<I', fb['stride'])[0]) == (1080, 2400, 4320))
         check('/sweet-ufs ufshc', props(find(root, 'sweet-ufs'))['compatible'] == b'qcom,ufshc\0')
         check('xiaomi,sweet kept', b'xiaomi,sweet' in props(root)['compatible'])
 

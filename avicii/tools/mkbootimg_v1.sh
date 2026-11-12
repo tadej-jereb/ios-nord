@@ -121,6 +121,7 @@ else:
 # v1 kernel section must be a real gzip stream with the DTB appended; a stock v2 image
 # holds a raw Image instead, which is reported rather than flagged.
 kern = d[k_off:k_off + ks]
+tail = b''
 if kern[0x38:0x3c] == b'ARMd' and kern[:2] != b'\x1f\x8b':
     print('kernel section : raw aarch64 Image (stock v2 style, no appended DTB)')
 elif kern[:2] != b'\x1f\x8b':
@@ -135,12 +136,87 @@ else:
             tail = kern[len(kern) - len(z.unused_data):]
             print(f'gzip ok         : {len(out)} bytes decompressed, '
                   f'crc ok, tail {len(z.unused_data)} bytes at 0x{len(kern) - len(z.unused_data):x}')
-            if tail[:4] != b'\xd0\x0d\xfe\xed':
-                bad.append('no FDT magic right after the gzip stream')
-            else:
-                print(f'board dtb       : totalsize {struct.unpack_from(">I", tail, 4)[0]}')
     except zlib.error as e:
         bad.append(f'gzip: {e}')
+
+
+# The DTB must be an FDT that carries qcom,msm-id: that is the SoC base tree ABL
+# needs in the dtb section.  A dtbo fragment overlay has no qcom,msm-id and is
+# built out of __overlay__ nodes; ABL cannot use one as the board tree, which is
+# exactly the bug this gate exists for (wrong dtb = image accepted, tree bogus).
+def fdt_walk(blob):
+    """Minimal FDT parser: (node names, property names), or (None, None)."""
+    if blob[:4] != b'\xd0\x0d\xfe\xed':
+        return None, None
+    total, = struct.unpack_from('>I', blob, 4)
+    if total > len(blob):
+        raise ValueError(f'totalsize {total} exceeds the {len(blob)} dtb bytes')
+    offs, offstr = struct.unpack_from('>2I', blob, 8)
+    nodes, props, q = [], set(), offs
+    while q + 4 <= total:
+        tag, = struct.unpack_from('>I', blob, q)
+        q += 4
+        if tag == 1:                                    # FDT_BEGIN_NODE
+            e = blob.index(b'\0', q)
+            nodes.append(blob[q:e].decode('latin1'))
+            q = (e + 4) & ~3
+        elif tag == 3:                                  # FDT_PROP
+            ln, no = struct.unpack_from('>2I', blob, q)
+            q += 8
+            e = blob.index(b'\0', offstr + no)
+            props.add(blob[offstr + no:e].decode('latin1'))
+            q = (q + ln + 3) & ~3
+        elif tag == 2:                                  # FDT_END_NODE
+            continue
+        else:                                           # FDT_NOP / FDT_END
+            break
+    return nodes, props
+
+
+def check_dtb(blob, where):
+    try:
+        nodes, props = fdt_walk(blob)
+    except (ValueError, struct.error, IndexError) as e:
+        bad.append(f'dtb section is not a parseable FDT ({where}): {e}')
+        return
+    if nodes is None:
+        bad.append(f'no FDT magic in the dtb section ({where})')
+        return
+    print(f'board dtb       : totalsize {struct.unpack_from(">I", blob, 4)[0]} bytes, '
+          f'{len(nodes)} nodes, {where}')
+    if 'qcom,msm-id' not in props:
+        bad.append('dtb section has no qcom,msm-id: it is a dtbo fragment overlay, '
+                   'not the SoC base tree (use src/avicii-soc.dtb)')
+    ov = [n for n in nodes if '__overlay__' in n]
+    if ov:
+        bad.append(f'dtb section carries __overlay__ nodes ({len(ov)} of them): '
+                   'that is the dtbo overlay, not the SoC base tree '
+                   '(use src/avicii-soc.dtb)')
+
+
+dtb_size = 0
+if v['header_version'] >= 2 and v['header_size'] >= 1660:
+    dtb_size, = struct.unpack_from('<I', d, 1648)
+dtb_blob, dtb_where = None, ''
+if tail[:4] == b'\xd0\x0d\xfe\xed':
+    dtb_blob, dtb_where = tail, 'appended to the kernel'
+elif tail:
+    bad.append('no FDT magic right after the gzip stream')
+if dtb_blob is None and dtb_size:
+    o = d.find(b'\xd0\x0d\xfe\xed', p)
+    if o < 0:
+        bad.append(f'dtb_size {dtb_size} declared but no FDT anywhere in the image')
+    else:
+        n, = struct.unpack_from('>I', d, o + 4)
+        if n != dtb_size:
+            bad.append(f'dtb at 0x{o:x} is {n} bytes, header declares dtb_size {dtb_size}')
+        else:
+            dtb_blob, dtb_where = d[o:o + n], f'dtb section at 0x{o:x}'
+if dtb_blob is not None:
+    check_dtb(dtb_blob, dtb_where)
+elif not dtb_size:
+    bad.append('no dtb section and no DTB appended to the kernel: ABL would boot '
+               'its own tree instead of the board one')
 
 print()
 if warn:
@@ -192,7 +268,7 @@ PART_SIZE=${PART_SIZE:-100663296}
 # floor, not the stock tuple - docs/HYBRID.md packs stock's exact bytes.
 OS_VERSION=${OS_VERSION:-14.0.0}
 OS_VERSION_RAW=${OS_VERSION_RAW:-0x1c000185}
-DTB_FILE=${DTB_FILE:-/home/tadej/ios-nord/src/avicii-board.dtb}
+DTB_FILE=${DTB_FILE:-/home/tadej/ios-nord/src/avicii-soc.dtb}
 OS_PATCH_LEVEL=${OS_PATCH_LEVEL:-2024-05}
 "$PYTHON" "$MKBOOTIMG_PY" --header_version "$HDR" \
 	--kernel "$KERNEL" --ramdisk "$RAMDISK" \

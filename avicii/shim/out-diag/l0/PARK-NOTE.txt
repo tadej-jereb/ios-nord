@@ -1,0 +1,16 @@
+L0 = the psm shape: DIAG_STAGE=0 DIAG_LOG=0, park inside the first C frame.
+
+shim.c and start.S must not be edited, so the park is planted after the link:
+the 8 bytes at shim_main's first instruction are overwritten with
+`wfe` (5f 20 03 d5) + `b .` (00 00 00 14), in shim.elf at its real .text file
+offset and therefore in Image. Everything before it - code0 `b +0x80000`,
+text_offset 0x80000, `msr daifset`, sp/vbar/bss prologue, `bl shim_main` - is
+exactly the T1 (out-diag/dtbfix-park) entry path, so reaching the park proves
+the call into C, the stack and .bss.
+
+  park.txt        disassembly of shim_main after the patch
+  Image.nopark    the same build without the patch (diff = 8 bytes at 0x814c8)
+  Image           patched, re-objcopied from the patched elf, truncated to _end
+
+Repacked with everything else identical to build.sh: the stock SoC dtb section,
+the shared empty ramdisk, the stock cmdline, header v2.

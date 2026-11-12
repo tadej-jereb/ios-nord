@@ -5,11 +5,11 @@
  * them and prints every mismatch instead of panicking.
  *
  * source   : avicii/tools/mkadt_avicii.py
- * sha256   : 84b39bbc916a8e266a54a1c02c9dc96aac501047d05a02676858dcfb5eb97b4a
+ * sha256   : 1a6c84b2d32c1916186b1e1547f623ab8e2c0098d8537418657d0b892514a902
  */
 #pragma once
 
-#define MT_SRC_SHA256 "84b39bbc916a8e266a54a1c02c9dc96aac501047d05a02676858dcfb5eb97b4a"
+#define MT_SRC_SHA256 "1a6c84b2d32c1916186b1e1547f623ab8e2c0098d8537418657d0b892514a902"
 #define MT_4G        0x100000000UL
 
 #define MT_DEFAULT_PHYS_BASE 0x90000000UL	/* fallback dram base */

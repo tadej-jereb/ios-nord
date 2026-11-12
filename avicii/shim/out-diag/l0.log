@@ -1,0 +1,36 @@
+file            : /home/tadej/ios-nord/avicii/shim/out-diag/l0/shim-boot.img (100663296 bytes)
+magic           : b'ANDROID!' OK
+kernel_size     : 0xcb000 (831488)
+kernel_addr     : 0x8000 (32768)
+ramdisk_size    : 0x63 (99)
+ramdisk_addr    : 0x1000000 (16777216)
+second_size     : 0x0 (0)
+second_addr     : 0x0 (0)
+tags_addr       : 0x100 (256)
+page_size       : 0x1000 (4096)
+header_version  : 0x2 (2)
+os_version_raw  : 0x1c000185 (469762437)
+recovery_dtbo_size: 0x0 (0)
+recovery_dtbo_offset: 0x0 (0)
+header_size     : 0x67c (1660)
+name            : b''
+cmdline         : b'androidboot.hardware=qcom androidboot.memcg=1 androidboot.usbcontroller=a600000.dwc3 cgroup.memory=nokmem,nosocket loop.max_part=7 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 reboot=panic_warm service_locator.enable=1 swiotlb=2048'
+id (sha1)       : b21dc2ad9fd254849afe9c46b76a5956d9ced644000000000000000000000000
+extra_cmdline   : b''
+os version      : 14.0.0 patch 2024-05
+kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
+ramdisk load adr: 0x1000000
+tags addr       : 0x100
+kernel section  : page 1 offset 0x1000 size 831488
+ramdisk section : offset 0xcc000 size 99
+total needed    : 839680 bytes; file has 100663296
+avb footer      : present, original_image_size 1249280, sections end 839680
+kernel section : raw aarch64 Image (stock v2 style, no appended DTB)
+board dtb       : totalsize 406620 bytes, 2482 nodes, dtb section at 0xcd000
+
+WARN: header_version 2 (stock avicii ships v2 and boots it; v1 Image.gz-dtb is what this port packs)
+PASS (geometry matches; stock-style v2 image, not a packed v1 one)
+-rwxrwxr-x 1 tadej tadej    831488 Nov 12 22:08 /home/tadej/ios-nord/avicii/shim/out-diag/l0/Image
+-rw-rw-r-- 1 tadej tadej    420756 Nov 12 22:08 /home/tadej/ios-nord/avicii/shim/out-diag/l0/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 100663296 Nov 12 22:08 /home/tadej/ios-nord/avicii/shim/out-diag/l0/shim-boot.img
+flash: fastboot boot /home/tadej/ios-nord/avicii/shim/out-diag/l0/shim-boot.img   (or flash boot_a once the layout is confirmed)

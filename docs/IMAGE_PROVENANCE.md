@@ -162,3 +162,94 @@ expected). Corrects two earlier notes: stock `os_version` is **14.0.0 / 2024-05*
 | `hybrid/out/f3.img` | PASS | `aaae3ba4e7fad78747e978012a63ac4387de45fc5e7108382d4fbb534bac5ba7` |
 
 Result: __________ .
+
+## dtb-section fix: the park and everything behind it
+
+The dtb section carried `src/avicii-board.dtb` (the dtbo *overlay*, 620 fragments, no
+`qcom,msm-id`) instead of the SoC base tree, which is the plausible cause of the ~6 s
+refusal of every earlier image. `mkbootimg_v1.sh` now defaults to `src/avicii-soc.dtb`
+(406620 B, `48b0902a...`, extracted from the dtb section of `src/los21-boot.img` at
+`0x2bab000`) and `--verify` fails on a missing `qcom,msm-id` or any `__overlay__`.
+`--verify` PASSes the park and FAILs the overlay control; both kept as the gate's own
+regression pair.
+
+T1 vs stock `los21-boot.img`: every header field identical (incl. `dtb_addr`, `tags_addr`,
+`cmdline`, `os_version 0x1c000185`, `code0 b+0x2480000`) **except** `kernel_size` and
+`ramdisk_size`. Not flashed at write time; path is `fastboot boot` (writes nothing), so
+`boot_b` is the fallback by default and needs no restore.
+
+| image | what | verify | sha256 |
+|---|---|---|---|
+| `out-diag/dtbfix-park` | T1: bare park at 0x80000, soc dtb | PASS | `69cdca532998f06f965855fd6a84018a2e12a6f88ee7d1476923f32cb121f6dc` |
+| `out-diag/dtbfix-neg` | T2: overlay dtb control (must be refused) | FAIL by design | `2b1a18098230734f4065513811bdb6aeed9eb820107f09a1458559dc5e09327e` |
+| `out-diag/l0` | park inside `shim_main` (no 60 s reset) | PASS | `6f7b1bc71e6c8184c4b63380fbc76463daddb3a2e79d05ec410b72a77ac4ad41` |
+| `out-diag/l1` | stage 1, LOG=0 | PASS | `94cffac8f27e4a0459d2f74c63cb7eeb75d51bf01878b3550b0594f7e31c2bea` |
+| `out-diag/l2` | stage 1, LOG=1 | PASS | `5866e9c7fc95eff3f3c64febaf056842e846c22def2715e065c30500530498e5` |
+| `out-diag/l3` | stage 2, LOG=1 | PASS | `0bb629f9c953fd52443e109e5b35c5cd9bb47314ab9f04fa1d65cd260c84a4a4` |
+| `out-diag/c1` | park as first insn of `_start` (`-DPARK_C1`) | PASS | `f76d4d96cba2c6c663d67ecbb52fd296bde5e135c70ddc88e06c62da5d97ca16` |
+| `out-diag/c2` | park after `mov sp,x1`, sans `spsel` (`-DPARK_C2`) | PASS | `c83d9c3b7f7ea09784db6c93850d6a4a426e19a660ffaab64ec9b3e8a45e80f5` |
+| `out-diag/c3` | park after `vbar_el1`+`isb` (`-DPARK_C3`) | PASS | `3a18f3370ea64c304c1c341f551e9cbd4f8ff8f43dfbefae8c94dd4d0d46d642` |
+
+Every dtb section above re-hashed at its own header-derived offset:
+`48b0902a99c10a11ff52680bf81e9fec2574ad687c58ea35a00fdbf7aefe40ce`, all of them.
+Packed-image hashes are not run-reproducible (empty-cpio ramdisk mtime); the `Image`
+bytes are.
+
+Result: **T1 PASS (2026-11-12 22:13:13).** `fastboot boot` sent 98304 KB in 2.241 s, `Booting
+OKAY` in 0.084 s, then ≥200 s of silence: screen kept the fastboot UI unre-drawn, no
+re-enumeration on USB at all (`lsusb` has no 05c6/18d1 node, `fastboot devices` and
+`adb devices` both empty at 22:16:44). A refusal would have re-entered fastboot and put
+the 05c6 gadget back within ~6 s. ABL therefore decoded `code0`, honoured
+`base+text_offset` and executed at least `wfe` at 0x80000 — the SoC-dtb section is
+accepted. T1 never self-resets; left with Power+VolDown.
+
+**L0 PASS (22:18:01).** Same signature: sent 98304 KB in 2.239 s, `Booting OKAY` 0.084 s,
+60 s of silence with no USB at all (`fb=0 usb05c6=0 adb=0` at every poll to 22:19:04). The
+park sits in `shim_main`, so `daifset`, `spsel`, `mov sp`, `vbar_el1`, `isb`, the bss clear
+and the `bl shim_main` all completed. The entry prologue is not the problem and the C1/C2/C3
+contingency is not needed yet. L0 does not self-reset (bare `wfe` in C, not `diag.park()`).
+
+**L1 RAN (22:20:06)** — first rung that executes `diag_run`. Sent 98304 KB in 2.242 s. The
+screen carried **multiple lines of white and yellow glyphs, unreadable** — the console draws,
+the font table is fine, but the glyph raster does not land where it should. Values are
+therefore only obtainable from the ring, not from the panel. Also: the 60 s `park()` expired
+and the `smc` PSCI_SYSTEM_RESET did not reset (no re-enumeration at 105 s, 22:21:51); the
+power button stays the way out of a `park()`. L2 (`DIAG_LOG=1`) is the rung that puts the
+same lines in the userdata ring for `tooling/42-log-pull.sh`.
+
+**Ring works, rung 1 and 2 green (22:29-22:44).** Four probe/infra bugs found by the
+ladder and fixed, each proven by the next run: (a) `dlog_init` returned 5 on the header
+read-back, which is a lie on this medium - Linux reads the same block fine - so the gate
+became a warning (`dlog_warn()`, panel line `LOG warn rc=`); (b) `GICD_PIDR2` was 0xfe8,
+a 4 KiB-frame offset, while the GICD frame is 64 KiB and RAZ there - now 0xffe8;
+(c) `HCI_VERSION`/`HCI_CAP` were swapped vs the UFSHCI layout (CAP 0x00, VER 0x08 - what
+`ufs.c` uses) and the version test compared a major/minor-packed VER against 0x10000;
+(d) the park deadline used `60 * freq` with `freq` in ticks/ms, so every "60 s" park
+was 58 ms - now `60000 * freq`, measured 60 s. Also: `smc` PSCI reset never fires at
+EL2, `hvc` does, so the reset is HVC-then-SMC and a parked image now recovers by itself.
+
+| run | result |
+|---|---|
+| `l2` (stage 1, LOG=1, pre-fix) | header written, ring wiped, `total 0` - nothing logged |
+| `l2b` | ring live, rc=5 reported, D1 pidr2=0 (offset bug), typer 0x7b041d |
+| `l2c` | **D1 PASS**: pidr2=0x3b, arch nibble 3, gicv3 ok, itlines sane; HVC reset works |
+| `l3b` (stage 2, pre-fix) | version/cap read from swapped offsets, park 58 ms |
+| `l3c` | version=0x300, cap=0x1587031f, hcs DP set, park 60 s |
+| `l3d` | **D2 PASS**: hci 3.0 plausible, DP set, PHY window answering (+0x160=0x80) |
+
+Load base every run: `0xa7e80000` (ABL ignores the header's 0x8000, harmless - the code
+is position independent). Console `FB_STRIDE` was 4800 B for a 1080-px row (4320 B), which
+sheared every scanline 120 px right; fixed to `FB_W * 4`.
+
+**Ladder walked 1-5 (22:45-23:03).** Ring reads only, `fastboot boot`, nothing flashed.
+
+| rung | image | sha256 | result |
+|---|---|---|---|
+| 3 | `out-diag/l4`, `l7(ruler)` | `2821a59b…`, `991ba4ed…` | PASS: base 0xa0000000 size 0x2300000, `region matches`, painted 97 ms; ruler bars straight at `stride=0x10e0` - 4320 is the panel's real row pitch |
+| 4 | `out-diag/l5` | `0fc147dd…` | FINDING: `CPU_ON` accepted for 0x100-0x700 (ret=0) but `ack mask=0`, each spin slot a different value - cores released, none acked |
+| 5 | `out-diag/l6` | `0b305f26…` | PASS: three extents as tabled, `dram reaches above 4 GiB`, `RESULT mismatch=00` (docs' expected 01 is stale - the live map matches the generator now) |
+
+Console: `FB_STRIDE` 4800 -> `FB_W*4` (4320) confirmed on hardware; glyphs resolve at 1:1 and
+the ruler bars are straight. LineageOS drops to **recovery** (not Android) after a ring write,
+which is where adb lands; recovery adbd is root but has no `su`, so ring pulls there go through
+`adb exec-out dd` of `/dev/block/sda16` skip `size/4096-1025`, not `42-log-pull.sh`.

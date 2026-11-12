@@ -41,7 +41,7 @@ SOC_BASE = 0x01000000
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0xa0000000, 0x2300000   # cont_splash_region, 35 MiB
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 4800
+FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4   # row = width*4, nothing pads it
 UFS, UFS_SIZE = 0x01d84000, 0x3000    # ufshc@1d84000 "ufs_mem"; QEMU virt has none
 TIMEBASE = 19200000
 # lito arch timer PPI 11 (0x1b in DT numbering) -> XNU INTID 19, as on sweet.

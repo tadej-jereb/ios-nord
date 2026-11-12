@@ -25,7 +25,7 @@ the walls are hit in the order that already has answers.
 | all seven images build and pass `mkbootimg_v1.sh --verify` | **verified** (see §2 output, `out-diag/SHA256SUMS`) |
 | GICD 0x17a00000, PIDR2 0xfe8, TYPER 0x004 as read by rung 1 | verified: `avicii/CONSTANTS.md:49` (base from `lito.dtsi:599,605`), PIDs at Arm's GICD offsets; expected TYPER shape from a sibling lito unit, `docs/anonbeat1-NOTES.md:1054` (`0x007B041D`, 30 groups) |
 | UFSHCI 0x1d84000 / PHY PCS 0x1d87008 as read by rung 2 | registers from JESD223 + dts node `ufshc@1d84000`; **PCS offset 0x08 is UNVERIFIED** for lito's PHY |
-| `cont_splash_region` = 0xa0000000 + 0x2300000, framebuffer 1200x2400x4 inside it | **verified** from the live DTB (`10-fdt.dtb`, decoded with `dtc`), checked again by rung 3 at boot |
+| `cont_splash_region` = 0xa0000000 + 0x2300000, framebuffer 1080x2400x4 inside it, row = 1080*4 B, unpadded | region **verified** from the live DTB (`10-fdt.dtb`, decoded with `dtc`), re-checked by rung 3 at boot; geometry is the panel's own `qcom,mdss-dsi-panel-width` 0x438 x 0x960 in that tree - no node states a stride, and nothing pads an ABL row |
 | FDT `/memory` decoding of the ladder's walker | **verified** on the live DTB: 3 extents, 0x80000000+0x3bb00000, 0xc0000000+0xc0000000, 0x180000000+0x100000000 |
 | expected stage-5 result on this unit = exactly 1 mismatch (mkadt fallback window) | **verified** by replaying the checks on the dumped values; see §6 |
 | `fastboot boot` works on avicii | **UNVERIFIED on this unit** (claimed by twrp.me/PitchBlack threads) - §3 covers the fallback |
@@ -139,6 +139,11 @@ slot, which is the fallback.
 Format: `D<rung> <text>`. The `begin` line is the marker; everything after it is
 result. A hang **between two lines** names the rung and step above it.
 
+### Panel console (every rung)
+
+- Geometry: 1080x2400 `a8r8g8b8` at `0xa0000000`, one row is exactly `FB_W * 4` = 4320 B, glyphs 8x16 at 3x from `24,24` (`avicii/shim/console.h:7`).
+- Garbled blobs that still sit in the right order and colour are a stride fault, not a font or bpp one: check `FB_STRIDE` against the panel width first.
+
 ### Rung 1 - GIC read-only
 
 Good:
@@ -176,9 +181,13 @@ DP (device present) bit set, `pcs` neither 0 nor all-ones, and `phy pcs not
 stuck`.
 
 Bad: `version=0x00000000` or `0xffffffff` (host not enabled - ABL left it off,
-or the base is wrong), `pcs=0x00000000` (PHY unpowered), `hci version
+or the base is wrong), `hcs DP clear` (host up but sees no device), `hci version
 implausible`. Any of these with rung 1 good points at the UFS block, not at the
-interconnect.
+interconnect. UFSHCI puts **CAP at 0x00 and VER at 0x08** (the reverse of what
+looks natural) and VER packs major in [15:8], so `0x300` is HCI 3.0, not an
+implausible `0x300`. `pcs=0` at `0x1d87008` is *not* a PHY fault when `DP` is
+set - the rung scans PHY offsets `0x0/0x8/0x160/0x16c/0x1c0/0x1d4` and a live
+PHY answers on `0x160`/`0x16c`.
 
 ### Rung 3 - splash buffer
 
@@ -251,10 +260,14 @@ D5 RESULT mismatch=00
 ```
 
 Good on this unit: three extents exactly as dumped, `dram reaches above 4 GiB`,
-`splash carve inside dram, expected`, `mkadt fallback window inside dram` **is
-expected to FAIL**, and a final `RESULT mismatch=01`. That one mismatch is real
-and predates the ladder: `mkadt_avicii.py`'s fallback window `0xb0000000 +
-0x4d000000` spans the `0xbbb00000..0xc0000000` hole in the live map. Anything
+`splash carve inside dram, expected`, and a final `RESULT mismatch=00`.
+
+That `00` is newer than the doc's first draft: the earlier expectation of
+`mismatch=01` came from `mkadt_avicii.py`'s fallback window `0xb0000000 +
+0x4d000000` spanning the `0xbbb00000..0xc0000000` hole. The tabled window now
+sits entirely inside the map (third extent `0xc0000000 + 0xc0000000`, total
+`0x1fbb00000`), so the check is clean and a non-zero mismatch is again a real
+finding. Anything
 else - an extent below `0x80000000`, an extent under `MIN_MEM_SIZE`, an overlap
 with the GIC or UFS carve-out, or `no /memory in x0` - is a genuine finding and
 the log keeps it.
@@ -280,6 +293,16 @@ tr -d '\000' < logs/diag-01.txt
 Every line carries `[ms] <kind> <rung> <text>`, kinds `B` (marker), `K` (ok),
 `X` (bad), `-` (note). The NUL padding `tr` strips comes from the zeroed ring
 ahead of a short log; the newest lines are always last.
+
+A ring write makes LineageOS drop into **recovery** afterwards, not Android, and
+recovery adbd is already root but has no `su` binary - so `42-log-pull.sh`'s
+root check fails there. Pull by hand instead (read-only, same offsets):
+
+```sh
+adb exec-out "dd if=/dev/block/sda16 bs=4096 skip=$(( $(adb shell blockdev --getsize64 /dev/block/sda16)/4096 - 1025 )) count=1025 2>/dev/null" > logs/ring.bin
+```
+
+`skip=0,count=0` after the 4096-byte header is the log; cut at the first NUL.
 
 Costs: writing the ring overwrites 4 MiB at the end of `userdata`. LineageOS may
 report `/data` corruption afterwards. Recovery is in §8.

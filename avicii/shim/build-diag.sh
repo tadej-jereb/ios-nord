@@ -19,7 +19,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 cd "$here"
 
-DTB=${DTB:-$repo/src/avicii-board.dtb}
+DTB=${DTB:-$repo/src/avicii-soc.dtb}
 OUTDIR=${OUTDIR:-$here/out-diag}
 STAGES="1 2 3 4 5 6 7 8"
 RO=1
