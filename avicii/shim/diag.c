@@ -87,6 +87,11 @@ extern void sec_stub(void);
 extern void _start(void);
 extern char _bss_start[];
 
+/* start.S publishes each secondary's index here before it touches anything, so
+ * the array has to exist at every DIAG_STAGE - including 0, where a payload
+ * boot compiles no rung at all. */
+volatile uint64_t sec_probe[8];
+
 #if DIAG_STAGE >= 1
 static const char *rung_name;
 static int diag_mode;
@@ -410,7 +415,7 @@ static void stage3(uintptr_t fdt)
 /* ---- rung 4: PSCI CPU_ON per core, ack, spin -------------------------- */
 #if DIAG_STAGE >= 4
 static volatile uint64_t sec_spin[8];
-volatile uint64_t sec_probe[8];
+
 static volatile int sec_stop;
 
 void diag_secondary(uint64_t idx)
