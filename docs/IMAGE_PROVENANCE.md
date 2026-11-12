@@ -270,3 +270,24 @@ reproduction: `HANDOFF-RUNG4.md`.
 
 | `out-diag/l14` | `ce42870a…` | stub with guarded `vbar_el2`/`vbar_el1` install first: still dies at the same instant -> target code and vectors ruled out |
 | `out-diag/l15` | `0676f9b5…` | verify PASS, **not booted**: prints caller `MPIDR_EL1`, releases only its sibling (`caller ^ 0x100`) |
+
+**Rung 4 closed (23:31-23:37).** Both `fastboot boot`, `DIAG_STAGE=4 DIAG_LOG=1`, soc dtb
+`48b0902a…` at `0xd1000` in each image, `verify` PASS on both, parked then self-reset at 60 s,
+ring pulled from `userdata`. The entry is now the bare symbol: `(uintptr_t)sym` is already a
+runtime address (`adr` under `-fno-pic`) and `kimg_base` is `_head`, so the old
+`kimg_base + (sym - _start)` was `0x80000` low — into the zero pad, `udf #0` on the core's first
+fetch. `el=0x4` (EL1) also ends the EL2 hypothesis.
+
+| image | sha256 | result |
+|---|---|---|
+| `out-diag/l16` | `5036ba873863cd1d0c58a2b27d1bbd5ee0e1d83d502e89d156d0e8a7b7d45dab` | PASS: entry `0xa7f000a0` (stub), seven `ret=0`, `probe now=` all seven slots = own index, `probe mask=0xfe`, `all 7 secondaries ran our code`, D5 green |
+| `out-diag/l17` | `734c15cbc67ff1b7a527429b3aaeca62524387645b0d961e720940061d8da508` | PASS: entry `0xa7f00054` (real `secondary_entry`), `sec_stop` before the mask, `ack mask=0xfe`, spin 0xce5d/0xb418/0x9881/0x7d29/0x6155/0x29a2/0x1bd8 |
+
+Both rings: `logs/ring-l16.bin`, `logs/ring-l17.bin`. `l16` landed in recovery (root adbd, no `su`,
+plain `exec-out dd`), `l17` on Android+Magisk (`unauthorized` until `ADB_VENDOR_KEYS=$HOME/.android/adbkey`,
+then `exec-out "su -c 'dd …'"`) — the landing point is not deterministic.
+
+Reproducing a sha256 from the commit does not work: `build.sh` regenerates the empty newc ramdisk
+each time (`cpio` writes ino/mtime), so only the kernel section is stable. Rebuilt
+`EXTRA_CFLAGS=-DSEC_ENTRY_REAL` for `l17`: `Image` byte-identical (`0afdece8…`), `shim-boot.img`
+differs. Compare `Image`, not the boot image, when re-checking a rebuild.

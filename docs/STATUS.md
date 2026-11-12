@@ -157,10 +157,23 @@ USB re-enumeration, where a refusal re-enumerates in ~6 s.
 | 2 UFS | `version=0x300` (HCI 3.0), `cap=0x1587031f`, `hcs=0x10f` **DP set**, PHY answers (`+0x160=0x7f`, `+0x16c=0xa`) |
 | 3 splash | base `0xa0000000`, size `0x2300000`, `region matches`, painted 97 ms, screen turns magenta off ABL scan-out |
 | 5 memory | three extents as tabled, `dram reaches above 4 GiB`, `RESULT mismatch=00` |
+| 4 SMP | all seven secondaries 0x100-0x700 released, `probe mask=0xfe` (each slot holds its own index) and, with the real entry, `ack mask=0xfe` with live spin counts — every core runs our code |
 
-Rung 4 is the one open finding: `PSCI CPU_ON` is accepted for every MPIDR 0x100-0x700 (`ret=0`) but
-`ack mask=0` and each spin slot holds a different non-zero value — cores released, none acked. The
-HVC conduit itself is proven (it is also what resets a parked image now).
+Rung 4 is closed (2026-11-12 23:31 / 23:37, `out-diag/l16` and `l17`). Two bugs in the shim, both
+host-visible, and neither in PSCI:
+
+1. The entry was built as `kimg_base + (sym - _start)`. `(uintptr_t)sym` is *already* a runtime
+   address (`adr`/`adrp` under `-fno-pic`) and `kimg_base` is `_head`, not `_start`, so every
+   release landed `0x80000` low in the zero padding before `.text` and took `udf #0` at its first
+   fetch. PSCI returned 0 for all seven every time; the "release is fatal" signature was the caller
+   wedging on the faulted core, not the core dying in our code. `out-diag/l6` had it right by
+   accident (bare symbol) and its ack mask of 0 was the second bug.
+2. The ack mask was read before `sec_stop = 1`, while `diag_secondary()` stores `sec_spin[]` only
+   after its loop exits — a perfect release still printed `mask=0`.
+
+`CurrentEL` at the caller is `0x4` (EL1), so the EL2-vector hypothesis is dead: PSCI starts a
+secondary at the caller's EL, and the EL1 `vbar_el1` install in `sec_stub` was correct all along.
+stage4 now refuses to release if the entry is outside `[_start, _bss_start)`.
 
 ## Four bugs the ladder found in the shim, all fixed
 
@@ -177,12 +190,13 @@ and confirmed on the panel with a bar ruler (`ruler stride=0x10e0`, bars straigh
 
 ## Next
 
-**Rung 4 is the live investigation and has its own handoff: `HANDOFF-RUNG4.md`.** Short form: the
-release is fatal even to a naked `wfe` stub, `0x700` alone returns where `0x100` wedges, and the
-SoC dies microseconds after the call — the entry address is no longer in question, the state the
-core starts in is. Then the XNU payload on this shape (`fastboot boot`, `boot_b` untouched) and the
-iOS root.
+**The ladder is green; the next rung is the XNU payload on this shape** (`fastboot boot`, nothing
+flashed, `boot_b` untouched), then the iOS root in `userdata`. Stage-4 images `l16`/`l17` stay in
+`out-diag/` as the SMP reference: `l17` (`ack mask=0xfe`, real entry) is the one to reuse when the
+shim has to bring secondaries up for real.
 
-Notes for whoever continues: LineageOS lands in **recovery** after a ring write, and recovery adbd
-is root without `su`, so pull with `adb exec-out dd` (skip `size/4096-1025`), not `42-log-pull.sh`.
-`park()` needs the power button only if the HVC reset itself fails.
+Notes for whoever continues: after a ring write LineageOS usually lands in **recovery**, where adbd
+is root without `su` (pull with `adb exec-out dd`, skip `size/4096-1025`), but it landed on **Android
+with Magisk** twice tonight — `adb devices` answers `unauthorized` there until `ADB_VENDOR_KEYS` is
+exported, then `su -c` is root and the same `dd` goes through `adb exec-out "su -c '…'"`. Do not
+assume the recovery. `park()` needs the power button only if the HVC reset itself fails.

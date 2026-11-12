@@ -1,5 +1,11 @@
 # Handoff — rung 4: released cores never run our entry
 
+**CLOSED 2026-11-12 23:37.** Cause: the entry was relocated twice — `kimg_base + (sym - _start)`,
+where `kimg_base` is `_head` and `(uintptr_t)sym` was already a runtime address, so every release
+landed `0x80000` low in the zero pad and executed `udf #0`. Bare symbols fixed it (`out-diag/l16`
+stub, `out-diag/l17` real entry, both `mask=0xfe`). The hypotheses below are kept as history, not
+as open work; `docs/STATUS.md` carries the resolved text.
+
 For the next agent (Claude Code). Everything below is measured on the unit; nothing is
 inferred from datasheets. Read `AGENTS.md`, `docs/STATUS.md` (the last section) and
 `avicii/CONSTANTS.md` before touching anything.
