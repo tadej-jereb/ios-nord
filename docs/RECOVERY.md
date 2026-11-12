@@ -123,9 +123,16 @@ The manifest records `userdata` and `super` with their sizes instead of dumping
 them. `persist`, `modemst1/2`, `fsg`, `fsc` are only restorable onto *this*
 handset — see `docs/IMAGE_PROVENANCE.md` for the restore rules.
 
-## 4. Build slot b as the fallback (a stays active)
+## 4. Build the inactive slot as the fallback
 
-4.1 Flash the LOS `dtbo` and `vbmeta` to the **active** slot, which is where
+> **Actual slot state 2026-11-12:** the phone boots OOS from **slot b**, so the inactive
+> slot is **a** and sideload writes a. Swap every letter below if the phone is ever on a.
+> Verified: `getprop ro.boot.slot_suffix` = `_b`, `getvar current-slot` = `b`,
+> `flash.locked` = `0`, `verifiedbootstate` = `orange`, build `Q.GDPR.202309140004` (OOS 12),
+> model AC2003. TWRP for this firmware is the **aviciiv2** (FBEv2) build,
+> sha256 `3870c41e…fd87c`, `src/twrp_v2.img`.
+
+4.1 Flash the LOS `dtbo` and `vbmeta` to the **active** slot (b today), which is where
 the temporarily booted Lineage Recovery reads them from:
 
 ```sh
@@ -140,10 +147,10 @@ verification off; `libavb/avb_vbmeta_image.h`). No extra flags needed here, and
 the OTA payload writes the same kind of vbmeta into slot b.
 
 4.2 Put Lineage Recovery in `recovery_a` and sideload. Sideload writes the
-inactive slot, b:
+inactive slot, a:
 
 ```sh
-./fastboot flash recovery recovery.img
+./fastboot flash recovery recovery.img      # writes recovery_b while b is active
 ./fastboot reboot recovery
 adb sideload lineage-21.0-20240619-nightly-avicii-signed.zip
 ```
@@ -152,8 +159,8 @@ adb sideload lineage-21.0-20240619-nightly-avicii-signed.zip
 make it stick and let it boot:
 
 ```sh
-./fastboot getvar current-slot          # expect b; if it still says a:
-./fastboot --set-active=b
+./fastboot getvar current-slot          # expect a; if it still says b:
+./fastboot --set-active=a
 ./fastboot reboot
 ```
 

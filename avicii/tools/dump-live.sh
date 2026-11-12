@@ -36,9 +36,17 @@ fi
 
 UID_DEV="$("$ADB" shell id -u 2>/dev/null | tr -d '\r\n')"
 echo "device uid: '${UID_DEV}'"
+SU=0
 if [ "$UID_DEV" != "0" ]; then
-	echo "NOT root (uid=$UID_DEV). Run 'adb root' (or use TWRP / adb shell su) and retry." >&2
-	exit 2
+	# adb root is gated behind the LineageOS "Rooted debugging" toggle; fall back to su
+	# (Magisk), which the same reads work under.
+	if [ "$("$ADB" shell 'su -c id -u' 2>/dev/null | tr -d '\r\n')" = "0" ]; then
+		SU=1
+		echo "not adb-root; using su instead"
+	else
+		echo "NOT root (uid=$UID_DEV, su unavailable). Enable Developer options -> Rooted debugging, or run 'adb root'." >&2
+		exit 2
+	fi
 fi
 
 SERIAL="$("$ADB" get-serialno | tr -d '\r\n')"
@@ -47,9 +55,9 @@ printf '%s\n' "$SERIAL" >"$RUN/00-serial.txt"
 printf '%s\n' "$STAMP" >"$RUN/00-stamp.txt"
 
 # shell capture (text), via /bin/sh on the device
-sh_() { "$ADB" shell "$1" >"$RUN/$2" 2>&1; }
+sh_() { if [ "$SU" = 1 ]; then "$ADB" shell su -c "$1" >"$RUN/$2" 2>&1; else "$ADB" shell "$1" >"$RUN/$2" 2>&1; fi; }
 # raw capture (binary-safe, no CRLF translation)
-raw_() { "$ADB" exec-out "cat $1" >"$RUN/$2" 2>/dev/null; }
+raw_() { if [ "$SU" = 1 ]; then "$ADB" exec-out su -c "cat $1" >"$RUN/$2" 2>/dev/null; else "$ADB" exec-out "cat $1" >"$RUN/$2" 2>/dev/null; fi; }
 
 # ------------------------------------------------------- identity / build
 sh_ 'uname -a' 01-uname.txt
