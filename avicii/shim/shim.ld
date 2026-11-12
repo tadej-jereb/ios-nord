@@ -2,7 +2,11 @@ ENTRY(_head)
 SECTIONS
 {
 	. = 0;
-	.text : { *(.text.head) *(.text*) }
+	/* ABL enters at the image start, so the header stub lives at 0 and branches to
+	 * the body, which stock-shape places 0x80000 in (text_offset). */
+	.text.head : { *(.text.head) }
+	. = 0x80000;
+	.text : { *(.text*) }
 	.rodata : { *(.rodata*) }
 	.data : { *(.data*) }
 	. = ALIGN(16);
