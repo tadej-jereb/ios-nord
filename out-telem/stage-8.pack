@@ -1,0 +1,35 @@
+file            : ../../out-telem/stage-8/shim-boot.img (100663296 bytes)
+magic           : b'ANDROID!' OK
+kernel_size     : 0x574c1 (357569)
+kernel_addr     : 0x8000 (32768)
+ramdisk_size    : 0x62 (98)
+ramdisk_addr    : 0x1000000 (16777216)
+second_size     : 0x0 (0)
+second_addr     : 0x0 (0)
+tags_addr       : 0x100 (256)
+page_size       : 0x1000 (4096)
+header_version  : 0x1 (1)
+os_version_raw  : 0x18000179 (402653561)
+recovery_dtbo_size: 0x0 (0)
+recovery_dtbo_offset: 0x0 (0)
+header_size     : 0x670 (1648)
+name            : b''
+cmdline         : b'console=null'
+id (sha1)       : 4d0c0c0ab71830713585e54e5d99be55d4206ceb000000000000000000000000
+extra_cmdline   : b''
+os version      : 12.0.0 patch 2023-09
+kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
+ramdisk load adr: 0x1000000
+tags addr       : 0x100
+kernel section  : page 1 offset 0x1000 size 357569
+ramdisk section : offset 0x59000 size 98
+total needed    : 368640 bytes; file has 100663296
+avb footer      : present, original_image_size 368640, sections end 368640
+gzip ok         : 327680 bytes decompressed, crc ok, tail 337226 bytes at 0x4f77
+board dtb       : totalsize 337226
+
+PASS: header v1, stock avicii geometry, gzip+DTB kernel
+-rwxrwxr-x 1 tadej tadej    327680 Nov 12 21:16 ../../out-telem/stage-8/Image
+-rw-rw-r-- 1 tadej tadej    357569 Nov 12 21:16 ../../out-telem/stage-8/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 100663296 Nov 12 21:16 ../../out-telem/stage-8/shim-boot.img
+flash: fastboot boot ../../out-telem/stage-8/shim-boot.img   (or flash boot_a once the layout is confirmed)

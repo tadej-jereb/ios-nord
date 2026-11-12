@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the whole avicii diag ladder and verify every rung's boot image.
 #
-#   ./build-diag.sh                 # rungs 1-5 + read-only rungs 1-2, verify all
+#   ./build-diag.sh                 # rungs 1-8 + read-only rungs 1-2, verify all
 #   ./build-diag.sh -s "1 2"        # only these rungs
 #   ./build-diag.sh --no-ro         # skip the DIAG_LOG=0 (write-nothing) pair
 #
@@ -21,7 +21,7 @@ cd "$here"
 
 DTB=${DTB:-$repo/src/avicii-board.dtb}
 OUTDIR=${OUTDIR:-$here/out-diag}
-STAGES="1 2 3 4 5"
+STAGES="1 2 3 4 5 6 7 8"
 RO=1
 
 while [ $# -gt 0 ]; do
@@ -70,5 +70,5 @@ fi
 
 echo
 echo "images under $OUTDIR (<name>/shim-boot.img), sha256 in $OUTDIR/SHA256SUMS"
-echo "boot order: stage-1 first, then 2, 3, 4, 5; each adds one rung."
+echo "boot order: stage-1 first, then 2..5; 6..8 are the telemetry builds (docs/TELEMETRY.md)."
 [ "$fails" = 0 ] || { echo "$fails rung(s) failed" >&2; exit 1; }

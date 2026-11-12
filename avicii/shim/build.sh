@@ -29,10 +29,11 @@ SHIM_HDR=${SHIM_HDR:-1}
 [ "$SHIM_HDR" = 1 ] || { echo "error: this ABL only takes header v1 (SHIM_HDR=$SHIM_HDR)" >&2; exit 1; }
 
 # DIAG_STAGE: 0 = plain milestone shim, 1..5 = diag ladder rung (cumulative),
-# MAX = 5 (the default, full ladder). See diag.c and docs/DIAG.md.
+# 6..8 = telemetry rungs (IMEM record -> TLMM/SPMI -> haptic) in front of them,
+# MAX = 8 (the default, full set). See diag.c, docs/DIAG.md, docs/TELEMETRY.md.
 DIAG_STAGE=${DIAG_STAGE:-MAX}
-[ "$DIAG_STAGE" = MAX ] && DIAG_STAGE=5
-case "$DIAG_STAGE" in [0-5]) ;; *) echo "error: DIAG_STAGE=$DIAG_STAGE, want 0..5 or MAX" >&2; exit 1 ;; esac
+[ "$DIAG_STAGE" = MAX ] && DIAG_STAGE=8
+case "$DIAG_STAGE" in [0-8]) ;; *) echo "error: DIAG_STAGE=$DIAG_STAGE, want 0..8 or MAX" >&2; exit 1 ;; esac
 # OUT: separate build trees per rung so the ladder can be built in one run.
 OUT=${OUT:-out}
 # DIAG_LOG=0 builds an image that never writes (no UFS ring at all).
@@ -81,9 +82,9 @@ fi
 # pointers in .rodata (R_AARCH64_ABS64). Those are only correct if the image is
 # loaded at its link address (0); the shim is loaded wherever ABL likes, so keep
 # the switches as compare-and-branch. The ABS64 check below enforces it.
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DDIAG_STAGE=$DIAG_STAGE -DDIAG_LOG=$DIAG_LOG"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DDIAG_STAGE=$DIAG_STAGE -DDIAG_LOG=$DIAG_LOG ${EXTRA_CFLAGS:-}"
 mkdir -p "$OUT"
-OBJS="start shim console mmu fdt loader ufs diag diaglog"
+OBJS="start shim console mmu fdt loader ufs diag diaglog tel_imem tel_gpio tel_spmi tel_haptic"
 for f in $OBJS; do
 	case $f in
 	start) src=start.S ;;
@@ -121,8 +122,10 @@ else
 	(cd "$OUT" && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 
+# --os_version / --os_patch_level are not passed here: mkbootimg_v1.sh appends
+# the stock values (12.0.0 / 2023-09) itself, because serial-boot ABL refuses a
+# boot image with os_version 0 and the stock tuple is the one known accepted.
 ../tools/mkbootimg_v1.sh --kernel "$OUT/Image.gz-dtb" --ramdisk "$OUT/ramdisk.bin" \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "${CMDLINE:-console=null}" -o "$OUT/shim-boot.img"
 
 # Host render of the console layout (x86 gcc, host_test only).

@@ -1,0 +1,3 @@
+# build products of mk.sh: 100 MB per image and the extracted stock sections
+out/
+sections/

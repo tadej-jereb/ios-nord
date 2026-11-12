@@ -1,0 +1,163 @@
+STOCK reference: 100663296 bytes, sha256 183795b7a887d4f4c69e5b29cf65f3345ae6cea634ebdb2db49edc9cbaa45239, original_image_size 46198784
+
+== S1  size 100663296  original_image_size 46198784  sha256 183795b7a887d4f4c69e5b29cf65f3345ae6cea634ebdb2db49edc9cbaa45239
+   kernel_size              43876368 vs stock 43876368    
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size              1900641 vs stock 1900641     
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        identical
+   header padding       zero, as stock
+   kernel section       identical
+   ramdisk section      identical
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          704 vs stock 704
+   bytes differing      0
+   extra bytes past the footer: none
+
+== S2  size 100663296  original_image_size 46198784  sha256 7b91cdc630561fce7ddc8086482acfabe280ed1dcd2803374e8684b5283fec97
+   kernel_size              43876368 vs stock 43876368    
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size              1900641 vs stock 1900641     
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        identical
+   header padding       zero, as stock
+   kernel section       identical
+   ramdisk section      identical
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          512 vs stock 704
+   bytes differing      215
+   extra bytes past the footer: none
+
+== S3  size 100663296  original_image_size 46198784  sha256 45e7deacb39c4d387355c06d641499c23456bba2a8704c81017f1ac0434f6a20
+   kernel_size              43876358 vs stock 43876368       <-- DIFFERS
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size              1900641 vs stock 1900641     
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        differs (derived digest)
+   header padding       zero, as stock
+   kernel section       size 43876358 vs 43876368
+   ramdisk section      identical
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          512 vs stock 704
+   bytes differing      237
+   extra bytes past the footer: none
+
+== S4  size 100663296  original_image_size 46198784  sha256 005b6af0e5df9f6ce7eb1202e3cc6a4867f1e9593087985bf4596bbfcc15b232
+   kernel_size              43876368 vs stock 43876368    
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size              1900641 vs stock 1900641     
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        differs (derived digest)
+   header padding       zero, as stock
+   kernel section       identical
+   ramdisk section      identical
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          512 vs stock 704
+   bytes differing      235
+   extra bytes past the footer: none
+
+== S5  size 100663296  original_image_size 44298240  sha256 f024b50b3471ce36ec62f09539ab3c6b29bd996bc9be99883c7136c5e78a61e3
+   kernel_size              43876368 vs stock 43876368    
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size                   98 vs stock 1900641        <-- DIFFERS
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        differs (derived digest)
+   header padding       zero, as stock
+   kernel section       36147306/43876368 bytes differ
+   ramdisk section      size 98 vs 1900641
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          512 vs stock 704
+   bytes differing      38121088
+   extra bytes past the footer: none
+
+== S6  size 100663296  original_image_size 774144  sha256 599f878e9b93c7e3b00d95fc4bd0404d6d8c5fce788b7d8db75b21a62e6380b6
+   kernel_size                354519 vs stock 43876368       <-- DIFFERS
+   kernel_addr                 32768 vs stock 32768       
+   ramdisk_size                   98 vs stock 1900641        <-- DIFFERS
+   ramdisk_addr             16777216 vs stock 16777216    
+   second_size                     0 vs stock 0           
+   second_addr                     0 vs stock 0           
+   tags_addr                     256 vs stock 256         
+   page_size                    4096 vs stock 4096        
+   header_version                  2 vs stock 2           
+   os_version              469762437 vs stock 469762437   
+   recovery_dtbo_size              0 vs stock 0           
+   recovery_dtbo_offset            0 vs stock 0           
+   header_size                  1660 vs stock 1660        
+   dtb_size                   406620 vs stock 406620      
+   dtb_addr                 32505856 vs stock 32505856    
+   cmdline              identical (235 bytes)
+   id (sha1 20B)        differs (derived digest)
+   header padding       zero, as stock
+   kernel section       size 354519 vs 43876368
+   ramdisk section      size 98 vs 1900641
+   dtb section          identical
+   footer at            0x5ffffc0 vs stock 0x5ffffc0  AVBf ok
+   vbmeta size          512 vs stock 704
+   bytes differing      38107967
+   extra bytes past the footer: none

@@ -25,6 +25,7 @@
 #include "fdt.h"
 #include "memtab.h"
 #include "mmu.h"
+#include "tel.h"
 #include "ufs.h"
 
 /* The image is freestanding: clang emits calls to these for struct and array
@@ -55,7 +56,12 @@ void *memcpy(void *dst, const void *src, unsigned long n)
 #endif
 #define STR2(x) #x
 #define STR(x) STR2(x)
-#define STAGE_S "stage " STR(DIAG_STAGE) " of 5"
+#if DIAG_STAGE >= 6
+#define STAGE_TOTAL 8
+#else
+#define STAGE_TOTAL 5
+#endif
+#define STAGE_S "stage " STR(DIAG_STAGE) " of " STR(STAGE_TOTAL)
 
 #define GICD_BASE	0x17a00000UL
 #define GICD_PIDR2	(GICD_BASE + 0xfe8)
@@ -571,6 +577,27 @@ int diag_run(uintptr_t fdt)
 	return 0;
 #else
 	diag_mode = 1;
+#if DIAG_STAGE >= 6
+	/*
+	 * Telemetry first: the ring and the console are both unproven on this
+	 * command-mode panel, so every cheap side effect that survives a reset is
+	 * laid down before either is touched. The ring then comes *after* the
+	 * record (step 2c): a ring line can never be the first evidence, and
+	 * dlog_init hanging still leaves "code ran this far" in IMEM.
+	 */
+	tel_begin(DIAG_STAGE);
+	tel_imem_rung();
+#if DIAG_STAGE >= 7
+	tel_gpio_rung();
+	tel_spmi_rung();
+#endif
+#if DIAG_STAGE >= 8
+	tel_haptic_rung();
+#endif
+	tel_alive_ms(0);
+	tel_mark(DIAG_STAGE >= 8 ? TEL_S8_PARK : DIAG_STAGE == 7 ? TEL_S7_PARK : TEL_S6_PARK);
+	tel_say('-', "END", "telemetry rungs done; unproven path continues");
+#endif
 #if DIAG_STAGE < 3
 	(void)fdt;
 #endif

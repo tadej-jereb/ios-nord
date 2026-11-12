@@ -1,0 +1,6 @@
+8429032133608bf3a3740dd5ccb0d77ab2eda8a1723001cce2e67c75f554edca  stage-6/shim-boot.img
+f65665c69a986906f0d5e37b4e2abc7a8937c18b201db47c42c518061cdb773d  stage-6-ro/shim-boot.img
+22165dc07adcd2b8a657e5a46988af7b93cd6f00f7f6d1cecc097437ad5b5cc8  stage-7/shim-boot.img
+b0dc568409bce492e418f535614d1860c53c0bd2f1819adf33d313cfff4f9af5  stage-8/shim-boot.img
+b005174a5f0f6ff7068167365fe381a8fbacb1f454fb7891672e1eccb0818f35  anchor-park/shim-boot.img
+e3a5372769c395870150ed9b9f11154506ab7c4570a90cc7bdb16660da814674  anchor-refuse/shim-boot.img  # verify FAILS on purpose

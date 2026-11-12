@@ -81,6 +81,8 @@ if magic != b'ANDROID!':
 if v['header_version'] != 1:
     warn.append(f'header_version {v["header_version"]} (stock avicii ships v2 and boots it; '
                 'v1 Image.gz-dtb is what this port packs)')
+if (v['os_version_raw'] >> 11) == 0:
+    bad.append('os_version is 0 - ABL refuses this image (anti-rollback); pass OS_VERSION')
 if v['page_size'] != 4096:
     bad.append(f'page_size {v["page_size"]} != 4096')
 if v['header_version'] in (0, 1) and v['header_size'] != 1648:
@@ -109,7 +111,7 @@ foot = d.rfind(b'AVBf')
 if foot < 0 or len(d) - foot != 64:
     bad.append('no AVB footer at the end of the partition (ABL will not execute this image)')
 else:
-    orig, = struct.unpack_from('<Q', d, foot + 12)
+    orig, = struct.unpack_from('>Q', d, foot + 12)
     need = p + ((ks + p - 1) // p) * p + ((rs + p - 1) // p) * p
     print(f'avb footer      : present, original_image_size {orig}, sections end {need}')
     if orig < need:
@@ -183,12 +185,17 @@ done
 # accepted by fastboot and then simply never executed. Unsigned hash footer
 # (--algorithm NONE) is what the stock image itself carries.
 PART_SIZE=${PART_SIZE:-100663296}
+# ABL with secboot=enabled REFUSES a boot image whose os_version is 0 (anti-rollback):
+# the image is accepted by fastboot, then dropped back after ~6 s. Stock carries
+# 0x1c000185 (Android 12.0.0 / 2023-09). Never pack without these.
+OS_VERSION=${OS_VERSION:-12.0.0}
+OS_PATCH_LEVEL=${OS_PATCH_LEVEL:-2023-09}
 "$PYTHON" "$MKBOOTIMG_PY" --header_version "$HDR" \
 	--kernel "$KERNEL" --ramdisk "$RAMDISK" \
 	--base "$BASE" --kernel_offset "$KERNEL_OFFSET" \
 	--ramdisk_offset "$RAMDISK_OFFSET" --second_offset "$SECOND_OFFSET" \
 	--tags_offset "$TAGS_OFFSET" --pagesize "$PAGESIZE" \
-	"${EXTRA[@]}" -o "$OUT"
+	"${EXTRA[@]}" --os_version "$OS_VERSION" --os_patch_level "$OS_PATCH_LEVEL" -o "$OUT"
 
 # Pad the sections to the partition and append the AVB footer, then verify.
 AVBTOOL="${AVBTOOL:-$(dirname "$0")/avbtool.py}"

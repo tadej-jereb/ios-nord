@@ -117,3 +117,26 @@ about to stare at.
 If `userdata` was reformatted for the iOS root, the Android fallback boots to a
 clean first-run wizard. That is expected, not a second failure: `fastboot -w`
 (or TWRP's format data) before judging it.
+
+## 2026-11-12 21:0x — telemetry set (DIAG_STAGE 6/7/8 + anchors), host-built
+
+Not flashed at write time. All host-built from `avicii/shim` with
+`DTB=src/avicii-board.dtb`, `--verify` PASS except `anchor-refuse` (on purpose).
+Slot for all of them: **`boot_b`** (`boot_a` has no system metadata since the
+LOS flash; `boot_b` is restored from `backup/64f70df8/boot_b.img`).
+
+| image | stage | verify | sha256 |
+|---|---|---|---|
+| `out-telem/stage-6/shim-boot.img` | 6 | PASS | `8429032133608bf3a3740dd5ccb0d77ab2eda8a1723001cce2e67c75f554edca` |
+| `out-telem/stage-6-ro/shim-boot.img` | 6, ring off | PASS | `f65665c69a986906f0d5e37b4e2abc7a8937c18b201db47c42c518061cdb773d` |
+| `out-telem/stage-7/shim-boot.img` | 7 | PASS | `22165dc07adcd2b8a657e5a46988af7b93cd6f00f7f6d1cecc097437ad5b5cc8` |
+| `out-telem/stage-8/shim-boot.img` | 8 | PASS | `b0dc568409bce492e418f535614d1860c53c0bd2f1819adf33d313cfff4f9af5` |
+| `out-telem/anchor-park/shim-boot.img` | park before C | PASS | `b005174a5f0f6ff7068167365fe381a8fbacb1f454fb7891672e1eccb0818f35` |
+| `out-telem/anchor-refuse/shim-boot.img` | broken gzip magic | FAIL (on purpose) | `e3a5372769c395870150ed9b9f11154506ab7c4570a90cc7bdb16660da814674` |
+
+Image header: v1, `Image.gz-dtb`, os_version 12.0.0 / 2023-09 (stock tuple,
+anti-rollback), unsigned AVB hash footer, padded to the 96 MiB partition.
+Protocol: `docs/TELEMETRY.md` §5; timing: `docs/TIMING.md` §3.
+Result: __________ (fill after the runs; the record is readable only after the
+B2 normal boot, so paste `out-telem/timing/<stamp>/runs.tsv` and the
+`51-imem-read.sh` transcript).

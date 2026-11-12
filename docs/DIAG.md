@@ -69,6 +69,13 @@ DIAG_STAGE=1 ./build-diag.sh -s 1
 value is compiled in, so a stage-3 image contains rungs 1, 2 and 3 and cannot be
 talked into rung 4.
 
+Stages **6, 7 and 8** are a different kind of build and live in
+`docs/TELEMETRY.md`: the cheap side effects (IMEM record, TLMM/SPMI, haptic) are
+laid down *before* the ring and the console, because neither of those has ever
+produced a byte. A stage-6 image therefore writes the IMEM record first and only
+then enters the code below. While the question is still "does anything execute",
+use `docs/TELEMETRY.md` and `docs/TIMING.md` rather than rungs 1-5.
+
 ## 2. Verify (gate: do not boot an image that has not printed this)
 
 ```sh

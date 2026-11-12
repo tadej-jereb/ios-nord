@@ -7,6 +7,8 @@ refs/
 *.img
 *.bin
 build/
+# control-image series sources under avicii/build (the *.img outputs stay ignored via *.img)
+!avicii/build/
 __pycache__/
 *.adt
 *.dtb

@@ -152,3 +152,20 @@ CONTROL TIMING (measured 2026-11-12 ~20:58, adb server killed before each run)
 A refusal is therefore 2.5x faster than the earliest userspace contact of a healthy
 kernel: ABL gives up before it would even have handed over. Use 6000 ms vs >16000 ms
 as the pass/fail discriminator in every later test.
+
+BREAKTHROUGH 2026-11-12 ~21:10 — the packaging gate is os_version
+---------------------------------------------------------------
+ABL with `secboot=enabled` REFUSES any boot image whose header os_version is 0. The
+stock value is 0x1c000185 (Android 12.0.0 / 2023-09). Proven by control: the same
+stock kernel, packed by us, was refused while os_version was 0 and BOOTED in 22 s once
+the field was stamped. `mkbootimg_v1.sh` now defaults OS_VERSION=12.0.0 /
+OS_PATCH_LEVEL=2023-09 and its verify FAILS on 0.
+
+Cleared by measurement in the process (all refused identically, so all irrelevant to
+the refusal): header v1 vs v2, gzip vs raw kernel, appended DTB vs none, empty vs stock
+ramdisk, console=null vs stock cmdline, AVB footer present or absent, text_offset 0 vs
+0x80000, kernel section padded to stock weight, and a matching vbmeta_b.
+
+Still open: our shim in that same now-correct container is refused at ~6 s, so the shim's
+own entry convention is the remaining fault. H-series hybrids (stock first page, park loop
+at stock's branch target +0x92000) are being built to localise it.

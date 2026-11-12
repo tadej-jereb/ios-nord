@@ -111,3 +111,17 @@ Plan changes, all verified, all recorded in `docs/SHIM_BOOT.md`:
 Blocker: the shim dies ~6 s in, before its first C statement (`for(;;) wfe`-only build also fails).
 Bisect images `bisect-N` are being produced (N1 = header+park, MMU off → N5 = console clear).
 Next: flash them in order with a restore between each.
+
+Measurement and telemetry, independent of the packer: `docs/TIMING.md` +
+`tooling/50-boot-timing.sh` decide refused-vs-died on a millisecond plateau with
+the stock control, and `docs/TELEMETRY.md` + `avicii/shim/tel_*.c`
+(`DIAG_STAGE=6/7/8`) leave evidence that survives a refusal (IMEM record, then
+TLMM/SPMI, then the motor). Rebuilt images and their sha256: `out-telem/`.
+
+Complementary line, 2026-11-12 late: `avicii/build/` holds a six-image controlled series (S1 stock
+control, S2 footer-only, S3/S4 our packer at stock shape, S5/S6 park payload) that separates packer
+shape from payload; flash order, expectations and the single fix per failure are in
+`docs/PAYLOAD_ORDER.md`. Measured while building it: the stock image carries a **real dtb section**
+(`dtb_size 406620` at `0x1f00000`, blob at `0x2bab000`), and our packer reproduces stock byte for
+byte up to `original_image_size` except the sha1 `id`.
+
