@@ -140,3 +140,25 @@ Protocol: `docs/TELEMETRY.md` §5; timing: `docs/TIMING.md` §3.
 Result: __________ (fill after the runs; the record is readable only after the
 B2 normal boot, so paste `out-telem/timing/<stamp>/runs.tsv` and the
 `51-imem-read.sh` transcript).
+
+## 2026-11-12 late - H/F hybrid set (entry convention), host-built
+
+Not flashed at write time. Hypothesis list, kill experiments, pass criterion and the
+expected/observed table: `docs/HYBRID.md`. Slot: **`boot_b`**, restore
+`backup/64f70df8/boot_b.img` between runs. All 100663296 B, `--verify` PASS (v2 WARN is
+expected). Corrects two earlier notes: stock `os_version` is **14.0.0 / 2024-05**
+(`0x1c000185`), not 12.0.0/2023-09, and stock's `code0` branches to **+0x2480000**, not
++0x92000 (`imm26` is a word count).
+
+| image | verify | sha256 |
+|---|---|---|
+| `hybrid/out/h1.img` | PASS | `1dd159a985f44a9a46e7a0253757826d851b67e6838908f016d72fb40621b616` |
+| `hybrid/out/h1x.img` | PASS | `cb6fadb8ee4fa07054a2715a42c77c1c567bed5fd8aa770e94cf1858209b6e31` |
+| `hybrid/out/h2.img` | PASS | `3ae325aa9e76a3fe6e54e1e53c6ec683c23b2b14e7066bcbb7d7bfa6174222ef` |
+| `hybrid/out/h3.img` | PASS | `594c6109764dd3d6803687689ea4fa2ca3e1485595cbeeaa07f380803f2ca9d5` |
+| `hybrid/out/h4.img` | PASS | `597175f4f36b6ffe1bfab56bdbc154541043b822c91df5a4571b3a5c9c0167f5` |
+| `hybrid/out/f1.img` | PASS | `ff8cf597d1ee222a9b3df13e8da6fd18f71327955e58bab541d7cb8b144a19c4` |
+| `hybrid/out/f2.img` | PASS | `4a44c043deeaf9583fd6fabbbb9ac9896f0d26e518738a970126e7a95a1a4700` |
+| `hybrid/out/f3.img` | PASS | `aaae3ba4e7fad78747e978012a63ac4387de45fc5e7108382d4fbb534bac5ba7` |
+
+Result: __________ .

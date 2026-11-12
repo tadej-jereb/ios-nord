@@ -187,7 +187,9 @@ done
 PART_SIZE=${PART_SIZE:-100663296}
 # ABL with secboot=enabled REFUSES a boot image whose os_version is 0 (anti-rollback):
 # the image is accepted by fastboot, then dropped back after ~6 s. Stock carries
-# 0x1c000185 (Android 12.0.0 / 2023-09). Never pack without these.
+# 0x1c000185, which decodes to Android 14.0.0 / patch 2024-05 (imm26-style packing:
+# major<<25 | minor<<18 | patch<<11 | (year-2000)<<4 | month). OS_VERSION below is a
+# floor, not the stock tuple - docs/HYBRID.md packs stock's exact bytes.
 OS_VERSION=${OS_VERSION:-12.0.0}
 OS_PATCH_LEVEL=${OS_PATCH_LEVEL:-2023-09}
 "$PYTHON" "$MKBOOTIMG_PY" --header_version "$HDR" \

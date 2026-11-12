@@ -1,0 +1,10 @@
+target        : h1
+payload       : stock's first page (header AND stub) byte for byte; our 8-byte park at stock's own branch landing 0x2480000
+code0         : +0x2480000
+expected      : park: off fastboot, off adb >= 90 s
+proves        : page-0 byte identity is sufficient to be entered, and the landing offset in stock's code0 is what the ABL actually honours
+if refused    : if refused: page 0 identity is not enough -> the fault is the section layout or weight -> run H3/H4, then F-series
+os_version    : 0x1c000185 (stock)
+partition     : 100663296 B
+flash         : boot_b, restore_image backup/64f70df8/boot_b.img between runs
+measure       : tooling/50-boot-timing.sh, plateau vs the stock control

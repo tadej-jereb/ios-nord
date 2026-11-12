@@ -1,0 +1,10 @@
+target        : h2
+payload       : our own 0..0x40 Image header, stock bytes 0x40..0x1000, park at our code0's destination 0x800
+code0         : +0x800
+expected      : park, or refused
+proves        : with H1: a park at H1 and a refusal here localises the fault to our header fields 0..0x40; a park here too exonerates the header and points at the body
+if refused    : if refused while H1 parks: go to F1/F2/F3 to name the field
+os_version    : 0x1c000185 (stock)
+partition     : 100663296 B
+flash         : boot_b, restore_image backup/64f70df8/boot_b.img between runs
+measure       : tooling/50-boot-timing.sh, plateau vs the stock control

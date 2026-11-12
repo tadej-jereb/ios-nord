@@ -1,11 +1,15 @@
-# ABL forensics: why our packer's images are not executed
+# ABL forensics: the `os_version` gate, and the field-value reference for a valid image
 
 Scope: host-side byte analysis of the boot images named in the task, plus the device's own
 pstore/`misc`/`ro.boot.*` channels. Nothing flashed here; the orchestrator flashes.
-Written 2026-11-12. Every number below comes from a tool run pasted in this file, or from a
-command whose output is quoted; anything reasoned from those numbers is labelled
-**HYPOTHESIS**. Host scratch tooling: `logs/forensics/` (`parse.py`, `digest2.py`,
-`check_bootimg.py`, `build/`).
+Written 2026-11-12, rewritten the same evening when the device result landed (§0): the gate
+is a zero `os_version` in the header, and container shape is proven irrelevant. The byte
+tables are kept as the authoritative reference they are (§2, §2.1, §3); footer/vbmeta
+findings are kept but demoted.
+
+Every number below comes from a tool run pasted in this file, or from a command whose output
+is quoted; anything reasoned from those numbers is labelled **HYPOTHESIS**. Host scratch
+tooling: `logs/forensics/` (`parse.py`, `digest2.py`, `check_bootimg.py`, `build/`).
 
 Images under analysis (sha256, all 100663296 B = the 96 MiB boot partition):
 
@@ -20,27 +24,64 @@ Images under analysis (sha256, all 100663296 B = the 96 MiB boot partition):
 
 ---
 
-## 0. Verdict, ranked
+## 0. Result: the gate is `os_version` = 0
 
-`repack7` and stock share a byte-identical kernel and ramdisk and differ in **five header
-bytes only** inside the region they share (§4); the entire difference between them is the
-406620-byte dtb section that stock has and repack7 does not. Both controls and *every* image
-this phone has ever accepted carry a `dtb` section; all four refusals do not. That is the finding; the rest of this section is the ranking of
-everything else that differs, and §5 is the list of candidates the bytes already exclude.
+**Device result (orchestrator, 2026-11-12 late):** ABL refuses a boot image whose header
+`os_version` (offset 44) is 0 — `secboot=enabled` + anti-rollback. Stamping the stock value
+`0x1c000185` into a stock kernel we had packed made it **boot immediately**. `mkbootimg_v1.sh`
+now defaults `OS_VERSION` and its `--verify` fails a zero.
 
-| # | difference | stock (works) | ours (fails) | confidence |
+So the executable gate is one 4-byte header field, not the footer and not the container
+shape. **Container shape is proven irrelevant** from the flash series: header v1 and v2,
+gzip and raw kernel, dtb section present and absent, ramdisk size, `text_offset`, kernel
+weight — every combination was refused identically until `os_version` was non-zero. §5 keeps
+the measurements that make each of those "excluded" claims concrete, and §2/§3 stay as the
+byte-level reference.
+
+What the bytes add to the result:
+
+* Ours were exactly in the blind spot. `os_version` = `0x0` in `v1stock` and `p0c`; the two
+  `dtb`-less stocks carried a *non-zero* value and were refused earlier for the reasons the
+  shape series has since isolated (`repack7` = `0x1c000185`, `p0f` = `0x22000236`, both
+  `dtb_size 0`). Recorded as-is: a non-zero `os_version` is necessary, and on this evidence
+  not sufficient (see §10.1).
+* `p0f` is the one image in this set that PASSes the packaging rules (`check_bootimg.py`) and
+  still failed — its refusal is an entry/payload question, not a packaging one, which is
+  exactly what the sibling bisect is for.
+* Both controls carry stock's value byte-for-byte (`0x1c000185` in stock *and* in the Magisk
+  backup), so no control ever exercised the zero case: the defect could not show up in any
+  host-side comparison against them. That is why a byte table alone could not find it — only
+  the device did.
+
+### Ranked differences, as a reference (not a ranking of causes any more)
+
+| # | difference | stock (works) | ours | status now |
 |---|---|---|---|---|
-| 1 | `dtb` section present | `dtb_size` = **406620**, `dtb_addr` = **0x1f00000**, 406620-byte FDT at 0x2bab000 | `dtb_size` = **0**, `dtb_addr` = **0x0**, no dtb section (repack7, p0c); v1 images: no dtb section and no dtb fields at all (v1stock, p0f) | **VERIFIED difference**; gate status HYPOTHESIS (see §4, §10) |
-| 2 | header version | **2** | 1 (v1stock, p0f) | HYPOTHESIS (secondary). Every image that boots on this phone is v2 — boot, recovery, TWRP all carry a dtb section (v2 magic at 40 = 2 for all three). `docs/SHIM_BOOT.md:9-16` already records that the "avicii drops v2" claim is false |
-| 3 | `dtb_addr` used as the `x0` FDT pointer | 0x1f00000 → a real FDT | **0** | HYPOTHESIS, sub-case of 1: with `dtb_size`=0 our header hands ABL nowhere to load a tree and `x0`=0 is the natural outcome (`avicii/shim/start.S:3` "x0 = DTB pointer") |
-| 4 | `os_version` | 0x1c000185 (= `14.0.0` / `2024-05`, the tool's own round-trip) | 0x0 (v1stock, p0c); 0x22000236 (p0f); stock's value (repack7) | weak as a gate: `mkbootimg_v1.sh` now hard-fails `os_version` 0 on an anti-rollback claim, but repack7 and p0f carry non-zero values and are refused too, so 0 is not sufficient to be refused and not necessary |
-| 5 | embedded-vbmeta size / contents | 704 B, hash descriptor + 2 property descriptors | 512 B, hash descriptor only | weak: shape is legal, `avbtool info_image` parses it, and property descriptors are informational |
-| — | **footer digest freshness** | matches | also matches on all four failures | **excluded** (§5) |
-| — | footer presence, magic, version, partition size, page size, magic `ANDROID!`, load addresses, `header_size`, all padding | — | identical | **excluded** (§5) |
+| 1 | **`os_version` (off 44)** | `0x1c000185` = 14.0.0 / 2024-05 | **`0x0`** in v1stock, p0c; `0x22000236` in p0f; `0x1c000185` in repack7 | **GATE (device-proven)** |
+| 2 | `dtb` section | `dtb_size` 406620 @0x2bab000, `dtb_addr` 0x1f00000 | `dtb_size` 0 / `dtb_addr` 0 everywhere in this set | shape — proven irrelevant as a gate; keep it anyway (§5) |
+| 3 | header version | 2 | 1 in v1stock, p0f | shape — proven irrelevant |
+| 4 | embedded-vbmeta size / props | 704 B + 2 property descriptors | 512 B, hash descriptor only | cosmetic; `verify` now matches with properties, but they change nothing |
+| 5 | footer digest freshness | matches | matches on all four failures too | cosmetic (§7) |
+| — | footer presence/magic/version, partition size, page size, `ANDROID!`, load addresses, `header_size`, padding | — | identical | structural, never the cause |
 
-Consequence: a footer that merely *parses* is provably not enough — our four refusals all
-carry a structurally perfect, self-consistent footer whose `SHA256` over
-`image[0:original_image_size]` recomputes correctly (§5).
+The authoritative per-field value table for a valid image — every field, its stock value and
+whether it is load-bearing — is §2 and §2.1.
+
+Current verdicts of `logs/forensics/check_bootimg.py` over this set (it fails on `os_version`
+0, passes stock's geometry; shape lines are informational):
+
+```
+src/los21-boot.img                    PASS      controls
+backup/64f70df8/boot_b.img            PASS
+logs/forensics/build/raw.img          PASS      stock payload + recipe, byte-identical but 50 B
+logs/forensics/build/shimfix.img      PASS      shim payload + recipe
+/tmp/repack7.img                      PASS      f5271cdf…  refused on the device: unexplained by os_version
+avicii/shim/out-diag/p0f/shim-boot.img PASS     fdb6061b…  refused on the device: unexplained by os_version
+/tmp/v1stock.img                      FAIL      os_version 0
+avicii/shim/out-diag/p0c/v2.img        FAIL      os_version 0
+```
+
+The two PASS-and-still-refused images are the open work (§4, §10).
 
 ---
 
@@ -53,8 +94,8 @@ carry a structurally perfect, self-consistent footer whose `SHA256` over
    embedded `boot` hash descriptor digest as `sha256(salt ‖ image[0:image_size])` and compare
    (§5).
 4. `cmp`-style full-file diff of stock against a rebuild by our own tooling (§8).
-5. Read the device's pstore, `misc` and `ro.boot.*` to size the log channel that can settle
-   the remaining HYPOTHESIS (§9).
+5. Read the device's pstore, `misc` and `ro.boot.*` to build the collection transcript that
+   still settles refused-vs-entered (§9).
 
 The footer is big-endian: `struct "!4sIIQQQ28s"` (`avbtool.py:1999` `FORMAT_STRING`;
 `RESERVED`=28 so the footer is 64 B in the last 64 B of the partition). Reading it
@@ -101,6 +142,23 @@ p0c is header v2, kernel 315392 (uncompressed Image), ramdisk 99, `os_version` 0
 Stock's bytes at 1648-1659 are `5c 34 06 00 | 00 00 f0 01 00 00 00 00` — the only five
 bytes of the whole stock image that are non-zero here and zero in repack7 (`1648, 1649,
 1650, 1654, 1655`).
+
+### 2.1 Which fields are load-bearing
+
+The four classes, with the stock value to copy for each. Nothing here is inferred: every
+"must" is either device-proven or forced by the parser/ABL reading the field.
+
+| class | fields | stock value to write |
+|---|---|---|
+| **must be non-zero / exact (gate)** | `os_version` (44) | `0x1c000185` = `--os_version 14.0.0 --os_patch_level 2024-05`. 0 is refused. The encoding is `(((a<<14)\|(b<<7)\|c) << 11) \| ((y-2000)<<4 \| m)` — any non-zero spelling writes *something*, but `0x1c000185` is the only value the phone is known to accept |
+| **must equal stock (ABL/loader reads them)** | `magic` `ANDROID!`, `page_size` 4096, `header_version` 2, `kernel_addr` 0x8000, `ramdisk_addr` 0x1000000, `tags_addr` 0x100, `second_size` 0, `second_addr` 0, section order kernel→ramdisk→dtb, page-aligned sections, vbmeta page-aligned at end of sections, footer in the last 64 B, file exactly 100663296 B | as in §2, offsets 0/8/12/16/20/24/28/32/36/40 |
+| **should equal stock (shape; proven not to gate)** | `dtb_size` 406620, `dtb_addr` 0x1f00000, `header_size` 1660, `recovery_dtbo_*` 0 | as stock |
+| **cosmetic / informational** | `id` (32 B content digest), `name`, `cmdline` (stock's anyway), `extra_cmdline` empty, the patch-level bits inside `os_version`, vbmeta property descriptors, footer salt and digest, vbmeta header flags, `original_image_size` precision beyond "covers every section" | — |
+
+Kernel side, for completeness (all of it payload, none of it packaging): the kernel section
+must carry an arm64 Image header — `code0` a `b`, `text_offset` 0, `image_size` = the section
+length, `flags` 0xa (LE, 4K, place-anywhere), `ARM\x64` magic at 0x38 — which `start.S:5-17`
+already emits, and `p0c/Image` carries (offset 0x38 = `ARMd`).
 
 ---
 
@@ -169,7 +227,7 @@ descriptor but a freshly generated salt and a digest that recomputes correctly.
 
 ---
 
-## 4. The A/B that isolates the dtb section
+## 4. The A/B that isolates the container delta
 
 `repack7` is our packer fed the stock kernel and the stock ramdisk. Its payload is not
 "similar" to stock, it is **the same bytes**:
@@ -181,6 +239,10 @@ ramdisk stock  sha256 5d5a792b3d85c016032443504bec1d74…
 ramdisk repack7 sha256 5d5a792b3d85c016032443504bec1d74…
 cmdline equal: True      id equal: True (both 9e8527a0…)
 ```
+
+This pair is the cleanest container A/B on disk: the only difference between a booting and a
+non-booting image is the absent dtb section (the device series later showed even that is not
+sufficient to explain a refusal — both of these carry a non-zero `os_version`).
 
 Full-file compare of stock vs repack7 over `0 … 0x2bab000` (everything up to where stock's
 dtb begins) yields **5 differing bytes: offsets 1648, 1649, 1650, 1654, 1655** — exactly
@@ -203,24 +265,35 @@ src/twrp_v2.img         hdrver 2  page 4096  dtb (1096921,  0x1f00000)
 
 and the LOS `recovery.img` reuses stock's identical 406620-byte tree.
 
-HYPOTHESIS on mechanism, two branches, both consistent with a constant ~6 s with no
-watchdog (bark is 15 s, `docs/BISECT.md:47`):
+Where that leaves this pair: both carry the same non-zero `os_version`, so the `os_version`
+result alone does not explain repack7's refusal. Either the dtb (or its `x0` correlate) is a
+real second gate, or repack7's refusal had an unrelated cause and the flash series' "shape
+does not matter" result is the correct reading. Two branches, both consistent with a constant
+~6 s and with no watchdog (bark is 15 s, `docs/BISECT.md:47`):
 
-* **A — ABL refuses before hand-off.** For a v2 image ABL loads `dtb_size` bytes at
-  `dtb_addr`; with both zero there is nothing to load and it bails back to fastboot. Best
-  fit for the parked-shim evidence: a `wfe` park cannot return on its own, yet it returns in
-  the same 6 s as the 30 s-spin variant, so the shim was never executed.
+* **A — ABL refuses before hand-off.** Best fit for the parked-shim evidence: a `wfe` park
+  cannot return on its own, yet it returns in the same 6 s as the 30 s-spin variant, so the
+  shim was never executed.
 * **B — ABL hands off and the payload dies at once.** `x0` = 0 into
-  `fdt_check_header()`/`setup_arch` faults, `reboot=panic_warm` (in the cmdline) warm-resets.
-  Explains the real kernel; does not explain a parked shim.
+  `fdt_check_header()`/`setup_arch` faults and `reboot=panic_warm` (in the cmdline) warm-resets
+  — but that cannot kill a parked shim.
 
 §9's procedure decides between them: a panic writes `dmesg-ramoops-*`, a refusal writes
-nothing.
+nothing. The decisive cheap test is a dtb-less v2 image with `os_version` `0x1c000185`
+straight from the current wrapper: if it boots, the dtb was never load-bearing (§5, §10.1).
 
 ---
 
-## 5. Candidates the bytes exclude
+## 5. Shape and footer candidates, all excluded
 
+Excluded means: the two controls and the refusals can be told apart on none of these, or they
+were flipped one at a time in the flash series and the refusal did not move.
+
+* **Container shape.** v1 vs v2, gzip vs raw kernel, dtb present vs absent, ramdisk size and
+  kernel weight: all refused identically until `os_version` was non-zero (device result, §0).
+  Our `dtb`-less `repack7` and `p0c` are the concrete cases; the working `p0f` is v1 with no
+  dtb at all once its `os_version` is non-zero. Keep the stock shape anyway: it costs one
+  `--dtb` flag and removes the question (§8).
 * **Footer digest freshness.** `sha256(salt ‖ image[0:image_size])` recomputes to the stored
   digest on stock, repack7, v1stock, p0f, p0c — and **fails on the boots-fine magisk image**
   (stored digest and `image_size` = stock's 46198784/`23bf8963…`, while the file's own
@@ -244,7 +317,7 @@ nothing.
 
 ---
 
-## 6. What Magisk's patcher actually does to the footer and the padding
+## 6. What Magisk's patcher actually does to the header, the footer and the padding
 
 Source: `topjohnwu/Magisk`, `native/src/boot/bootimg.cpp` (master; the on-disk APK is
 v31.1). Registration of the footer, in the `boot_img` constructor:
@@ -299,6 +372,29 @@ Repack, three steps, in this order:
 PATCHVBMETAFLAG=false`), so the copied header keeps its original `Flags: 0` — confirmed in
 the backup: both its descriptor flags and its vbmeta-header flags read 0.
 
+### `os_version` is preserved because the header is never rebuilt
+
+`magiskboot` maps the image and wraps the existing header in place (`dyn_img_hdr`, a
+`boot_img_hdr` view over the mapping) instead of assembling a new one. Every field it does
+not deliberately change is re-serialised from the original bytes, so `os_version` survives a
+patch untouched — measured: `boot_b.img` offset 44 carries `0x1c000185`, byte-identical to
+stock.
+
+Two details matter for us:
+
+* the value can only be *overridden* through an unpacked `header` file
+  (`dyn_img_hdr::load_hdr_file`, `key == "os_version"` → `os_version() = (((a << 14) |
+  (b << 7) | c) << 11) | patch_level`), so a hand-edited header keeps the rest;
+* Magisk's own dumper emits the line **only when the value is non-zero**
+  (`if (uint32_t os_ver = os_version()) { … }` in `dyn_img_hdr::dump_hdr_file`), i.e. Magisk
+  treats 0 as "unset" as well. A `magiskboot unpack --header` / `repack` round trip of an
+  image whose `os_version` is 0 therefore keeps it 0 — Magisk preserves the bug, it never
+  repairs it.
+
+Consequence: a Magisk-patched stock image is a *safe* template precisely because it inherits
+stock's `os_version`, footer, shape and all. Ours lost the field because our packer wrote a
+fresh header and had no default for it.
+
 What Magisk does **not** do: it does not drop the dtb section. The backing files for
 kernel/ramdisk/second/recovery_dtbo/**dtb** are restored if present, so a patched image is
 stock's layout with a new ramdisk. Verified in `boot_b.img`: `dtb_size` 406620, `dtb_addr`
@@ -307,9 +403,10 @@ stock's layout with a new ramdisk. Verified in `boot_b.img`: `dtb_size` 406620, 
 bytes).
 
 Net: Magisk's footprint on the AVB structures is exactly "relocate the blob, fix the two
-size fields, keep everything else". That is enough for this ABL — because verification is
-off (§7) — but it is **not** enough by itself: the working image also kept a dtb section
-that ours drop.
+size fields, keep everything else", and on the header it is "change the ramdisk size and the
+`id`, touch nothing else". Why its image boots therefore has three parts, none of which is
+the footer: `os_version` preserved (§6), `container`/`dtb` shape untouched (§5), and
+verification off so the stale digest is never consulted (§7).
 
 ---
 
@@ -338,8 +435,8 @@ Public key (sha1):        2597c218aae470a130f61162feaae70afd97f011
   and digest, 512 B aux block). With verification off that costs nothing — but if
   verification is ever turned back on, ours would fail first.
 
-Practical rule: a self-consistent footer is required (ABL reads it to find the vbmeta at
-all); agreement with `vbmeta_b` is not. Cheap way to get both: sign with the stock salt and
+Practical rule: carry a self-consistent footer — that is what stock and the Magisk backup
+both do, and it is how ABL finds the vbmeta at all; agreement with `vbmeta_b` is not needed. Cheap way to get both: sign with the stock salt and
 byte-identical `original_image_size`, which makes the descriptor identical to the chain's
 (§8 does exactly that for a stock payload).
 
@@ -347,9 +444,11 @@ byte-identical `original_image_size`, which makes the descriptor identical to th
 
 ## 8. Minimal recipe for an image ABL will run
 
-Requirements it satisfies, in order of what actually gated us: header v2, `dtb_size` > 0,
-`dtb_addr` = 0x1f00000, section order kernel→ramdisk→dtb, page-aligned sections, vbmeta at
-the page-aligned end of sections, footer last 64 B, partition 100663296 B. Payload-agnostic:
+Requirements it satisfies, in the order they gated us: **`os_version` = `0x1c000185`**
+(the gate — passing `--os_version 14.0.0 --os_patch_level 2024-05` alone fixes the refusal),
+the stock geometry (header v2, `dtb_size` > 0 at `dtb_addr` 0x1f00000, section order
+kernel→ramdisk→dtb, page-aligned sections, vbmeta at the page-aligned end of sections, footer
+in the last 64 B, partition 100663296 B), and a footer `avbtool` can parse. Payload-agnostic:
 works for the stock kernel and for a shim Image.
 
 Recover the stock sections **and the stock dtb** (the DTB in the image is 406620 B and is
@@ -384,8 +483,11 @@ python3 /home/tadej/ios-nord/avicii/tools/mkbootimg.py \
   -o boot.img
 ```
 
-Note the wrapper's new `OS_VERSION` default (`12.0.0` / `2023-09` → raw `0x180000F9`) is
-**not** what stock carries: stock is `14.0.0` / `2024-05` → `0x1c000185`. Pass
+The gate is the `--os_version`/`--os_patch_level` pair above. **Copy stock's exact pair.**
+The wrapper's new `OS_VERSION` default (`12.0.0` / `2023-09` → raw `0x180000F9`) is non-zero
+and therefore fixed the immediate refusal, but it is *lower* than stock's `14.0.0` / `2024-05`
+(`0x1c000185`): if ABL's anti-rollback compares against a stored index rather than merely
+against zero, a lowered value is the next thing to bite. Prefer
 `OS_VERSION=14.0.0 OS_PATCH_LEVEL=2024-05` if you drive the wrapper instead of
 `mkbootimg.py` directly.
 
@@ -411,9 +513,11 @@ footer invariants the task names, and the digest recomputation:
 python3 /home/tadej/ios-nord/logs/forensics/check_bootimg.py boot.img
 ```
 
-Expected `RESULT PASS`, with `original_image_size covers every section`,
-`dtb_size > 0`, `file size == partition size 100663296`, `avbtool info_image parses
-footer/vbmeta` all PASS. Then `sha256sum boot.img` and record it in
+Expected `RESULT PASS`: `os_version != 0` (it prints the decoded value — check it is
+`14.0.0 patch 2024-05`), `original_image_size covers every section`, `file size == partition
+size 100663296`, `avbtool info_image parses footer/vbmeta`, and the digest line. The `SHAPE`/
+`note` lines (header version, dtb) are informational — they print stock's shape, they do not
+fail the image. Then `sha256sum boot.img` and record it in
 `docs/IMAGE_PROVENANCE.md` before flashing.
 
 **This recipe is byte-proven against stock.** Run exactly as above on stock's own payload
@@ -559,16 +663,21 @@ Reading the result:
 
 ---
 
-## 10. What would still falsify this
+## 10. Open questions, and what would refute the reading
 
-1. A `dtb`-section-bearing image that is refused anyway → the gate is not the dtb but
-   something correlated with it (rank 3's `x0`=0, or rank 2's v2 requirement being about
-   something else). The recipe in §8 exists to be falsified this way.
-2. A refusal that nonetheless leaves a panic dump naming our payload → ABL did hand off and
-   the missing DTB killed it in `setup_arch`, i.e. rank 1 is a *payload* bug, not an ABL
-   gate, and the shim's park should have survived — which would then point hard at the park
-   shims not being reached for a different reason (load address / Image header), worth its
-   own bisect rung.
-3. `docs/SHIM_BOOT.md` needs a correction either way: the port packs v1 with no dtb section
-   (`build.sh` refuses `SHIM_HDR != 1`), and neither of the two working controls looks like
-   that.
+1. `p0f` passes every packaging rule in §2.1 (`os_version` `0x22000236`, footer parses,
+   `original_image_size` covers the sections, 96 MiB, header v1 without dtb — all shape) and
+   was still refused. Either v1 is not free after all on this firmware, or the refusal is
+   payload/entry (the 17.0.0 / 2035-06 stamp is odd; nothing else about it is). The sibling
+   bisect owns this. If it turns out a *v2* image with a dtb and a non-zero `os_version` is
+   still refused, the gate is not `os_version` alone.
+2. Is the rule "`os_version` != 0" or "`os_version` >= stored"? Both are consistent with the
+   device result. If it is `>=`, the wrapper's `12.0.0` / `2023-09` default is a latent
+   second refusal and only stock's `14.0.0` / `2024-05` (`0x1c000185`) is safe. The `p0f`
+   value (`17.0.0`) sits *above* stock, which fits `>=` and fits `!= 0` equally.
+3. A refusal that still leaves a panic dump naming our payload would prove hand-off happened;
+   §9 is written to catch exactly that, and `bootreason` alone cannot (it reads `bootloader`
+   on a healthy `reboot bootloader` too).
+4. `docs/SHIM_BOOT.md` states `header_size` must be 1648 and no dtb section. That is still
+   the v1 layout and still works once `os_version` is set, but the stock/`fajita`-independent
+   evidence says v2 + dtb is the shape every image on this phone actually uses.

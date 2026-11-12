@@ -1,0 +1,10 @@
+target        : f1
+payload       : H1 with exactly one field from our header: text_offset 0 (stock 0x80000)
+code0         : +0x2480000
+expected      : park
+proves        : text_offset 0 is harmless
+if refused    : if refused: text_offset is the offending field; pack text_offset 0x80000
+os_version    : 0x1c000185 (stock)
+partition     : 100663296 B
+flash         : boot_b, restore_image backup/64f70df8/boot_b.img between runs
+measure       : tooling/50-boot-timing.sh, plateau vs the stock control

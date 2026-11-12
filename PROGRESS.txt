@@ -169,3 +169,15 @@ ramdisk, console=null vs stock cmdline, AVB footer present or absent, text_offse
 Still open: our shim in that same now-correct container is refused at ~6 s, so the shim's
 own entry convention is the remaining fault. H-series hybrids (stock first page, park loop
 at stock's branch target +0x92000) are being built to localise it.
+
+MILESTONE 6 BROKEN 2026-11-12 ~21:29 — the shim executes
+-------------------------------------------------------
+h1.img (stock kernel first page verbatim, park loop at stock's own branch target
++0x92000, everything else stock, os_version stamped) PARKED: no fastboot and no adb for
+a full 90 s. The CPU reached our code and stayed in it — the first time any shim ran on
+this device.
+
+Meaning: the entry convention was the second fault. Stock's stub branches to +0x92000 and
+ABL evidently uses that shape; our own header's near branch to +0x800 never ran.
+The H/F series now walks back which element (header vs stub vs text_offset) is the culprit
+so the shim can be built natively rather than through a stock-stub transplant.

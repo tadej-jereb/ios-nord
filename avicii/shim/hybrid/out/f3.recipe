@@ -1,0 +1,10 @@
+target        : f3
+payload       : H1 with exactly one field from our header: code0 = b +0x800, park moved there
+code0         : +0x800
+expected      : park
+proves        : a near branch to 0x800 is harmless (stub alignment is stock's anyway)
+if refused    : if refused: code0 distance itself is checked; move the park to 0x2480000
+os_version    : 0x1c000185 (stock)
+partition     : 100663296 B
+flash         : boot_b, restore_image backup/64f70df8/boot_b.img between runs
+measure       : tooling/50-boot-timing.sh, plateau vs the stock control

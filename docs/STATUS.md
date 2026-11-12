@@ -125,3 +125,9 @@ shape from payload; flash order, expectations and the single fix per failure are
 (`dtb_size 406620` at `0x1f00000`, blob at `0x2bab000`), and our packer reproduces stock byte for
 byte up to `original_image_size` except the sha1 `id`.
 
+Second complementary line, 2026-11-12 late: `docs/HYBRID.md` + `avicii/shim/hybrid/` — 8
+build-and-verify-checked images that start from byte-identical agreement with stock's first
+page and localise the entry convention. Measured while building it: stock's `code0` branches
+to **+0x2480000** (`imm26` counts words, so the earlier "+0x92000" reading was 4x short) and
+stock's `os_version` `0x1c000185` is **14.0.0 / 2024-05**, not 12.0.0/2023-09.
+
