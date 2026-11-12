@@ -177,10 +177,11 @@ and confirmed on the panel with a bar ruler (`ruler stride=0x10e0`, bars straigh
 
 ## Next
 
-1. Rung 4: the secondary entry contract. The cores take the `CPU_ON` entry, so check EL at the
-   entry (PSCI starts a core at EL1 unless EL2 is set up), the stack per core, and whether the ack
-   word address is the one the secondaries actually write.
-2. Then the XNU payload on this shape (`fastboot boot`, `boot_b` untouched) and the iOS root.
+**Rung 4 is the live investigation and has its own handoff: `HANDOFF-RUNG4.md`.** Short form: the
+release is fatal even to a naked `wfe` stub, `0x700` alone returns where `0x100` wedges, and the
+SoC dies microseconds after the call — the entry address is no longer in question, the state the
+core starts in is. Then the XNU payload on this shape (`fastboot boot`, `boot_b` untouched) and the
+iOS root.
 
 Notes for whoever continues: LineageOS lands in **recovery** after a ring write, and recovery adbd
 is root without `su`, so pull with `adb exec-out dd` (skip `size/4096-1025`), not `42-log-pull.sh`.

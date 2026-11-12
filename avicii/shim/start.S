@@ -77,17 +77,40 @@ _head:
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
-	msr	spsel, #1
+	/* PSCI starts a secondary at the caller's EL, and the shim runs at EL2,
+	 * so the vectors must go to VBAR_EL2 or an exception here is lost. */
+	mrs	x2, CurrentEL
+	and	x2, x2, #0xc
+	cmp	x2, #0x8
+	b.ne	8f
+	adr	x1, vectors
+	msr	vbar_el2, x1
+	b	9f
+8:	adr	x1, vectors
+	msr	vbar_el1, x1
+9:	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x0, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
-	adr	x1, vectors
-	msr	vbar_el1, x1
 	isb
 	bl	secondary_main
 4:	wfe
 	b	4b
+
+/*
+ * Naked secondary stub: the cheapest thing a released core can run - record
+ * the MPIDR it was called with and park. No stack, no vectors, no C, so a
+ * hang here is the release/EL contract, not the C path.
+ */
+	.globl	sec_stub
+sec_stub:
+	msr	daifset, #0xf
+	adr	x1, sec_probe
+	add	x1, x1, x0, lsl #3
+	str	x0, [x1]
+5:	wfe
+	b	5b
 
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number

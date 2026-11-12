@@ -83,6 +83,8 @@ void *memcpy(void *dst, const void *src, unsigned long n)
 #define MAGENTA64	0xffff00fffff00ffULL
 
 extern void secondary_entry(void);
+extern void sec_stub(void);
+extern void _start(void);
 
 #if DIAG_STAGE >= 1
 static const char *rung_name;
@@ -407,6 +409,7 @@ static void stage3(uintptr_t fdt)
 /* ---- rung 4: PSCI CPU_ON per core, ack, spin -------------------------- */
 #if DIAG_STAGE >= 4
 static volatile uint64_t sec_spin[8];
+volatile uint64_t sec_probe[8];
 static volatile int sec_stop;
 
 void diag_secondary(uint64_t idx)
@@ -434,8 +437,26 @@ static void stage4(void)
 {
 	rung(4, "psci cpu_on 0x100-0x700");
 	int on = 0;
-	for (int i = 1; i < 8; i++) {
-		int64_t r = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, (uint64_t)i);
+	/* The image runs wherever ABL put it (0xa7e80000 here), so the entry must
+	 * be relocated. Take the offset as a link-time difference between two
+	 * text symbols instead of a symbol address: adding the symbol address to
+	 * kimg_base came out as 2*base+off and hung the caller in CPU_ON
+	 * (measured 2026-11-12). */
+	uintptr_t entry = kimg_base + ((uintptr_t)secondary_entry - (uintptr_t)_start);
+	uintptr_t stub = kimg_base + ((uintptr_t)sec_stub - (uintptr_t)_start);
+	{
+		char e[40];
+		hexline(e, "kimg=", kimg_base);
+		say('-', "D4", e);
+		hexline(e, "sec_entry=", (uintptr_t)secondary_entry);
+		say('-', "D4", e);
+		hexline(e, "entry=", entry);
+		say('-', "D4", e);
+	}
+	/* Only the A76 sibling 0x700: same cluster as core 0, so no cluster
+	 * power-up is involved (2026-11-12 probe). */
+	for (int i = 7; i < 8; i++) {
+		int64_t r = smc(PSCI_CPU_ON, (uint64_t)i << 8, stub, (uint64_t)i);
 		char t[48] = "mpidr=0x";
 		char b[12];
 		hex8(b, (uint32_t)i << 8);
@@ -450,28 +471,35 @@ static void stage4(void)
 			on++;
 		say(r ? 'X' : 'K', "D4", t);
 	}
+	{
+		/* Read the probe before any delay: the run aborts during the spin on
+		 * this unit (2026-11-12), so an ack must be captured immediately. */
+		char p[40];
+		hexline(p, "probe now=", sec_probe[7]);
+		say('-', "D4", p);
+	}
 	say('-', "D4", "spin 200 ms");
 
 	uint64_t start = ticks();
 	while (ms_since(start) < 200)
 		;
 	uint32_t mask = 0;
-	for (int i = 1; i < 8; i++)
-		if (sec_spin[i])
+	for (int i = 7; i < 8; i++)
+		if (sec_probe[i])
 			mask |= 1u << i;
 	sec_stop = 1;
 
 	con_hex2("D4", "released=", (uint32_t)on, "ackmask=", mask);
 	char t[48];
-	hexline(t, "ack mask=", mask);
+	hexline(t, "probe mask=", mask);
 	say(mask == 0xfeu ? 'K' : 'X', "D4", t);
 	for (int i = 1; i < 8; i += 4) {
-		char s[64] = "spin ";
-		unsigned n = 5;
+		char s[64] = "probe ";
+		unsigned n = 6;
 		for (int k = i; k < i + 4 && k < 8; k++) {
 			s[n++] = (char)('0' + k);
 			s[n++] = '=';
-			hex8(s + n, (uint32_t)sec_spin[k]);
+			hex8(s + n, (uint32_t)sec_probe[k]);
 			n += 8;
 			s[n++] = ' ';
 		}
@@ -479,9 +507,9 @@ static void stage4(void)
 		say('-', "D4", s);
 	}
 	if (mask == 0xfeu)
-		say('K', "D4", "all 7 secondaries acked");
+		say('K', "D4", "all 7 secondaries reached the stub");
 	else
-		say('X', "D4", "not every released core acked");
+		say('X', "D4", "not every released core reached the stub");
 }
 #endif
 

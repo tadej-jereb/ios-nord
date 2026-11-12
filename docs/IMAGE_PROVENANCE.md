@@ -253,3 +253,17 @@ Console: `FB_STRIDE` 4800 -> `FB_W*4` (4320) confirmed on hardware; glyphs resol
 the ruler bars are straight. LineageOS drops to **recovery** (not Android) after a ring write,
 which is where adb lands; recovery adbd is root but has no `su`, so ring pulls there go through
 `adb exec-out dd` of `/dev/block/sda16` skip `size/4096-1025`, not `42-log-pull.sh`.
+
+**Rung 4 investigation (23:06-23:16).** All `fastboot boot`, `DIAG_STAGE=4 DIAG_LOG=1`, soc dtb.
+
+| image | sha256 | result |
+|---|---|---|
+| `out-diag/l8` | `3b9a787f…` | entry relocated to `0x14fd80054` (= 2*base+off), caller hangs in the first `CPU_ON` |
+| `out-diag/l9` | (component print) | `kimg=0xa7e80000`, `sec_entry=0xa7f00054`, `entry=0x14fd80054` |
+| `out-diag/l10` | `c007a0e9…` | entry via link-time symbol difference = `0xa7e80054`, still hangs at `0x100` |
+| `out-diag/l11` | `74691c58…` | naked `sec_stub` target: still hangs -> not our secondary code |
+| `out-diag/l12` | `7d860cbe…` | only `0x700`: `ret=0` **and returns**, then dies during the 200 ms spin |
+| `out-diag/l13` | `51c3deb9…` | probe read moved ahead of the spin: still dies before the line lands |
+
+Open: which state the released core starts in. Handoff with hypotheses, discriminators and
+reproduction: `HANDOFF-RUNG4.md`.
