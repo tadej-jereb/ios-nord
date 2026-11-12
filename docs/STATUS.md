@@ -85,3 +85,29 @@ requirement — see `docs/SHIM_BOOT.md`.
 - Proven end to end with a synthetic Mach-O: `fdt-mem` -> `mkadt` -> `mkpayload` -> `build.sh`
   -> `--verify` PASS, image 417,792 B with a 62,912 B payload ramdisk. A real XNU kernel is
   still only obtainable from the macOS CI run.
+
+---
+
+# 2026-11-12, device day — unlock, LOS, root, backups
+
+Bootloader is **unlocked** (`flash.locked=0`, `verifiedbootstate=orange`, `getvar unlocked: yes`).
+LineageOS 21 + Magisk v31.1 is on slot **b**, root over adb. Nothing is bricked; `b` restores from
+`backup/64f70df8/boot_b.img` in one command.
+
+Verified today: 41 partitions dumped with size+md5 (`tooling/44-backup-stream.sh`), 83 live dump
+files (`avicii/tools/dump-live.sh`), `logs/mem-live.json`, `avicii/adt/avicii-live.adt`.
+`tooling/42-log-pull.sh` fixed to go through `su`. `mkbootimg.py` now accepts an empty `--dtb` for
+v2, matching the stock image (`dtb_size=0`, tree from `dtbo`).
+
+Plan changes, all verified, all recorded in `docs/SHIM_BOOT.md`:
+
+- **Slot `a` is unusable as a test slot** (no system metadata) → experiments go to `boot_b`.
+- **`fastboot boot` does not work** on this ABL (4/4 fallbacks, both header versions) → flash only.
+- A fallback from a payload-less shim is the shim's own reset, not a rejection.
+- **Touch is Goodix GT9886 @ 0x5D** (driver bound); FTS @ 0x49 unbound. FTS docs = fallback only.
+- Panel is command-mode DSC and shows **no console text**; the UFS ring is the only observer, and
+  it is empty because the crash precedes its init.
+
+Blocker: the shim dies ~6 s in, before its first C statement (`for(;;) wfe`-only build also fails).
+Bisect images `bisect-N` are being produced (N1 = header+park, MMU off → N5 = console clear).
+Next: flash them in order with a restore between each.

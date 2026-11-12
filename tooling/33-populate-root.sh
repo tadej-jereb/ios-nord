@@ -116,6 +116,15 @@ EOF
 state=$img.populate-state
 [[ $restart == 1 ]] && rm -f "$state"
 
+# The documented gate leaves a baseline checksum next to the image; a fresh run
+# must match it, so an accidentally different image cannot be half-filled.
+base=$img.sha256.pre-populate
+if [[ -f $base ]] && [[ ! -s $state ]]; then
+	(cd "$(dirname "$img")" && sha256sum -c --status "$(basename "$base")") || \
+		die "$img does not match $base - re-make it or delete the baseline deliberately"
+	say "baseline ok $(cut -d' ' -f1 "$base")"
+fi
+
 say "image   $img ($(numfmt --to=iec "$VOLUME_BYTES"), HFSX, journaled)"
 say "payload $PAYLOAD B unique ($(numfmt --to=iec "$PAYLOAD"))"
 

@@ -14,6 +14,9 @@ and prints every mismatch instead of panicking.
 Nothing here flashes, formats, or regenerates a partition. `boot_a` is the
 experiment slot, `boot_b` keeps bootable LineageOS + Magisk and stays untouched.
 Read `docs/SHIM_BOOT.md` first; the header rules there are what the images obey.
+The rung order is the ladder `docs/fajita-PORTING.md` worked out on the 6T port
+of this same tree - GIC, then UFS, then the panel, then cores, then memory - so
+the walls are hit in the order that already has answers.
 
 ## 0. Claim status
 
@@ -42,6 +45,12 @@ cd avicii/shim
 
 ```sh
 ./build-diag.sh
+```
+
+Back to the repository root, everything below is root-relative:
+
+```sh
+cd ../..
 ```
 
 That builds rungs 1..5 plus the two write-nothing variants `ro1`/`ro2`
@@ -271,19 +280,15 @@ report `/data` corruption afterwards. Recovery is in §8.
 ## 6. Building and booting a rung
 
 ```sh
-cd avicii/shim
+(cd avicii/shim && DIAG_STAGE=3 ./build-diag.sh -s 3)
 ```
 
 ```sh
-DIAG_STAGE=3 ./build-diag.sh -s 3
+avicii/tools/mkbootimg_v1.sh --verify avicii/shim/out-diag/stage-3/shim-boot.img
 ```
 
 ```sh
-avicii/tools/mkbootimg_v1.sh --verify out-diag/stage-3/shim-boot.img
-```
-
-```sh
-fastboot boot out-diag/stage-3/shim-boot.img
+fastboot boot avicii/shim/out-diag/stage-3/shim-boot.img
 ```
 
 Same for 4 and 5. Each carries every rung below it, so only ever go forward one

@@ -15,7 +15,7 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : e778a39c8ba342ea8860ecf4d1a0e1071200a217000000000000000000000000
+id (sha1)       : 38fe447b1f029448681a052fa150d40da7433566000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)

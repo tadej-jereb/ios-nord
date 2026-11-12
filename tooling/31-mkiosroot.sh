@@ -185,6 +185,9 @@ if (( mkonly )); then
 fi
 
 # --- phase: populate (root) ------------------------------------------------
+# tooling/33-populate-root.sh does the same work as a standalone, resumable step
+# with a marker file; use it when the image already exists (docs/ROOTFS_READY.md).
+# Keep the two in step if a stage changes here.
 if (( EUID )); then
 	echo "re-executing under sudo for apfs-fuse, loop mount and rsync"
 	args=("$0")

@@ -10,9 +10,9 @@ Evidence base, in order of weight:
 1. `avicii/xnu-patch-notes/0095-avicii-goodix-gt9886-touch.patch` — the delta this note
    describes. Line numbers `bsd/dev/sweet_touch.c:N` and `bsd/dev/sweet_rpmh.c:N` are the
    files **as they stand in the live series** after `xnu-avicii/patches/0060`, `0062`,
-   `0063`, i.e. the reviewable state. Those three are already avicii-adapted relative to
-   `refs/dipa-studio-ios-sweet` (SE base, RPMH bases, `"9886"` gate); the ref copies do
-   **not** have them.
+   `0063`, i.e. the reviewable state **before** 0095. Those three are already avicii-adapted
+   relative to `refs/dipa-studio-ios-sweet` (SE base, RPMH bases, `"9886"` gate); the ref
+   copies do **not** have them, so a ref-based reading shifts every line number here.
 2. Live dump `logs/dumps/run-20261112-195027/` — the binding A/B resolution (§1).
 3. `refs/lito-dts/` (vendor DT + GCC driver) and `avicii/` DT sources — every hardware
    number in §3.
@@ -64,8 +64,8 @@ instead of acknowledging (`:396-401`). Header and body each carry a 16-bit big-e
 trailing sum over the preceding bytes (`:355-366`, `:403`, `:417`); a bad sum returns `EIO`
 **without** writing to the IC. Contact count is `buf[2] & 15` (`:406`), body at `0x4188`
 with 8 bytes per contact (`:412-413`). Per contact: `id = p[0] >> 4`, low nibble 1 or 3 =
-pen and rejected, `x = be16(p+2)`, `y = be16(p+4)`, duplicate ids rejected, plotted bounds
-1080x2400 (`:422-431`). Then a 3-byte write `{0x41, 0x80, 0x00}` acknowledges the frame
+pen and rejected, `x = be16(p+2)`, `y = be16(p+4)`, duplicate ids rejected, bounds checked
+against 1080x2400 (`:422-431`). Then a 3-byte write `{0x41, 0x80, 0x00}` acknowledges the frame
 (`:320-325`) and the contacts go to `sweet_hid_touch(id, down, x, y)` (`:368-384`).
 
 Polling: 10 ms period, optional `sweettouchirq` hint that gates reads on the pin level and
@@ -82,10 +82,10 @@ configuration; this driver only reads reports and writes the ack byte.
 
 | # | item | sweet (`refs/`) | avicii | where | state |
 |---|---|---|---|---|---|
-| 1 | SE base physical address | `0x00a84000` (`refs .../0060:…`, `:25`) | `0x00984000` | `refs/lito-dts/lito-qupv3.dtsi:370-371` | series |
+| 1 | SE base physical address | `0x00a84000` (`:25`) | `0x00984000` | `refs/lito-dts/lito-qupv3.dtsi:370-371` | series |
 | 2 | GPIO window | one flat base `0x03900000`, offset `pin*0x1000` | config blocks are per quadrant: 6/7/8/9 WEST `0x500000`, 90 SOUTH `0x100000`, from TLMM `0x0f000000` | `refs/lito-dts/lito-pinctrl.dtsi:2-4`, `avicii/pinctrl-lito.c:20-23,1339-1345,1505` | **patch** (series uses the bare TLMM base, off by 0x500000 for 6-9) |
 | 3 | SE clock branch vote | word `0x5200c` (`:28`), bits 18-21+23 | word `0x52008`, bits 20 (m-ahb), 21 (s-ahb), 23 (S1) | `refs/lito-dts/gcc-lito.c:1799-1804,1917-1920,1930-1933` | series has the word, **patch** narrows the mask |
-| 4 | SE RCG | `0x18148` (`:29`) | `0x18140` = `CFG_RCGR` (`cmd_rcgr` in the vendor driver) | `refs/lito-dts/gcc-lito.c:542` | series |
+| 4 | SE RCG | `0x18148` (`:29`), used as if it were `CFG_RCGR` | `cmd_rcgr` `0x18140` (`:29`, series) and `CFG_RCGR` = `+4` = `0x18144` | `refs/lito-dts/gcc-lito.c:542` | RCG base series; **patch** makes every CFG access add the +4 |
 | 5 | SE CBCR halt check | `0x18144` in the branch list (`:163`) | `0x1813c` | `refs/lito-dts/gcc-lito.c:1800` | **patch** |
 | 6 | touch 2.8 V rail | `ldoc11` @ 3200 mV (`:578`) | `ldo13` / `ldoa13` @ 3008 mV | `refs/lito-dts/lito-regulators.dtsi:353,359-366`; `avicii/lito.dtsi:3998-3999` | series calls `ldo13`, **patch** makes the helper accept it (+`ldoa13` retry) |
 | 7 | touch 1.8 V rail | not voted | `smpa4`, fixed 1800 mV, vote it **first** | `refs/lito-dts/lito-regulators.dtsi:35-49`; `avicii/mtp.dtsi:350` | **patch** |
@@ -129,10 +129,14 @@ property, so the S4 vote is inferred from the shared assembly, not from the Good
    those belong to the NORTH window, while both pins are WEST
    (`avicii/pinctrl-lito.c:1343-1345`). The reset pin is never driven and the printed
    `reset=`/`irq=` values are foreign registers. `TOUCH_NORTH_PA` also cannot reach GPIO 90
-   (SOUTH, `pinctrl-lito.c:1505`) inside its `0x5b000` map (`:563`).
-3. **Wrong CBCR in the halt loop.** `0x18144` (`:163`) is the RCG's M register; the S1
-   branch halt bit is at `0x1813c`. The loop either passes on garbage or reports a halted
-   branch that is not the SE's.
+   (SOUTH, `pinctrl-lito.c:1505`) inside its `0x5b000` map (`:563`), and `touch_gpio()`
+   hardcodes `st.gpio` for every pin, so a SOUTH base would be needed there too.
+3. **The branch-halt check checks the wrong register.** `0x18144` (`:163`) is the RCG's
+   `CFG_RCGR`, not a branch CBCR; bit 31 there is always 0, so the loop can never report a
+   halted branch. The S1 branch may stay stopped while `touch_clocks()` returns true, and
+   the failure only surfaces as a transfer timeout. The same function also writes the
+   update bit to `cmd_rcgr` (`:157`) while reading/writing the CFG fields at `+4` (`:143,
+   155-156`), so the two halves disagree about which word is the CFG.
 4. **Vote mask too wide.** `(0x0fu << 18) | (1u << 23)` (`:140`) also votes bits 18/19,
    which are not SE7's; bits 20/21 (the wrapper AHBs) are only covered by accident.
 5. **No flips**: coordinates arrive mirrored on both axes. Touch works, but every point lands
@@ -153,8 +157,8 @@ property, so the S4 vote is inferred from the shared assembly, not from the Good
 |---|---|---|
 | header | rails/handedness paragraph | a reader must not think this is still sweet |
 | defines | `TOUCH_NORTH_PA 0x0f500000`, `TOUCH_SOUTH_PA 0x0f100000`, explicit vote mask, `TOUCH_RCG_S1_HALT`, `TOUCH_ADDR`, panel W/H, `TOUCH_XFLIP`/`YFLIP` | §3 rows 2-5, 11-12 |
-| `st` | second MMIO base `gpio_s` + its map and NULL check | gpio 90 lives in the SOUTH quadrant (`:563`) |
-| `touch_clocks` | masked vote, S1 CBCR in the branch list | §4 items 3-4; other users' bits stay |
+| `st`, `touch_gpio` | second MMIO base `gpio_s` + its map and NULL check; `touch_gpio` picks the base by pin (>= 90 south) | gpio 90 lives in the SOUTH quadrant (`:563`); the function wrote `st.gpio` for every pin |
+| `touch_clocks` | masked vote, explicit `TOUCH_RCG_CFG`/`_DFS`/`_DFS0` (cmd_rcgr + CFG offset), update bit written into CFG, S1 CBCR in the branch list | §4 items 3-4; other users' bits stay |
 | `touch_map` | mirror in panel space, called by both parsers after the bounds check | §4 item 5; bounds run **before** mirroring so an out-of-range IC value is still an error |
 | power block | vote `smpa4` 1800 then `ldo13` 3008 with `ldoa13` retry, abort if all fail | §4 item 1, order = IO before analog |
 | probe | `TOUCH_ADDR`, id gate `gid[0..1] == "98"`, full string logged | §4 item 6 |
@@ -219,7 +223,7 @@ boot-args — in the `docs/IMAGE_PROVENANCE.md` form.
 | rail voltage unit | mV-in-argument is the codebase convention, mV-vs-uV on the RPC unproven | meter on the rail; the log prints the number sent |
 | `enable1v8_gpio` (PM8150L GPIO1, active low) | nothing in the tree writes PMIC GPIOs (the SPMI path is read-only), so it relies on ABL having left it asserted | if S4 is voted and the IC still NACKs, this is the next suspect; driving it needs an SPMI write path |
 | GPIO 90 as "board enable" | inherited from sweet (`:583`); avicii's DT has no such property, and pin 90 is SOUTH | the `vdd90` field in the sequence log; harmless if it drives an unrelated pin |
-| the whole clock half of `touch_clocks` | register offsets are the base's, only the base address and halt reg are ids | `gcc vote=... rcg=... cfg=... dfs=...` (`:144-145`): `dfs & 1` must be 0 (lito has no DFS RCG) and `DFS level0`/`RCG update timeout` name the wrong-register case |
+| the `CFG_RCGR` offset (`cmd_rcgr + 4`) | the base wrote the divider one word off relative to its own RCG id; the `+4` is the Linux `clk_rcg2` layout, not measured here | `gcc vote=... rcg=... cfg=... dfs=...` (`:144-145`): `dfs & 1` must be 0 (lito has no DFS RCG) and `DFS level0`/`RCG update timeout` name the wrong-register case |
 | device is `lito`, driver is guarded `ARM64_BOARD_CONFIG_SWEET` | the whole base tree is sweet-guarded | out of scope: widen the guard or have the ADT define the sweet token (`docs/SHIM_BOOT.md`) |
 | second touch variant (FTS) | `docs/FTS_TOUCH.md` stays as fallback | untouched here |
 

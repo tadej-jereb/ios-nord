@@ -55,6 +55,21 @@ Rules for filling it:
 - If the same image is flashed twice, the block is duplicated with the new
   timestamp — the counter, not the hash, distinguishes them.
 
+## root image (userdata) — baseline before populate, 2026-11-12
+
+Empty 16 GiB volume, fsck -n clean, HFSX, journaled. Recorded before
+`tooling/33-populate-root.sh` writes anything; the script refuses to run
+against an image that does not match this while no resume marker exists.
+
+| file | bytes | sha256 |
+|---|---|---|
+| ios16-root.img | 17179869184 | 21e00f47267c0f986dae16f65971f426780cb2c4eb441fc43318546f3107b5c9 |
+
+context: host build host, tooling/31-mkiosroot.sh, `fsck.hfsplus -N` dry-run and
+`-n` clean, header 4858, 114 MiB on disk. Baseline copy:
+`build/ios16-root.img.sha256.pre-populate`. The populate run appends its own
+block with the post-fsck hash below this one.
+
 ## Restore rules for the step-3 backup
 
 | partition(s) | restore onto this handset | restore onto another avicii |

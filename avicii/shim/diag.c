@@ -579,21 +579,25 @@ int diag_run(uintptr_t fdt)
 		freq = 1;
 	t0 = ticks();
 
+	/* Log first, console second: the console is unproven on this command-mode panel,
+	 * so the ring must be up before anything that could fault on the display path. */
+	int lrc = 0;
+#if DIAG_LOG
+	lrc = dlog_init();
+	if (!lrc)
+		dlog_line('-', "SHIM diag " STAGE_S " start (pre-console)");
+#endif
 	con_clear(0xff08080aU);
 	say('-', "SHIM", "avicii DIAG " STAGE_S);
 	say('-', "SHIM", "rungs are cumulative; last line = last step run");
-	int lrc = 0;
-#if DIAG_LOG
-	con_str("LOG", "init: wipe 4 MiB of userdata tail");
-	lrc = dlog_init();
-#endif
 	if (!DIAG_LOG) {
 		con_str("LOG", "off (DIAG_LOG=0): image writes nothing");
 	} else if (lrc) {
 		con_hex2("LOG", "off, ufs/gpt rc=", (uint32_t)lrc, "panel only", 0);
+		dlog_line('-', "SHIM log init failed, console only");
 	} else {
 		con_str("LOG", "on: last 1024 blocks of userdata");
-		dlog_line('-', "SHIM diag " STAGE_S " start");
+		dlog_line('-', "SHIM console up (pre-console marker present = it crashed here)");
 	}
 
 #if DIAG_STAGE >= 1

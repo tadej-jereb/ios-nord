@@ -45,7 +45,10 @@ NEED=$((BLOCKS * BLK))
 dev=$($ADB shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e "$d" ] && readlink -f "$d" && break; done' 2>/dev/null | tr -d '\r')
 [ -n "$dev" ] || { echo "Error: userdata block device not found on device" >&2; exit 1; }
 
-bytes=$($ADB shell "blockdev --getsize64 '$dev' 2>/dev/null || cat /sys/class/block/\$(basename \$(readlink -f '$dev'))/size | { read s; echo \$((s*512)); }" 2>/dev/null | tr -d '\r')
+# adb shell is uid 2000 on a Magisk-rooted ROM, so every read goes through su
+SU="su -c"
+$ADB shell "$SU 'id -u'" 2>/dev/null | tr -d '\r' | grep -qx 0 || { echo "Error: no root (su) on the device" >&2; exit 1; }
+bytes=$($ADB shell "$SU \"blockdev --getsize64 '$dev' 2>/dev/null || cat /sys/class/block/\$(basename \$(readlink -f '$dev'))/size | { read s; echo \$((s*512)); }\"" 2>/dev/null | tr -d '\r')
 case ${bytes:-} in ''|*[!0-9]*) echo "Error: could not read userdata size" >&2; exit 1 ;; esac
 [ "$bytes" -gt "$NEED" ] || { echo "Error: userdata is only $bytes bytes" >&2; exit 1; }
 
@@ -57,7 +60,7 @@ LOGDIR=$(cd "$(dirname "$0")/.." && pwd)/logs
 mkdir -p "$LOGDIR"
 BIN=${OUT:-$LOGDIR/sweet-log-$STAMP}.bin
 
-$ADB exec-out "dd if='$dev' bs=$BLK skip=$skip count=$BLOCKS 2>/dev/null" > "$BIN"
+$ADB exec-out "$SU \"dd if='$dev' bs=$BLK skip=$skip count=$BLOCKS 2>/dev/null\"" > "$BIN"
 got=$(wc -c < "$BIN" | tr -d ' ')
 [ "$got" = "$NEED" ] || { echo "Error: read $got of $NEED bytes (short read)" >&2; exit 1; }
 

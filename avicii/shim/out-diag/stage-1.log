@@ -15,7 +15,7 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : 3079c2484e8d09ac5d683493aade9e8f8578f507000000000000000000000000
+id (sha1)       : 78d5ceae565f813bd7b7a8d01742872275214fd5000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
@@ -28,7 +28,7 @@ gzip ok         : 307200 bytes decompressed, crc ok, tail 337226 bytes at 0x2e7a
 board dtb       : totalsize 337226
 
 PASS: header v1, stock avicii geometry, gzip+DTB kernel
--rwxrwxr-x 1 tadej tadej 307200 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/Image
--rw-rw-r-- 1 tadej tadej 349124 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/Image.gz-dtb
--rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:10 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/shim-boot.img
+-rwxrwxr-x 1 tadej tadej 307200 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/Image
+-rw-rw-r-- 1 tadej tadej 349124 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/shim-boot.img
 flash: fastboot boot /home/tadej/ios-nord/avicii/shim/out-diag/stage-1/shim-boot.img   (or flash boot_a once the layout is confirmed)

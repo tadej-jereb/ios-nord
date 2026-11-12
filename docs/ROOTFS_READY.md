@@ -3,7 +3,7 @@
 State: the volume `build/ios16-root.img` (16 GiB, HFSX, case-sensitive,
 journaled, fsck -n clean) exists and is empty. Everything that fills it needs
 root and is now a single script, `tooling/33-populate-root.sh`. Run the lines
-below in this order; nothing before line 12 is destructive.
+below in this order; nothing before line 10 is destructive.
 
 ## What is verified, and what is not
 
@@ -11,7 +11,7 @@ below in this order; nothing before line 12 is destructive.
 |---|---|---|
 | apfs-fuse built unprivileged into `tooling/opt/apfs-fuse` | **verified** | `tooling/32-build-apfsfuse.sh --check`: clean clone of `66b86bd`, build, install, mount, unmount |
 | apfs-fuse mounts all three DMGs unprivileged | **verified** | 087-86698-044 / 087-86593-047 / 087-86715-047 mounted, `root/` present, no loop device |
-| DMG payload measured through apfs-fuse | **verified** | `tooling/33-populate-root.sh --dry-run`: 143 341 files, 11 304 857 126 B |
+| DMG payload measured through apfs-fuse | **verified** | `tooling/33-populate-root.sh --dry-run`: 144 341 files, 11 304 857 126 B |
 | hfsplus module loaded on this host | **verified** | `/proc/filesystems` contains `hfsplus`; `modprobe` is still in the script for a host without it |
 | hard links on Linux HFS+ | **not run here** | module exports `hfsplus_link`; the script probes and falls back to copies |
 | loop mount of the 16 GiB image, rsync, fsck -fy | **not run here** | needs the sudo password; that is what this document is for |
@@ -21,7 +21,7 @@ Baseline sha256 of the empty image, taken before anything was written:
 
     21e00f47267c0f986dae16f65971f426780cb2c4eb441fc43318546f3107b5c9  build/ios16-root.img
 
-## Size budget - read before line 12
+## Size budget - read before line 10
 
 * Volume: 17 179 869 184 B = 16 GiB exactly, of which 32 MiB is the HFS+ journal.
 * On disk now: ~114 MB (sparse). Populating writes real blocks into the host
@@ -121,38 +121,43 @@ Baseline sha256 of the empty image, taken before anything was written:
 
     Must equal line 14 - the sparse form decodes back to the same bytes.
 
-18. `sudo modprobe hfsplus`
+18. `rm -f /var/tmp/simg-check.img`
 
-19. `sudo mkdir -p /mnt/iosroot`
+19. `sudo modprobe hfsplus`
 
-20. `sudo mount -t hfsplus -o loop,ro build/ios16-root.img /mnt/iosroot`
+20. `sudo mkdir -p /mnt/iosroot`
 
-21. `sudo ls -l /mnt/iosroot/System/Library/CoreServices/SystemVersion.plist /mnt/iosroot/private/var/keybags/systembag.kb /mnt/iosroot/System/Library/Caches/com.apple.dyld | head`
+21. `sudo mount -t hfsplus -o loop,ro build/ios16-root.img /mnt/iosroot`
+
+22. `sudo ls -l /mnt/iosroot/System/Library/CoreServices/SystemVersion.plist /mnt/iosroot/private/var/keybags/systembag.kb /mnt/iosroot/System/Library/Caches/com.apple.dyld | head`
 
     The plist is `-r--r--r-- root`, the keybag `-rw------- root`, the dyld
     entries show link count 2.
 
-22. `sudo cat /mnt/iosroot/private/var/db/diagnostics/.migrated`
+23. `sudo cat /mnt/iosroot/private/var/db/diagnostics/.migrated`
 
     Empty, owner `_logd` 272, mode 0644.
 
-23. `sudo find /mnt/iosroot -xdev -type f | wc -l`
+24. `sudo find /mnt/iosroot -xdev -type f | wc -l`
 
     Above 180 000.
 
-24. `sudo df -B1 --output=used /mnt/iosroot`
+25. `sudo df -B1 --output=used /mnt/iosroot`
 
     Between 11 and 13 GB. Much less means a stage was skipped.
 
-25. `sudo umount /mnt/iosroot`
+26. `sudo umount /mnt/iosroot`
 
 ## Flashing gate
 
-26. `tooling/opt/platform-tools/fastboot getvar partition-size:userdata`
+27. `tooling/opt/platform-tools/fastboot getvar partition-size:userdata`
 
     Must be at least `0x400000000` (16 GiB). The volume does not shrink.
 
-27. `fastboot flash userdata build/ios16-root.img.simg`
+28. `fastboot flash userdata build/ios16-root.img.simg`
+
+29. `tooling/43-hash-images.sh build` - paste the block for the flashed files into
+    `docs/IMAGE_PROVENANCE.md` if the script's own block is not enough.
 
 ## If it stops
 
@@ -167,7 +172,7 @@ Baseline sha256 of the empty image, taken before anything was written:
 
 ## Limits of this document
 
-The sudo password was not available on the build host, so lines 10-27 are
+The sudo password was not available on the build host, so lines 10-29 are
 unexecuted here. Line ordering, guards and resume behaviour were exercised up to
 the loop mount by `--dry-run`; the mount, rsync, tweaks and fsck are the
 remainder.
