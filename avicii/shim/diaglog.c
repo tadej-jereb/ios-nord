@@ -12,6 +12,7 @@
  *   3  userdata too small for the ring
  *   4  header write failed
  *   5  header read-back did not match
+ *   6  ring wipe failed
  */
 #include <stdint.h>
 #include "diaglog.h"
@@ -24,6 +25,7 @@
 static uint8_t hdr[BLOCK] __attribute__((aligned(4096)));
 static uint8_t blk[BLOCK] __attribute__((aligned(4096)));
 static uint8_t chk[BLOCK] __attribute__((aligned(4096)));
+static uint8_t wipe[16 * BLOCK] __attribute__((aligned(4096)));	/* 64 KB, .bss = zero */
 
 static uint32_t header_lba, ring_lba;
 static uint32_t total;			/* bytes ever written into the ring */
@@ -114,6 +116,14 @@ int dlog_init(void)
 	header_lba = (uint32_t)(last - RING_BLOCKS);
 	ring_lba = header_lba + 1;
 
+	/* Zero the ring before any line: otherwise the first pull of a fresh
+	 * area shows the old filesystem bytes behind the log lines. */
+	for (uint32_t done = 0; done < RING_BLOCKS; done += 16) {
+		if (ufs_write(ring_lba + done, 16, wipe))
+			return 6;
+	}
+	if (ufs_sync())
+		return 6;
 	if (write_hdr(0))
 		return 4;
 	/* Prove the header is readable where we will look for it later. */

@@ -117,17 +117,17 @@ fi
 
 # apfs-fuse is only needed from the populate gate on: the image phase runs
 # without it, so a missing binary is a warning here and fatal there.
+# Prefer the unprivileged build in tooling/opt (32-build-apfsfuse.sh) over PATH.
+apfs_fuse=$root/tooling/opt/apfs-fuse/bin/apfs-fuse
+[[ -x $apfs_fuse ]] || apfs_fuse=$(command -v apfs-fuse || true)
 insist_apfs() {
-	command -v apfs-fuse >/dev/null && return 0
+	[[ -x ${apfs_fuse:-} ]] && return 0
 	echo "apfs-fuse missing: it reads the APFS DMGs of the populate phase" >&2
-	echo "  no distro packages it (not on noble) - source build, ~1 min:" >&2
-	echo "    sudo apt install libfuse3-dev libbz2-dev zlib1g-dev libcrypto++-dev cmake g++ git" >&2
-	echo "    git clone https://github.com/sgan81/apfs-fuse ~/apfs-fuse && cd ~/apfs-fuse" >&2
-	echo "    git submodule update --init && cmake -B build && cmake --build build -j 8" >&2
-	echo "    sudo cmake --install build" >&2
+	echo "  no distro packages it (not on noble) - build it unprivileged:" >&2
+	echo "    tooling/32-build-apfsfuse.sh" >&2
 	return 1
 }
-if ! command -v apfs-fuse >/dev/null && ! (( mkonly )); then
+if [[ ! -x ${apfs_fuse:-} ]] && ! (( mkonly )); then
 	echo "warning: apfs-fuse not installed - the populate phase below will stop" >&2
 fi
 
@@ -217,7 +217,7 @@ trap cleanup EXIT
 apfs_mount() { # dmg name
 	ln -s "$1" "$work/$2.dmg"
 	mkdir "$work/$2"
-	apfs-fuse "$work/$2.dmg" "$work/$2"
+	"$apfs_fuse" "$work/$2.dmg" "$work/$2"
 	mnts+=("$work/$2")
 }
 apfs_mount "$ipsw/$OS_MEMBER" os

@@ -22,8 +22,10 @@ for t in rsync truncate xxd python3 curl df du stat; do
 	if command -v "$t" >/dev/null; then ok "$t"; else no "$t"; fi
 done
 # apfs-fuse: not packaged on Mint 22.x - source build only
-if command -v apfs-fuse >/dev/null; then ok "apfs-fuse $(apfs-fuse 2>&1 | head -1)"
-else no "apfs-fuse (APFS read; source build, see docs/IOSROOT.md Requirements)"; fi
+if [[ -x $root/tooling/opt/apfs-fuse/bin/apfs-fuse ]]; then
+	ok "apfs-fuse (tooling/opt/apfs-fuse/)"
+elif command -v apfs-fuse >/dev/null; then ok "apfs-fuse (PATH)"
+else no "apfs-fuse (APFS read, no distro package -> tooling/32-build-apfsfuse.sh)"; fi
 for t in cmake g++ git; do command -v "$t" >/dev/null || warn "$t (needed to build apfs-fuse)"; done
 for h in fuse3 bzlib.h zlib.h cryptopp; do
 	[[ -e /usr/include/$h || -d /usr/include/fuse3 ]] && ok "header $h" || warn "header $h (for apfs-fuse build)"

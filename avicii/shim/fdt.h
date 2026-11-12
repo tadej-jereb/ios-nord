@@ -5,11 +5,10 @@
 int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out);
 
 /*
- * Visit the reg property of every node exactly two levels down (i.e. every
- * device under a top-level bus, every child of /reserved-memory). The callback
- * gets the parent name, the node name and one base/size pair per reg entry,
- * already decoded with the root #address-cells/#size-cells. Return 0 to stop
- * the walk, 1 to continue.
+ * Walk every reg property in the tree, whatever its depth. The callback gets
+ * the parent node's name ("" for a top-level node) and the node's own name,
+ * plus one base/size pair per reg entry, decoded with the root
+ * #address-cells/#size-cells. Return 0 to stop the walk, 1 to continue.
  *
  * Bounded by the tree's totalsize, so a truncated or wrong tree ends the walk
  * instead of running off into unreserved memory. Returns the number of reg

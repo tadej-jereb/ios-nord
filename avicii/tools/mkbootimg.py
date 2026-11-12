@@ -262,13 +262,15 @@ def write_header(args):
         args.output.write(pack('I', BOOT_IMAGE_HEADER_V2_SIZE))
 
     if args.header_version > 1:
-        if filesize(args.dtb) == 0:
-            raise ValueError('DTB image must not be empty.')
-
-        # dtb size in bytes
-        args.output.write(pack('I', filesize(args.dtb)))
-        # dtb physical load address
-        args.output.write(pack('Q', args.base + args.dtb_offset))
+        # OnePlus stock avicii images carry dtb_size = 0 and dtb_addr = 0: ABL takes the
+        # tree from the dtbo partition instead. AOSP's newer script rejects that, so an
+        # absent --dtb is written as the two zero fields rather than raising.
+        if args.dtb is not None and filesize(args.dtb) > 0:
+            args.output.write(pack('I', filesize(args.dtb)))
+            args.output.write(pack('Q', args.base + args.dtb_offset))
+        else:
+            args.output.write(pack('I', 0))
+            args.output.write(pack('Q', 0))
 
     pad_file(args.output, args.pagesize)
     return img_id

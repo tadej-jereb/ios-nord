@@ -1,6 +1,16 @@
 # avicii: ST FTS touch on GENI I2C 0x49 — port note
 
-Status: **adaptation note, nothing built or booted on avicii.** Sources: anonbeat1 patch 0089
+> **Fallback path only — read `docs/GOODIX_GT9886.md` first.** This unit is a **Goodix
+> GT9886**, not FTS. The dump that resolved it is
+> `logs/dumps/run-20261112-195027/50-i2c-4-005d.txt` (`5d`'s `driver` symlink points at
+> the `Goodix-gt9886` driver) against `50-i2c-4-0049.txt` (the `st_fts@49` client has an
+> `of_node` but no `driver` symlink, i.e. it never bound). See also `avicii/CONSTANTS.md`
+> §4. Keep this note for a unit that really does populate FTS; its transport, clock and
+> rail half (SE7 base 0x984000, TLMM 0x0f000000, `GCC_QUPV3_WRAP1_S1_CLK`, both rails) is
+> shared with the Goodix path and was correct as far as it went. `qcom,i2c-touch-active =
+> "st,fts"` (`avicii/mtp.dtsi:343`) is the board default, not this unit's answer.
+
+Status: **fallback adaptation note, nothing built or booted on avicii.** Sources: anonbeat1 patch 0089
 (FTS on SE13 **SPI**, FT3680, Spacewar) and rrrd-jpg patches 0080-0085 (FTS on **PM6150 I2C 0x49**,
 Pixel 4a/sunfish). The transport we need on avicii is neither: it is the GENI **FIFO I2C** path
 already written for **SE7** in anonbeat1 patch 0060. Vendor protocol backing comes from the stock
@@ -33,7 +43,8 @@ Cited patch lines are patch lines; `refs/anonbeat1/patches/0089.patch:N` address
 
 No `st,max-x-coordinate` / `st,max-y-coordinate` exists in the avicii DT (grep of `avicii/mtp.dtsi`,
 `avicii/lito.dtsi` returns nothing) — the resolution has to be a driver constant: **1080, 2400**.
-The chip type is **unknown** until the boot-id read (§4); the DT only says "ST FTS".
+The FTS chip type is **unknown** until the boot-id read (§4); the DT only says "ST FTS". On this
+particular unit nothing will bind at 0x49 at all — see the header.
 
 ---
 

@@ -28,6 +28,16 @@ if [ -f ../../tooling/env.sh ]; then . ../../tooling/env.sh; fi
 SHIM_HDR=${SHIM_HDR:-1}
 [ "$SHIM_HDR" = 1 ] || { echo "error: this ABL only takes header v1 (SHIM_HDR=$SHIM_HDR)" >&2; exit 1; }
 
+# DIAG_STAGE: 0 = plain milestone shim, 1..5 = diag ladder rung (cumulative),
+# MAX = 5 (the default, full ladder). See diag.c and docs/DIAG.md.
+DIAG_STAGE=${DIAG_STAGE:-MAX}
+[ "$DIAG_STAGE" = MAX ] && DIAG_STAGE=5
+case "$DIAG_STAGE" in [0-5]) ;; *) echo "error: DIAG_STAGE=$DIAG_STAGE, want 0..5 or MAX" >&2; exit 1 ;; esac
+# OUT: separate build trees per rung so the ladder can be built in one run.
+OUT=${OUT:-out}
+# DIAG_LOG=0 builds an image that never writes (no UFS ring at all).
+DIAG_LOG=${DIAG_LOG:-1}
+
 # Toolchain: $CC wins (the workspace LLVM wrapper exports it), else the distro
 # aarch64 gcc. clang needs an explicit target or it emits x86-64.
 CC=${CC:-}
@@ -60,50 +70,64 @@ if [ ! -f "$DTB" ]; then
 		echo "error: no $DTB and no STOCK_BOOT=<stock boot.img> to extract it from" >&2
 		exit 1
 	}
-	"$PYTHON" ../tools/extract-dtb.py "$STOCK_BOOT" out --dump
+	"$PYTHON" ../tools/extract-dtb.py "$STOCK_BOOT" "$OUT" --dump
 fi
+
+# Stage 5 compares /memory against a table generated from mkadt_avicii.py; it
+# lands in the shim dir, so it is fresh for every rung of every build.
+"$PYTHON" ../tools/mkdiag_memtab.py >/dev/null
 
 # -fno-jump-tables: clang turns dense switches into tables of absolute string
 # pointers in .rodata (R_AARCH64_ABS64). Those are only correct if the image is
 # loaded at its link address (0); the shim is loaded wherever ABL likes, so keep
 # the switches as compare-and-branch. The ABS64 check below enforces it.
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
-	$CC $CFLAGS -c "$f" -o "out/${f%.*}.o"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DDIAG_STAGE=$DIAG_STAGE -DDIAG_LOG=$DIAG_LOG"
+mkdir -p "$OUT"
+OBJS="start shim console mmu fdt loader ufs diag diaglog"
+for f in $OBJS; do
+	case $f in
+	start) src=start.S ;;
+	*) src=$f.c ;;
+	esac
+	$CC $CFLAGS -c "$src" -o "$OUT/$f.o"
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$($READELF -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+abs=0
+for f in $OBJS; do
+	[ "$f" = start ] && continue
+	abs=$((abs + $($READELF -r "$OUT/$f.o" | grep -c ABS64 || true)))
+done
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
-$CC $CFLAGS -static -T shim.ld $LINKFLAGS \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
-$OBJCOPY -O binary out/shim.elf out/Image
+link=()
+for f in $OBJS; do link+=("$OUT/$f.o"); done
+$CC $CFLAGS -static -T shim.ld $LINKFLAGS "${link[@]}" -o "$OUT/shim.elf"
+$OBJCOPY -O binary "$OUT/shim.elf" "$OUT/Image"
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 # mawk has no strtonum, so let bash do the hex conversion.
-size_hex=$($NM out/shim.elf | awk '$3=="_end"{print $1}')
-[ -n "$size_hex" ] || { echo "error: no _end symbol in out/shim.elf" >&2; exit 1; }
+size_hex=$($NM "$OUT/shim.elf" | awk '$3=="_end"{print $1}')
+[ -n "$size_hex" ] || { echo "error: no _end symbol in $OUT/shim.elf" >&2; exit 1; }
 size=$((0x$size_hex))
-truncate -s "$size" out/Image
+truncate -s "$size" "$OUT/Image"
 # gzip -n: no name/mtime, so the image is reproducible.
-gzip -9 -n -c out/Image > out/Image.gz
-cat out/Image.gz "$DTB" > out/Image.gz-dtb
+gzip -9 -n -c "$OUT/Image" > "$OUT/Image.gz"
+cat "$OUT/Image.gz" "$DTB" > "$OUT/Image.gz-dtb"
 
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then
-	cp "$1" out/ramdisk.bin
+	cp "$1" "$OUT/ramdisk.bin"
 else
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+	(cd "$OUT" && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 
-../tools/mkbootimg_v1.sh --kernel out/Image.gz-dtb --ramdisk out/ramdisk.bin \
+../tools/mkbootimg_v1.sh --kernel "$OUT/Image.gz-dtb" --ramdisk "$OUT/ramdisk.bin" \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
-	--cmdline "console=null" -o out/shim-boot.img
+	--cmdline "console=null" -o "$OUT/shim-boot.img"
 
 # Host render of the console layout (x86 gcc, host_test only).
 if command -v gcc >/dev/null; then
-	gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+	gcc -O1 -Wall -o "$OUT/host_test" console.c host_test.c && "$OUT/host_test"
 fi
-ls -l out/Image out/Image.gz-dtb out/shim-boot.img
-echo "flash: fastboot boot out/shim-boot.img   (or flash boot_a once the layout is confirmed)"
+ls -l "$OUT/Image" "$OUT/Image.gz-dtb" "$OUT/shim-boot.img"
+echo "flash: fastboot boot $OUT/shim-boot.img   (or flash boot_a once the layout is confirmed)"

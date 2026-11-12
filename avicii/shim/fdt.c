@@ -105,6 +105,7 @@ int fdt_reg_walk(uintptr_t fdt, fdt_reg_cb cb, void *ctx)
 	uintptr_t p = fdt + be32(fdt + 8);
 	uintptr_t strings = fdt + be32(fdt + 12);
 	int depth = 0, ac = 2, sc = 1, seen = 0, ok = 1;
+	char nm[5][64] = { { 0 } };
 	char parent[64], node[64] = "";
 
 	if (!be32(fdt + 4) || be32(fdt + 4) < 256)
@@ -121,13 +122,11 @@ int fdt_reg_walk(uintptr_t fdt, fdt_reg_cb cb, void *ctx)
 			p = align4(skip_str(p));
 			if (p > end)
 				return seen;
-			if (depth == 1 || depth == 2) {
-				char *dst = depth == 1 ? parent : node;
-				int i = 0;
-				for (; i < (int)sizeof(parent) - 1 && *(volatile char *)(start + i); i++)
-					dst[i] = *(volatile char *)(start + i);
-				dst[i] = 0;
-			}
+			char *dst = nm[depth < 5 ? depth : 4];
+			int i = 0;
+			for (; i < 63 && *(volatile char *)(start + i); i++)
+				dst[i] = *(volatile char *)(start + i);
+			dst[i] = 0;
 			depth++;
 			break;
 		}
@@ -153,8 +152,24 @@ int fdt_reg_walk(uintptr_t fdt, fdt_reg_cb cb, void *ctx)
 					sc = (int)v;
 				break;
 			}
-			if (depth != 2 || streq(pn, "reg") == 0)
+			if (depth < 2 || streq(pn, "reg") == 0)
 				break;
+			/* node is the one whose BEGIN got us here, parent the one
+			 * above it; both live in the name stack */
+			{
+				const char *nsrc = nm[depth - 1 < 5 ? depth - 1 : 4];
+				int i = 0;
+				for (; i < 63 && nsrc[i]; i++)
+					node[i] = nsrc[i];
+				node[i] = 0;
+				parent[0] = 0;
+				if (depth >= 3) {
+					const char *psrc = nm[depth - 2 < 5 ? depth - 2 : 4];
+					for (i = 0; i < 63 && psrc[i]; i++)
+						parent[i] = psrc[i];
+					parent[i] = 0;
+				}
+			}
 			unsigned cells = (unsigned)(ac + sc) * 4;
 			if (!cells || len < cells || len % cells)
 				break;

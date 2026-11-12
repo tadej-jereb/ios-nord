@@ -8,6 +8,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "diag.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -151,6 +152,8 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	}
 	con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
 	con_str("STAGE", stage);
+	if (diag_stage_name())
+		con_str("DIAG", diag_stage_name());
 	con_hex("ESR", rsr("esr_el1"));
 	con_hex("ELR", rsr("elr_el1"));
 	con_hex("FAR", rsr("far_el1"));
@@ -168,6 +171,13 @@ static uintptr_t find_gicr(void);
 void secondary_main(uint64_t idx)
 {
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
+	if (diag_active()) {
+		/* diag rung 4: ack + bounded spin, no GIC writes of our own */
+		diag_secondary(idx);
+		__asm__ volatile("dsb sy" ::: "memory");
+		smc(PSCI_CPU_OFF, 0, 0, 0);
+		return;
+	}
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
 		if (r) {
@@ -373,6 +383,11 @@ static uint32_t to_us(uint64_t ticks)
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+	/* DIAG_STAGE build: run the ladder and park there, nothing else. */
+	if (diag_run(dtb))
+		for (;;)
+			__asm__ volatile("wfe");
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

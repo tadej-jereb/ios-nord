@@ -1,0 +1,34 @@
+file            : /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img (360448 bytes)
+magic           : b'ANDROID!' OK
+kernel_size     : 0x5552d (349485)
+kernel_addr     : 0x8000 (32768)
+ramdisk_size    : 0x63 (99)
+ramdisk_addr    : 0x1000000 (16777216)
+second_size     : 0x0 (0)
+second_addr     : 0x0 (0)
+tags_addr       : 0x100 (256)
+page_size       : 0x1000 (4096)
+header_version  : 0x1 (1)
+os_version_raw  : 0x22000236 (570425910)
+recovery_dtbo_size: 0x0 (0)
+recovery_dtbo_offset: 0x0 (0)
+header_size     : 0x670 (1648)
+name            : b''
+cmdline         : b'console=null'
+id (sha1)       : 62db3161a3c9541f4d14320e3bedb33b911e83c8000000000000000000000000
+extra_cmdline   : b''
+os version      : 17.0.0 patch 2035-06
+kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
+ramdisk load adr: 0x1000000
+tags addr       : 0x100
+kernel section  : page 1 offset 0x1000 size 349485
+ramdisk section : offset 0x57000 size 99
+total needed    : 360448 bytes; file has 360448
+gzip ok         : 307200 bytes decompressed, crc ok, tail 337226 bytes at 0x2fe3
+board dtb       : totalsize 337226
+
+PASS: header v1, stock avicii geometry, gzip+DTB kernel
+-rwxrwxr-x 1 tadej tadej 307200 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image
+-rw-rw-r-- 1 tadej tadej 349485 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:08 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img
+flash: fastboot boot /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img   (or flash boot_a once the layout is confirmed)

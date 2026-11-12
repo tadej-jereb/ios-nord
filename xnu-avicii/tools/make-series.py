@@ -147,7 +147,9 @@ ADAPT = {
         ('Redmi Note 10 Pro bootstrap console', 'avicii bootstrap console', 1),
     ],
     "0012-sweet-keep-debug-console-after-ttbr0.patch": [
-        ('0x9c000000', '0xa0000000', 2),
+        ('0x9c000000', '0xa0000000', 3),
+        # 0012 quotes 0010's file header; it must match the adapted 0010.
+        ('Redmi Note 10 Pro bootstrap console', 'avicii bootstrap console', 1),
         ('#define EARLY_STRIDE (4320u / 4)', '#define EARLY_STRIDE (4800u / 4)', 1),
     ],
     "0018-sweet-boot-cpu-driver.patch": [
@@ -191,9 +193,17 @@ ADAPT = {
         ('voting L11C through RPMh', 'voting L13 through RPMh', 1),
         ('L11C RPMh enable failed', 'L13 RPMh enable failed', 1),
         ('SWEET PM6150L L11C bring-up', 'SWEET PM8150 L13 bring-up', 1),
+        # context lines quoting 0060's file header, which 0060's rules changed
+        (' * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.',
+         ' * SWEET SE7 FIFO I2C / GT9886 (GT885) / Focaltech 54:52 bring-up.', 1),
+        (" * zero to GT9896's event status after reading a report. See hw-report.md.",
+         " * zero to GT9886's event status after reading a report. See hw-report.md.", 1),
         ('Vendor GT9896 dev_confirm', 'Vendor GT9886 dev_confirm', 1),
     ],
     "0063-sweet-goodix-geni-packing.patch": [
+        # context quoting 0062's output
+        (' * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.',
+         ' * Requires ABL-loaded GENI I2C firmware; votes L13 through sweet_rpmh.c.', 1),
         ("- * zero to GT9896's event status after reading a report. See hw-report.md.",
          "- * zero to GT9886's event status after reading a report. See hw-report.md.", 1),
         ("+ * zero to GT9896's event status after reading a report. See touch2/report.md.",
@@ -208,6 +218,8 @@ ADAPT = {
         ('0x9d400000', '0xa0000000', 1),
     ],
     "0086-fajita-cpu-match.patch": [
+        # 0018/0038 already set the match string; both sides of this hunk agree.
+        ("'IONameMatch'     = 'qcom,kryo470';", "'IONameMatch'     = 'qcom,kryo475';", 1),
         ("'IONameMatch'     = 'qcom,kryo385';", "'IONameMatch'     = 'qcom,kryo475';", 1),
         ('/* FAJITA: the ADT says the truth (SDM845 = Kryo 385); matching the sweet',
          '/* AVICII: the ADT says the truth (SM7250 = Kryo 475); matching the sweet', 1),
@@ -282,7 +294,9 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 
 def recount(text):
     """Rewrite every hunk header count from its body (git trusts the header)."""
-    lines = text.split("\n")
+    # splitlines() drops the phantom element a trailing newline would add, which
+    # is exactly what git counts: only real lines belong to a hunk body.
+    lines = text.splitlines()
     out = []
     i = 0
     while i < len(lines):
@@ -310,8 +324,6 @@ def recount(text):
             else:
                 break
             j += 1
-        while j > i + 1 and lines[j - 1] == "":
-            j -= 1
         tail = m.group(5)
         header = "@@ -%s +%s @@%s" % (
             m.group(1) if old_n == 1 else "%s,%d" % (m.group(1), old_n),
@@ -321,7 +333,7 @@ def recount(text):
         out.append(header)
         out.extend(lines[i + 1:j])
         i = j
-    return "\n".join(out)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
 def main():
@@ -344,19 +356,24 @@ def main():
                                   % (name, old[:48], got, want))
                 text = text.replace(old, new)
             if name == "0060-sweet-keys-touch-drivers.patch":
-                for old, new in KEYS_ADAPT:
-                    if old not in text:
-                        failed.append("%s: keys block not found: %r" % (name, old[:48]))
-                    text = text.replace(old, new, 1)
+                # Every line of the two new files in this patch is an added
+                # line, so the blocks are written as plain code and prefixed.
+                def as_patch(block):
+                    return "\n".join("+" + ln for ln in block.split("\n"))
+                for old_b, new_b in KEYS_ADAPT:
+                    old_p, new_p = as_patch(old_b), as_patch(new_b)
+                    if old_p not in text:
+                        failed.append("%s: keys block not found: %r" % (name, old_b[:48]))
+                    text = text.replace(old_p, new_p, 1)
             text = recount(text)
         elif name in ADAPT:
             text = recount(text)
         if not name.endswith(".sh"):
             text = recount(text) if cls in ("A", "F") else text
         dest = OUT / name
-        if dest.exists() and check and dest.read_text() != text:
+        if dest.exists() and check and dest.read_text(encoding='utf-8', errors='surrogateescape') != text:
             failed.append("%s: on disk differs from what the builder produces" % name)
-        dest.write_text(text)
+        dest.write_text(text, encoding='utf-8', errors='surrogateescape')
         written.append((name, hashlib.sha256(dest.read_bytes()).hexdigest()[:16], cls))
 
     if failed:

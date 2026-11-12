@@ -11,6 +11,7 @@
 #define WHITE	0xffffffffU
 #define YELLOW	0xffffff00U
 #define GREEN	0xff00ff00U
+#define MAGENTA	0xffff00ffU
 
 extern volatile uint32_t *con_fb;
 

@@ -201,8 +201,14 @@ before userspace exists. So: **flash, do not boot.**
 
 ## Slot policy (observed behaviour)
 
-- Experiments go to **`boot_a`**, then `fastboot --set-active=a` and reboot.
-- `boot_b` is the working LineageOS 21 + Magisk and is never written.
+- **`boot_a` is unusable as a test slot**: the OOS install left no system metadata for
+  it, so any kernel there lands in recovery or straight back in fastboot (verified: stock
+  LOS kernel, our shim v1 and v2, and the restored OOS images all behave the same).
+- Experiments therefore go to **`boot_b`**, the live LineageOS slot, with
+  `backup/64f70df8/boot_b.img` (md5 `84bb0685c38b1c7fc9ffa0c37beae2a8`) as the restore:
+  `fastboot flash boot_b backup/64f70df8/boot_b.img`. Slot stays on `b`.
+- `vbmeta_b` is the LineageOS one (hashtree and verification already disabled by the
+  ROM's build flags), which is the correct environment for unsigned images.
 - When an experiment fails, ABL **switches the active slot to `a` by itself** (observed
   once) and lands in the stock recovery with "can't load Android system". Recovery is
   therefore not evidence of a brick: check `fastboot getvar current-slot`, then

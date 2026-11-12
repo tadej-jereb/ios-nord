@@ -26,7 +26,9 @@
 #define MT_UFS_SIZE 0x3000UL
 #define MT_SOC_BASE 0x1000000UL
 
-/* {base, size, name} extents that must not overlap dram. */
-struct mt_carveout { unsigned long base, size; const char *name; };
-#define MT_CARVEOUTS { MT_GICD, MT_GICD_SIZE, "gicd" }, { MT_GICR, MT_GICR_SIZE, "gicr" }, { MT_FB, MT_FB_SIZE, "splash" }, { MT_UFS, MT_UFS_SIZE, "ufs" }
+/* {base, size, tag} extents that must not overlap dram. The tag is a
+ * plain char so the table carries no pointers: an array of string
+ * pointers would need ABS64 relocations the unpinned image cannot use. */
+struct mt_carveout { unsigned long base, size; char tag; };
+#define MT_CARVEOUTS { MT_GICD, MT_GICD_SIZE, 'g' }, { MT_GICR, MT_GICR_SIZE, 'r' }, { MT_FB, MT_FB_SIZE, 's' }, { MT_UFS, MT_UFS_SIZE, 'u' }
 #define MT_N_CARVEOUTS 4
