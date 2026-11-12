@@ -1,0 +1,144 @@
+ios-avicii — project progress
+==============================
+Written 2026-11-12 ~20:50, at the point where the phone is unlocked and rooted but the
+shim still does not execute. This file is the honest state, including what failed and
+what it cost.
+
+GOAL
+----
+Run Apple's open-source XNU (xnu-8796, iOS 16 generation) plus the unmodified iOS 16.7.16
+iPhone X userland on a OnePlus Nord (avicii, SM7250/lito).
+
+IOS 16 IS NOT RUNNING YET. What runs today is LineageOS 21 on slot b, which is the
+scaffolding (root, adb, dumps, restore path).
+
+
+WHERE THE WORK ACTUALLY IS
+--------------------------
+Milestone ladder, with the real state of each rung:
+
+  1. bootloader unlock              DONE   verified: flash.locked=0, verifiedbootstate=orange
+  2. root + adb host                DONE   Magisk v31.1, su -c id -> 0
+  3. partition backup               DONE   41 partitions, sizes+md5, magic-checked
+  4. live hardware dump             DONE   83 files, live FDT, RAM map, cmdline, i2c ids
+  5. board ADT from live FDT        DONE   avicii/adt/avicii-live.adt
+  6. shim executes at all           BLOCKED  image is accepted, never executed (~6 s reset)
+  7. XNU payload                    READY    87-patch series applies clean, never compiled
+  8. iOS root image                 READY    16 GiB HFSX built+fsck-clean, EMPTY (populate script ready)
+  9. boot to launchd / SpringBoard  NOT STARTED
+
+
+THE CURRENT BLOCKER, IN DETAIL
+------------------------------
+Every self-built boot image on boot_b ends in fastboot after a fixed ~6 s. Measured so far:
+
+  - diag stage 1 (log+console)            ~6 s
+  - a park loop two instructions in       ~6 s
+  - same park, stock cmdline              ~6 s
+  - same park as header v2 + AVB footer   ~6 s
+  - a park that deliberately resets after 30 s of counter spin: STILL ~6 s
+
+A 30 s deliberate reset finishing in 6 s means the CPU never reaches our code: the 6 s is
+constant no matter what the image does, so it is a host-side (ABL/XBL) timeout or refusal,
+not a shim crash. Nothing is wasted by a failed run - boot_b restores in one command.
+
+What was ruled OUT by control experiments:
+  - stock kernel re-packed by our packer: does NOT boot (broke separately, see below)
+  - untouched stock boot.img: BOOTS (18 s) -> the slot, partition and flash path are fine
+  - header v1 vs v2: both fail identically
+  - cmdline content (console=null vs stock): both fail
+  - AVB footer presence: needed for the repack case, not sufficient for the shim
+  - MMU/console/log code: a two-instruction image fails the same way
+
+Still open: why ABL accepts (Sending/Writing OKAY) and then does not hand over. Next
+experiments queued: (a) compare ABL's own log (/proc/last_kmsg, msm_rtb) after a failed
+boot, (b) make the shim image *shape* identical to stock (43 MB kernel-sized payload,
+v2, stock cmdline, stock footer) and shave it down from there, (c) test whether ABL
+requires os_version/rollback fields to match the device, (d) test a payload known to be
+executable (a tiny Linux Image) through our packer to separate "our packer" from "our code".
+
+
+VERIFIED FACTS ABOUT THIS DEVICE
+--------------------------------
+- SM7250/lito, msm-id 400/440, project 20801, hw_version 14, model AC2003, OOS 12 base.
+- 8 CPUs: 6x A55 MPIDR 0x000-0x500, gold A76 0x600, prime A76 0x700 (domain order +
+  thermal throttle targets prove the order).
+- RAM (live FDT, 8 GB SKU): 0x80000000+0x3bb00000, 0xc0000000+0xc0000000,
+  0x180000000+0x100000000, 29 reserved carve-outs. The static DT has a placeholder.
+- GIC GICD 0x17a00000 / GICR 0x17a60000 stride 0x20000, virtual timer INTID 19.
+- UFS 0x1d84000, PHY 0x1d87000, ICE 0x1d90000. TLMM 0xf000000. PS_HOLD 0xc264000.
+  IMEM restart 0x146ab65c. apps RSC 0x18200000, TCS 0x18200d00.
+- splash 0xa0000000 +0x2300000 (35 MiB), dfps_data 0xa2300000.
+- Panel: Samsung AMS644VK04, 1080x2400, DSC, COMMAND MODE (from live cmdline).
+- Touch: Goodix GT9886 at I2C 0x5D is the BOUND driver; the ST FTS node at 0x49 is
+  unbound. IRQ gpio 9, reset gpio 8, rails pm8150_l13 (3.008 V) + pm8150_s4.
+- Wi-Fi: WCN3990 on SNOC 0x18800000 with WLFW carve-out + IPA, not PCIe.
+- Boot image: header v2, page 4096, kernel 0x8000, ramdisk 0x1000000, tags 0x100,
+  raw Image, dtb_size 0, partition 96 MiB, AVB footer (algorithm NONE, unsigned).
+- Board DTBs live in dtbo.img entry board-id 8 0 (dtsi_no 0x5141), extracted to
+  src/avicii-board.dtb. The DTB is a fragment overlay, so it has no /memory.
+- Device shows NO console text at all: the command-mode panel never has a frame pushed
+  after ABL hands off, so the shim console writes into a buffer nobody displays.
+
+
+HOST-SIDE STATE (all verified)
+------------------------------
+- Unprivileged toolchain: clang 18.1.8 (emits arm64 Mach-O), ld64.lld, llvm-objcopy/strip,
+  adb 1.0.41, fastboot 37.0.3, dtc 1.7.2. tooling/env.sh sources it.
+- Kernel: xnu-avicii/series, 87 patches + 3 stage scripts; every entry passes
+  `git apply --check` against a pristine xnu-8796.141.3. 76 files byte-identical to the
+  base tree, 10 adapted with counted replacements, drops reasoned in HANDOFF.md.
+  .github/workflows/xnu.yml prepared (macOS-14, dry-run mode). Needs `gh auth login` + fork.
+- Root image: build/ios16-root.img, 16 GiB sparse HFSX journaled, fsck clean, EMPTY.
+  apfs-fuse built from source; all three IPSW DMGs mount read-only unprivileged.
+  Payload measured 11.30 GB = 68.5 % of the volume, 5.03 GiB free. Populate = one sudo run.
+- Packer: header v1 (Image.gz-dtb) and v2 both supported, page padding, AVB footer added
+  and verified (footer presence, original_image_size vs sections end). mkbootimg accepts
+  empty dtb like stock.
+- ADT: avicii-live.adt built from the live FDT; fallback dram window fixed so it no longer
+  straddles a RAM hole.
+- Scripts: 44-backup-stream (su-aware, works), 42-log-pull (fixed to su), 33-populate-root
+  (dry-run passes), dump-live (83 captures), 43-hash-images.
+
+
+WHAT FAILED AND WHAT IT TAUGHT
+------------------------------
+- `fastboot boot` is unusable on this ABL: 4/4 attempts, both header versions, TWRP and shim.
+  Flash instead. (docs/SHIM_BOOT.md)
+- Slot a is unusable: OOS left no system metadata, so any kernel there lands in recovery.
+  Experiments go to boot_b, restore = backup/64f70df8/boot_b.img.
+- A payload-less shim resets itself after 20 s - a fastboot fallback is not proof of failure.
+- The stock boot.img carries an AVB footer at the partition end; an image without one is
+  accepted by fastboot and never run. The stock footer is unsigned (algorithm NONE).
+- Our first repacks were TRUNCATED: the ramdisk's last partial page was dropped and the
+  footer/vbmeta landed inside it. Page padding fixed that class of bug.
+- /proc/cmdline order differs from the stored cmdline; truncating from /proc drops
+  androidboot.* and bootdevice arguments. Copy the stored field, never /proc.
+- Measuring "did it boot" by watching adb gives false positives from the previous boot:
+  `adb kill-server` before every reboot test.
+- A repacked stock kernel still does not boot while stock itself does - that gap is the
+  live lead, not the shim code.
+
+
+RESTORE / SAFETY
+----------------
+Active slot must stay b. One-command restore, then reboot:
+
+    fastboot flash boot_b backup/64f70df8/boot_b.img
+    fastboot reboot
+
+If ABL flips to a after failures: `fastboot --set-active=b`.
+Backups: backup/64f70df8/ (41 partitions, md5 manifest). Never touched: persist, modemst*,
+fsg, xbl, abl, tz, all still original. Nothing has been destroyed except userdata (twice:
+unlock and the OOS->LOS format; both expected).
+
+
+NEXT STEPS, IN ORDER
+--------------------
+1. Boot a failed image, then read /proc/last_kmsg and the msm_rtb dump from a working boot
+   for an ABL/XBL reason line.
+2. Build a shim image with stock weight and shape (43 MB kernel section, v2, stock cmdline,
+   stock-style footer) and shrink from there once it runs.
+3. Push a known-executable tiny Linux Image through our packer: if it runs, the packer is
+   exonerated and the shim is at fault; if not, the packer still is.
+4. Then the diag ladder (docs/DIAG.md), then the XNU payload from CI, then the root.

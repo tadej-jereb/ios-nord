@@ -1,6 +1,6 @@
-file            : /home/tadej/ios-nord/avicii/shim/out-diag/stage-5/shim-boot.img (364544 bytes)
+file            : /home/tadej/ios-nord/avicii/shim/out-diag/stage-5/shim-boot.img (100663296 bytes)
 magic           : b'ANDROID!' OK
-kernel_size     : 0x567ec (354284)
+kernel_size     : 0x568d5 (354517)
 kernel_addr     : 0x8000 (32768)
 ramdisk_size    : 0x63 (99)
 ramdisk_addr    : 0x1000000 (16777216)
@@ -15,16 +15,17 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : a2abf2b8f5b6bb7d718731cea447a057c7b67236000000000000000000000000
+id (sha1)       : 37084be1577cc060064fa3ab8ae84691fd71c8c2000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
 ramdisk load adr: 0x1000000
 tags addr       : 0x100
-kernel section  : page 1 offset 0x1000 size 354284
+kernel section  : page 1 offset 0x1000 size 354517
 ramdisk section : offset 0x58000 size 99
-total needed    : 364544 bytes; file has 364544
-gzip ok         : 315392 bytes decompressed, crc ok, tail 337226 bytes at 0x42a2
+total needed    : 364544 bytes; file has 100663296
+avb footer      : present, original_image_size 40537894204473344, sections end 364544
+gzip ok         : 315392 bytes decompressed, crc ok, tail 337226 bytes at 0x438b
 board dtb       : totalsize 337226
 
 PASS: header v1, stock avicii geometry, gzip+DTB kernel

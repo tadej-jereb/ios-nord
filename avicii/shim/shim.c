@@ -152,6 +152,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	}
 	con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
 	con_str("STAGE", stage);
+	con_hex("BASE", kimg_base);	/* where ABL actually loaded us */
 	if (diag_stage_name())
 		con_str("DIAG", diag_stage_name());
 	con_hex("ESR", rsr("esr_el1"));

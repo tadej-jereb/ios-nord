@@ -74,6 +74,7 @@ static void zero_table(uint64_t *t)
 
 int mmu_enable(struct mmu_info *info)
 {
+	/* Symbol values are runtime addresses (see mmu.h), so no load base here. */
 	uintptr_t img_lo = (uintptr_t)_head & ~(PG_SIZE - 1);
 	uintptr_t img_hi = ((uintptr_t)_end + PG_SIZE - 1) & ~(PG_SIZE - 1);
 	uintptr_t pool = ((uintptr_t)pt_pool + PG_SIZE - 1) & ~(PG_SIZE - 1);
@@ -90,7 +91,11 @@ int mmu_enable(struct mmu_info *info)
 	zero_table(l2);
 	for (uint64_t i = 0; i < (8UL << 30) >> BLK_SHIFT; i++)
 		l2[i] = (i << BLK_SHIFT) | DEV_FLAGS | D_BLOCK;
-	l2[FB_PHYS >> BLK_SHIFT] = (FB_PHYS & ~(BLK_SIZE - 1)) | NC_FLAGS | D_BLOCK;
+#ifndef BISECT_NO_FB
+	/* Map the 32MB block that contains the splash; FB_PHYS need not be aligned. */
+	uint64_t fb_block = FB_PHYS & ~(BLK_SIZE - 1);
+	l2[fb_block >> BLK_SHIFT] = fb_block | NC_FLAGS | D_BLOCK;
+#endif
 
 	/* L3 for each block that holds part of the image */
 	for (uint64_t blk = img_lo >> BLK_SHIFT; blk <= (img_hi - 1) >> BLK_SHIFT; blk++) {

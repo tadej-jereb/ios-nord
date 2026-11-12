@@ -16,6 +16,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "mmu.h"
 #include "ufs.h"
 
 #define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, avicii/lito live FDT */
@@ -108,6 +109,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	for (unsigned i = 0; i < cdb_len; i++)
 		ucd.cmd[16 + i] = cdb[i];
 
+	/* The host DMAs from these, so they must be runtime (physical) addresses. */
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
 	/* DD: 2 = device->host, 1 = host->device, 0 = no data. */
 	utrl[0].dw0 = (1u << 28) | ((dir == 1 ? 2u : dir == 2 ? 1u : 0u) << 25) | (1u << 24);
@@ -196,6 +198,7 @@ uint32_t ufs_takeover(void)
 		return 11;
 	}
 	ufs_wr(REG_UTRLRSR, 0);
+	/* Runtime address: the host fetches the UTRL from here. */
 	uintptr_t list = (uintptr_t)utrl;
 	ufs_wr(REG_UTRLBA, (uint32_t)list);
 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));

@@ -5,15 +5,15 @@
  * them and prints every mismatch instead of panicking.
  *
  * source   : avicii/tools/mkadt_avicii.py
- * sha256   : c857d153477474e3899c7e6b72053bd1659401d3acf03637c423baa39e2eaf2e
+ * sha256   : 84b39bbc916a8e266a54a1c02c9dc96aac501047d05a02676858dcfb5eb97b4a
  */
 #pragma once
 
-#define MT_SRC_SHA256 "c857d153477474e3899c7e6b72053bd1659401d3acf03637c423baa39e2eaf2e"
+#define MT_SRC_SHA256 "84b39bbc916a8e266a54a1c02c9dc96aac501047d05a02676858dcfb5eb97b4a"
 #define MT_4G        0x100000000UL
 
-#define MT_DEFAULT_PHYS_BASE 0xb0000000UL	/* fallback dram base */
-#define MT_DEFAULT_MEM_SIZE 0x4d000000UL	/* fallback dram size */
+#define MT_DEFAULT_PHYS_BASE 0x90000000UL	/* fallback dram base */
+#define MT_DEFAULT_MEM_SIZE 0xf000000UL	/* fallback dram size */
 #define MT_MIN_MEM_SIZE 0x10000000UL	/* smallest believable dram extent */
 #define MT_PANIC_LOG_SIZE 0x100000UL	/* panic log carved off the top */
 #define MT_GICD 0x17a00000UL	/* GIC distributor */

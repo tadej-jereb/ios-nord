@@ -21,7 +21,17 @@ _head:
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
+	/*
+	 * Publish the runtime address of _head (= the load base) as kimg_base.
+	 * The image is linked at 0, so link address + kimg_base is the only
+	 * legal way to turn a symbol into an address (link2run() in mmu.h) and
+	 * the value itself is the one fact a crash report needs: where ABL
+	 * actually put us. Header kernel_addr wants 0x8000.
+	 */
+	adr	x20, _head
 	msr	spsel, #1
+	adr	x21, kimg_base
+	str	x20, [x21]
 	adr	x1, _stack_top
 	mov	sp, x1
 	adr	x1, vectors
@@ -35,11 +45,17 @@ _start:
 	str	xzr, [x1], #8
 	b	1b
 2:	mov	x0, x19
+#ifdef PARK_AFTER_ENTRY
+	/* Bisect rung: prove the whole prologue and park before any C code. */
+3:	wfe
+	b	3b
+#else
 	bl	shim_main
 3:	wfe
 	b	3b
+#endif
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+	/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
@@ -126,3 +142,13 @@ exc_common:
 	add	sp, sp, #(30 * 8)
 	ldp	x29, x30, [sp], #16
 	eret
+
+/*
+ * Runtime load base, published by _start. .data (not .bss) so the bss clear,
+ * which runs after the store, cannot wipe it.
+ */
+	.data
+	.balign	8
+	.globl	kimg_base
+kimg_base:
+	.quad	0

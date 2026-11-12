@@ -123,7 +123,7 @@ fi
 
 ../tools/mkbootimg_v1.sh --kernel "$OUT/Image.gz-dtb" --ramdisk "$OUT/ramdisk.bin" \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
-	--cmdline "console=null" -o "$OUT/shim-boot.img"
+	--cmdline "${CMDLINE:-console=null}" -o "$OUT/shim-boot.img"
 
 # Host render of the console layout (x86 gcc, host_test only).
 if command -v gcc >/dev/null; then

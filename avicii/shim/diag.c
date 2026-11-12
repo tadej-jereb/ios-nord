@@ -24,6 +24,7 @@
 #include "diaglog.h"
 #include "fdt.h"
 #include "memtab.h"
+#include "mmu.h"
 #include "ufs.h"
 
 /* The image is freestanding: clang emits calls to these for struct and array
@@ -590,6 +591,13 @@ int diag_run(uintptr_t fdt)
 	con_clear(0xff08080aU);
 	say('-', "SHIM", "avicii DIAG " STAGE_S);
 	say('-', "SHIM", "rungs are cumulative; last line = last step run");
+	{
+		/* Load base: the header asks for 0x8000. Anything else here is the
+		 * first thing to look at when a rung dies early. */
+		char b[40];
+		hexline(b, "load base=", kimg_base);
+		say('-', "SHIM", b);
+	}
 	if (!DIAG_LOG) {
 		con_str("LOG", "off (DIAG_LOG=0): image writes nothing");
 	} else if (lrc) {

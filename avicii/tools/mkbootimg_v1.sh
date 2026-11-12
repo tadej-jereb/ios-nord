@@ -104,6 +104,18 @@ if s_off + ((ss + p - 1) // p) * p > len(d):
 # Sizes are the real section lengths; only the sections after them are padded,
 # so no page-alignment check on the sizes themselves.
 
+# ABL only executes an image whose partition tail carries an AVB footer.
+foot = d.rfind(b'AVBf')
+if foot < 0 or len(d) - foot != 64:
+    bad.append('no AVB footer at the end of the partition (ABL will not execute this image)')
+else:
+    orig, = struct.unpack_from('<Q', d, foot + 12)
+    need = p + ((ks + p - 1) // p) * p + ((rs + p - 1) // p) * p
+    print(f'avb footer      : present, original_image_size {orig}, sections end {need}')
+    if orig < need:
+        bad.append(f'footer original_image_size {orig} cuts into the sections ({need})')
+
+
 # v1 kernel section must be a real gzip stream with the DTB appended; a stock v2 image
 # holds a raw Image instead, which is reported rather than flagged.
 kern = d[k_off:k_off + ks]
@@ -167,12 +179,24 @@ done
 [ -n "$OUT" ] || { echo "error: -o required" >&2; exit 2; }
 [ -f "$MKBOOTIMG_PY" ] || { echo "error: mkbootimg.py not found at $MKBOOTIMG_PY" >&2; exit 2; }
 
+# ABL verifies/rejects boot images by their AVB footer; without one the image is
+# accepted by fastboot and then simply never executed. Unsigned hash footer
+# (--algorithm NONE) is what the stock image itself carries.
+PART_SIZE=${PART_SIZE:-100663296}
 "$PYTHON" "$MKBOOTIMG_PY" --header_version "$HDR" \
 	--kernel "$KERNEL" --ramdisk "$RAMDISK" \
 	--base "$BASE" --kernel_offset "$KERNEL_OFFSET" \
 	--ramdisk_offset "$RAMDISK_OFFSET" --second_offset "$SECOND_OFFSET" \
 	--tags_offset "$TAGS_OFFSET" --pagesize "$PAGESIZE" \
 	"${EXTRA[@]}" -o "$OUT"
+
+# Pad the sections to the partition and append the AVB footer, then verify.
+AVBTOOL="${AVBTOOL:-$(dirname "$0")/avbtool.py}"
+"$PYTHON" "$AVBTOOL" add_hash_footer --image "$OUT" \
+	--partition_size "$PART_SIZE" --partition_name boot --algorithm NONE >/dev/null || {
+	echo "error: could not add the AVB footer (ABL will not run the image)" >&2
+	exit 1
+}
 
 # Never hand back an image the ABL will reject without saying so.
 verify "$OUT"

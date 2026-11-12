@@ -1,6 +1,6 @@
-file            : /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img (360448 bytes)
+file            : /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img (100663296 bytes)
 magic           : b'ANDROID!' OK
-kernel_size     : 0x55568 (349544)
+kernel_size     : 0x55615 (349717)
 kernel_addr     : 0x8000 (32768)
 ramdisk_size    : 0x63 (99)
 ramdisk_addr    : 0x1000000 (16777216)
@@ -15,20 +15,21 @@ recovery_dtbo_offset: 0x0 (0)
 header_size     : 0x670 (1648)
 name            : b''
 cmdline         : b'console=null'
-id (sha1)       : 21aaf2571e87663bae46006f795cd4235541e009000000000000000000000000
+id (sha1)       : 2ea055aaaa254e734e9180625ece128a3f0674fb000000000000000000000000
 extra_cmdline   : b''
 os version      : 17.0.0 patch 2035-06
 kernel load addr: 0x8000  (base+0x8000 = 0x8000 expected)
 ramdisk load adr: 0x1000000
 tags addr       : 0x100
-kernel section  : page 1 offset 0x1000 size 349544
+kernel section  : page 1 offset 0x1000 size 349717
 ramdisk section : offset 0x57000 size 99
-total needed    : 360448 bytes; file has 360448
-gzip ok         : 307200 bytes decompressed, crc ok, tail 337226 bytes at 0x301e
+total needed    : 360448 bytes; file has 100663296
+avb footer      : present, original_image_size 36034294577102848, sections end 360448
+gzip ok         : 307200 bytes decompressed, crc ok, tail 337226 bytes at 0x30cb
 board dtb       : totalsize 337226
 
 PASS: header v1, stock avicii geometry, gzip+DTB kernel
--rwxrwxr-x 1 tadej tadej 307200 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image
--rw-rw-r-- 1 tadej tadej 349544 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image.gz-dtb
--rw-rw-r-- 1 tadej tadej 360448 Nov 12 20:11 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img
+-rwxrwxr-x 1 tadej tadej    307200 Nov 12 20:48 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image
+-rw-rw-r-- 1 tadej tadej    349717 Nov 12 20:48 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/Image.gz-dtb
+-rw-rw-r-- 1 tadej tadej 100663296 Nov 12 20:48 /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img
 flash: fastboot boot /home/tadej/ios-nord/avicii/shim/out-diag/ro2/shim-boot.img   (or flash boot_a once the layout is confirmed)
