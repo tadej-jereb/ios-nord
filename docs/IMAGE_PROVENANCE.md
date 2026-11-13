@@ -333,3 +333,13 @@ Root cause of the 0x1e: writes are opt-in, `ufsrw=1` (patch 0030) and `rootrw=1`
 journal is always written, so an HFS root cannot mount without them.
 | `out-pay/p6` | `774764bd…` (Image identical) | `0x180000000`/`0xfff00000` | `+ ufsrw=1 rootrw=1` | **ROOT MOUNTED**: journal created through the UFS write path, `hfs: mounted iOSRoot on device ufsroot0`, `root volume is not authenticated (error 25); continuing`, devfs mounted, `POST boot-arg set`, `Swap Subsystem is ON`, then `load_init_program: opening of /sbin/launchd failed, errno 2` (volume is empty) and a panic that flushed 6392 bytes into the ring. payload `sha256 86b63c89…`, panel photo `photos/p6-panel.jpg` |
 
+## Kernel `528ea6b2…` (build `43467800138`, 95/95 patches, incl. 0096-0103)
+
+| image | Image sha256 | payload | result |
+|---|---|---|---|
+| `out-pay/p7` | `3e3a84e5…` | `fdb4a8f3…`, cmdline = p6 | pending. First kernel with the bounded mountroot retry, GPT bound check and the UFS write fixes; a mount failure now has a deadline instead of looping. |
+
+CI note: the run is red only because `make install` aborts in `lldbmacros` (Python relative
+imports); the kernel had already linked and was collected. The workflow now fails only when no
+Mach-O is produced. The 131 MB `.a` still keeps the kernel dir out of git.
+
