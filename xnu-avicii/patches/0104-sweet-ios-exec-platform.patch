@@ -8,11 +8,11 @@
 +/*
 + * SWEET runs an iOS userland on a macOS-configuration kernel
 + * (XNU_TARGET_OS_OSX), so an iOS platform binary is only let through the
-+ * platform check below by com.apple.private.security.no-sandbox, which needs
-+ * an entitlements implementation. Our AMFI stand-in (bsd/kern/sweet_amfi.c)
-+ * has none but an empty one, so every plain execve() of an iOS binary --
-+ * load_init_program's launchd among them -- was refused here and killed
-+ * CS_KILLED with EXEC_EXIT_REASON_WRONG_PLATFORM, one step before dyld.
++ * platform check below by com.apple.private.security.no-sandbox -- a
++ * simulator key the shipped iOS userland does not carry. Every plain
++ * execve() of an iOS binary, load_init_program's launchd among them, was
++ * refused here and killed CS_KILLED with EXEC_EXIT_REASON_WRONG_PLATFORM,
++ * one step before dyld.
 + *
 + * Accept the binary when its signature already validated through this exec:
 + * CS_SIGNED is only set once the page hashes have checked out (by the kernel

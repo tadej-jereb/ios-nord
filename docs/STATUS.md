@@ -6,6 +6,12 @@ root volume: the kernel mounts it and panics on the missing `/sbin/launchd`. Pop
 image (`tooling/33b`, no sudo) and validate it (`tooling/34-check-bootstrap.sh`) before the
 next boot.
 
+Second wall, settled on the host: launchd's exec was killed `CS_KILLED` by AMFI's platform
+check (namespace 9, 0xe) — the kernel is a macOS-config build and refuses an iOS platform
+binary without the simulator's `no-sandbox` entitlement. Patch `0104`
+(`sweet_ios_exec_platform=0` to turn it off) makes the exec reach dyld; the QEMU run now
+stops at the missing dylib cache. `docs/AMFI_LAUNCHD.md`.
+
 # Status — 2026-11-11 (evening), host preparation
 
 Bootloader unlock is planned for **2026-11-12**. Until then: no device writes, only host-side

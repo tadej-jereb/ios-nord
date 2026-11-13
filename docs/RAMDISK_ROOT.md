@@ -175,11 +175,12 @@ SWEET EARLY PANIC: unexpected SIGKILL of launchd (CS_KILLED) with reason -- name
 
 So the shape is right: the md driver made md0 from the ADT property, HFS mounted
 the image as the root volume, and the kernel reached the exec. The stop is **one
-step earlier than dyld** - AMFI kills launchd with `CS_KILLED` (namespace 9,
-0xe), i.e. the built-in code-signing gate rejects it on this kernel before any
-dylib is loaded. That is independent of the ramdisk (the bytes are the pinned
-ones) and is the next wall to look at, not a defect of this image. A cache-less
-image therefore cannot reach a dyld error until that gate is settled.
+step earlier than dyld** - AMFI's platform check kills launchd with `CS_KILLED`
+(namespace 9, 0xe) on this kernel before any dylib is loaded. That is independent
+of the ramdisk (the bytes are the pinned ones) and is not a defect of this
+image; `0104` takes it (`docs/AMFI_LAUNCHD.md`), and the same cmdline then stops
+in dyld with `Library not loaded: /usr/lib/libSystem.B.dylib` - which a cache-less
+image cannot get past.
 
 QEMU is not the phone (no UFS, different GIC/timer, `cpu-factor=10`); see
 `docs/QEMU_AVICII.md` for what transfers.

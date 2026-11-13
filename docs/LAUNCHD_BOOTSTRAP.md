@@ -181,6 +181,42 @@ Boot-args it honours (from the 0x62e49..0x632ab block):
 having on a bring-up kernel. It also reads `security.mac.amfi.developer_mode_status`
 (sysctl string 0x53f3f) and `kern.bootargs` itself.
 
+#### `launchd_log_serial` and `launchd_disable_all_timeouts`, exactly
+
+Neither is a kernel boot-arg. Nothing in the XNU tree checked out here contains
+either string (`grep -rn launchd_log_serial xnu-8796.141.3/` is empty, same for
+the other); of all `launchd_*` words the kernel itself parses only
+`launchdsuffix` (`bsd/kern/kern_exec.c:6890`). They travel as inert text in
+`kern.bootargs` — `sysctl_sysctl_bootargs` (`bsd/kern/kern_sysctl.c:2160`)
+hands back `PE_boot_args()` (`pexpert/gen/bootargs.c:191`), registered at
+`bsd/kern/kern_sysctl.c:2175` — and are read by launchd at its own startup
+(`sysctlbyname("kern.bootargs")`, string 0x5875e, read site 0x1000452fc).
+So they change **nothing before `exec launchd`**, and a line they cause is
+launchd's, never the kernel's.
+
+Both are read through the same helper `0x100046388` (dest byte, plist key,
+boot-arg prefix): when the boot-arg is present its value overrides the plist
+value, so each is a bring-up override of a real config key.
+
+* `launchd_log_serial=1` (prefix 0x10006308a) sets the byte at 0x1000728fa,
+  the same byte the config key `LogToConsole` (0x10006307d) sets. The logger's
+  record builder reads it at `0x10003f104`-`0x10003f128` and marks the record
+  for the console, so launchd's own log records start appearing on the ring
+  after the exec. On p6/p7 rings there are none; that is not a regression to
+  chase and the new lines are not evidence of new kernel behaviour.
+* `launchd_disable_all_timeouts=1` (prefix 0x100062e49, site
+  `0x100045a9c`-`0x100045ad0`) sets `SIGKILLTimeout` to 600 s (0x10007178c,
+  used at 0x100027844 for `exceeded sigkill timeout: %u` and `Service did not
+  exit %u seconds after SIGKILL.`), `ExtensionWatchdog` to 0 (0x100072950),
+  `ShutdownTimeout` to 0 (0x100071794, the `com.apple.xpc.launchd.timeout`
+  source), and the shutdown-stall timer's seconds to 0 (0x100073000, timer
+  armed at 0x10000f4d4). A job that never answers is then killed after ten
+  minutes instead of seconds, and a stuck shutdown stops being reported.
+
+Offsets are the 16.7.16 (20H392) `/sbin/launchd` of
+`build/rd-root.stage/sbin/launchd`, sha256 `12370e5e…`; text is mapped at
+0x100000000 = file offset 0, so these are file offsets too.
+
 ## 3. dyld and the shared cache
 
 `launchd` links only `/usr/lib/libSystem.B.dylib` (1319.100.3) and
@@ -278,6 +314,12 @@ Two consequences that the populate step must respect:
 Nothing needs to be *added* to the shipped signatures: they are already ad-hoc,
 already carry the entitlements, and the CD hashes are correct (verified: 127/127
 pages, slot -5, slot -1).
+
+One gate is not about the signature at all: on this kernel (a macOS-config build,
+`XNU_TARGET_OS_OSX`) an iOS platform binary is refused at exec unless it carries
+`com.apple.private.security.no-sandbox`, which the shipped launchd does not.
+`0104` accepts a signed iOS image past that check; `sweet_ios_exec_platform=0`
+restores the stock refusal. Path, switch and runs: `docs/AMFI_LAUNCHD.md`.
 
 ## 5. The ordered minimal set
 

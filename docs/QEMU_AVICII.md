@@ -200,9 +200,12 @@ very end of kernel boot, then panics in userland bootstrap:
 
 at 30.56 s and 30.75 s. That is *past* the phone's p6 rung (p6 stopped at
 `load_init_program: opening of /sbin/launchd failed, errno 2` because that volume
-was empty). Whether the `CS_KILLED` is a real defect or an AMFI-stand-in artifact
-of the missing ICE is open; it is the same code path that works on the phone
-once the volume has a userland.
+was empty). The `CS_KILLED` was AMFI's exec-side platform check, not ICE and not
+the signature: the kernel is a macOS-config build and refuses an iOS platform
+binary absent the simulator's `no-sandbox` entitlement. `0104` settles it
+(`sweet_ios_exec_platform=0` restores it); the same cmdline now stops one step
+further, in dyld, on the missing dylib cache. Identity, path and the before/after
+runs are in `docs/AMFI_LAUNCHD.md`.
 
 Earlier rungs all pass: `arm_init`, `ml_parse_cpu_topology`, `cpu_bootstrap`,
 `kernel_startup_bootstrap`, `cpu_init`, `arm_vm_init` (pmap, bootstrap TTBR0

@@ -97,4 +97,4 @@ b9a997943d05b975aedef08a6358339b5e9a677e9b930477bf73d040322bfb77  patches/0100-s
 33489e605f2feb296bb8cde2c305e90989e2f6da1692a7521c71cbb86472b7c4  patches/0101-sweet-ufs-write-power-mode.patch
 0101e0f19eb747b55304fcd228d2e908a03fd548c04185740ea06f85a2139510  patches/0102-sweet-ufs-write-short-transfer.patch
 285a755aaa48acf69f64c006cbc7714a77210c6092014500f0d6c607ef442a21  patches/0103-sweet-ufs-write-durability.patch
-7674bc4d535897385da4854cdd442ec3388f4c235bae9e0c2da13ef406b93a52  patches/0104-sweet-ios-exec-platform.patch
+aa57b7065776dad1ec49baee0298e736231eeab057b09b3192474150bc97f633  patches/0104-sweet-ios-exec-platform.patch
