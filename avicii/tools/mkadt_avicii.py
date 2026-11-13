@@ -301,7 +301,7 @@ def build(seed=None, qemu=False, fdt_json=None, phys_base=None, allow_high=False
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one and
     # uses cpus=N to select an initial prefix (N <= 8). QEMU keeps one CPU.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(1 if qemu else 8):   # one CPU unless -smp is proven
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),

@@ -218,7 +218,7 @@ new file mode 100644
 index 0000000..a044ad0
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,84 @@
 +/*
 + * Board config for the OnePlus Nord ("avicii", Qualcomm SM7250 /
 + * lito): Kryo 475 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
@@ -250,6 +250,15 @@ index 0000000..a044ad0
 +#define __ARM_16K_PG__            1
 +
 +#define HAS_GIC_V3                1
++
++/*
++ * PL011 text console. There is no UART on the phone, so it stays inert there
++ * unless the ADT carries a uart0 node and serial=8 is set; QEMU virt has one at
++ * 0x09000000 and tools/60-qemu-boot.sh --uart0 emits the node. The driver is
++ * gated on the node being found (pexpert/arm/pe_serial.c), so this cannot
++ * change a phone boot.
++ */
++#define VMAPPLE_UART              1
 +
 +#ifndef ASSEMBLER
 +#define PLATFORM_PANIC_LOG_DISABLED
