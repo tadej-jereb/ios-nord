@@ -161,6 +161,34 @@ def main():
                   base < 0x100000000 and not (base < SPLASH[0] + SPLASH[1] and 0xa2300000 > base),
                   hex(base))
 
+        # --phys-base overrides the regbase, keeps the containing extent's size and
+        # is refused outside the extents or above 4 GiB without --allow-high.
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'mkadt_avicii.py'),
+                            os.path.join(tmp, 'p.adt'), '--fdt-json', js,
+                            '--phys-base', '0x80000000'], capture_output=True, text=True)
+        check('--phys-base 0x80000000 exits 0', r.returncode == 0, r.stderr.strip())
+        if r.returncode == 0:
+            root, _ = adt.parse(open(os.path.join(tmp, 'p.adt'), 'rb').read())
+            chosen = props(find(root, 'chosen'))
+            check('--phys-base takes the containing extent size',
+                  chosen['dram-base'] == struct.pack('<Q', MEM_LOW[0])
+                  and chosen['dram-size'] == struct.pack('<Q', MEM_LOW[1] - 0x100000),
+                  chosen['dram-size'].hex())
+            check('--phys-base keeps the panic log at the extent top',
+                  props(find(root, 'pram'))['reg'][:8]
+                  == struct.pack('<Q', MEM_LOW[0] + MEM_LOW[1] - 0x100000))
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'mkadt_avicii.py'),
+                            os.path.join(tmp, 'h.adt'), '--fdt-json', js,
+                            '--phys-base', '0x200000000'], capture_output=True, text=True)
+        check('--phys-base above 4 GiB needs --allow-high',
+              r.returncode != 0 and 'allow-high' in r.stderr, r.stderr.strip())
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'mkadt_avicii.py'),
+                            os.path.join(tmp, 'o.adt'), '--fdt-json', js,
+                            '--phys-base', '0x2f0000000', '--allow-high'],
+                           capture_output=True, text=True)
+        check('--phys-base outside every extent fails',
+              r.returncode != 0 and 'outside every' in r.stderr, r.stderr.strip())
+
     print('PASS all' if not fails else f'{fails} check(s) failed')
     sys.exit(1 if fails else 0)
 

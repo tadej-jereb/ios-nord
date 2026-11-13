@@ -31,8 +31,8 @@ DEFAULT_OUT = os.path.join(ROOT, 'avicii', 'shim', 'memtab.h')
 
 # (macro suffix, attribute on mkadt_avicii, what it is)
 FIELDS = [
-    ('DEFAULT_PHYS_BASE', 'DEFAULT_PHYS_BASE', 'fallback dram base'),
-    ('DEFAULT_MEM_SIZE', 'DEFAULT_MEM_SIZE', 'fallback dram size'),
+    ('DEFAULT_PHYS_BASE', 'PHYS_BASE_FALLBACK', 'fallback dram base'),
+    ('DEFAULT_MEM_SIZE', 'FALLBACK_MEM_SIZE', 'fallback dram size'),
     ('MIN_MEM_SIZE', 'MIN_MEM_SIZE', 'smallest believable dram extent'),
     ('PANIC_LOG_SIZE', 'PANIC_LOG_SIZE', 'panic log carved off the top'),
     ('GICD', 'GICD', 'GIC distributor'),

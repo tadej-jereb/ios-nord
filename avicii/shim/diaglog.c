@@ -22,6 +22,11 @@
 
 #define BLOCK		4096u
 #define RING_BLOCKS	1024u		/* 4 MiB, as tooling/42-log-pull.sh reads */
+/* The kernel's own console ring (patch 0047) owns the last 4100 KiB of the
+ * partition and starts writing at its first block, so the shim's ring is parked
+ * KERNEL_AREA blocks earlier: the two must not share a block, or the kernel's
+ * first flush overwrites the loader record that is the whole point of this log. */
+#define KERNEL_AREA	1025u		/* 4100 KiB, kernel console ring + its header */
 #define TEXT_MAX	96u		/* one line, truncated if longer */
 
 static uint8_t hdr[BLOCK] __attribute__((aligned(4096)));
@@ -126,9 +131,9 @@ int dlog_init(void)
 	rc = ufs_part_find("userdata", &first, &last);
 	if (rc)
 		return 2;
-	if (last <= first || last - first + 1 < RING_BLOCKS + 2)
+	if (last <= first || last - first + 1 < RING_BLOCKS + KERNEL_AREA + 2)
 		return 3;
-	header_lba = (uint32_t)(last - RING_BLOCKS);
+	header_lba = (uint32_t)(last - KERNEL_AREA - RING_BLOCKS);
 	ring_lba = header_lba + 1;
 
 	/* Zero the ring before any line: otherwise the first pull of a fresh
@@ -156,9 +161,15 @@ int dlog_init(void)
  *   B rung begin (written before the rung touches anything)
  *   K rung result, okay
  *   X rung result, bad
+ *   L loader step
+ *   J last line before a jump (header deliberately left stale, see dlog_last)
  *   - plain note
+ *
+ * `hdr` rewrites the header block afterwards. dlog_last() clears it: then the
+ * line is the last byte range written and no UFS command (let alone a second
+ * WRITE+SYNC of the header) is still in flight behind it.
  */
-void dlog_line(char kind, const char *text)
+static void emit(char kind, const char *text, int hdr)
 {
 	if (!on)
 		return;
@@ -209,6 +220,26 @@ void dlog_line(char kind, const char *text)
 		done += chunk;
 		total += chunk;
 	}
-	if (write_hdr(total) && ++fails > 3)
+	if (hdr && write_hdr(total) && ++fails > 3)
 		on = 0;
+}
+
+void dlog_line(char kind, const char *text)
+{
+	emit(kind, text, 1);
+}
+
+/*
+ * Newest-line rule: the one line that has to survive a jump which never
+ * returns (loader_boot's entry PA). Same append, but the header is not
+ * rewritten - write_hdr() would put a second WRITE(10)+SYNC after the line, so
+ * the branch would wait for it and could hang inside the UFS host mid-write.
+ *
+ * Consequence for a reader: the header's `total` stays one line behind, so the
+ * tail line is not inside `total` bytes. It is at the tail either way; read
+ * `total`, then also take the bytes past it to the next block boundary.
+ */
+void dlog_last(const char *text)
+{
+	emit('J', text, 0);
 }

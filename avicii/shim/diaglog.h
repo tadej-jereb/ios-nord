@@ -21,4 +21,11 @@ int dlog_init(void);		/* 0 = logging on; else a code (see diaglog.c) */
 int dlog_warn(void);		/* non-fatal code from the last dlog_init(): 4 = hdr write/sync lied, 5 = hdr read-back mismatched */
 int dlog_on(void);
 void dlog_line(char kind, const char *text);
+/*
+ * Newest-line rule: one line at the ring tail, written *without* the header
+ * rewrite, for the last thing before a jump that may never return. The bytes
+ * are the newest in the ring; the header's `total` is left one line behind, so
+ * a reader must also take what lies past `total` to the block boundary.
+ */
+void dlog_last(const char *text);
 void dlog_off(const char *why);

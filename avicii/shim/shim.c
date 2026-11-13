@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "diag.h"
+#include "diaglog.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -394,6 +395,24 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "avicii milestone 4: xnu loader");
+#if DIAG_LOG
+	/*
+	 * The ring is the only channel that outlives this function: xnu repaints
+	 * the panel from its own fbcon. Bring it up here, once, and boot either
+	 * way - a failed ring costs the evidence, never the boot.
+	 */
+	{
+		int lrc = dlog_init();
+		if (lrc) {
+			con_str("DLOG", "ring init failed, booting on");
+			con_hex2("DLOG", "rc=", (uint32_t)lrc, 0, 0);
+		} else {
+			/* X marks a ring that came up with a warning (code 4/5). */
+			con_str("SHIM", "payload path: ring up");
+			dlog_line(dlog_warn() ? 'X' : '-', "SHIM payload path: ring up");
+		}
+	}
+#endif
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
