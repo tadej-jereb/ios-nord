@@ -91,3 +91,11 @@ apply 0085-fajita-sync-console.patch
 apply 0086-fajita-cpu-match.patch
 apply 0094-fajita-panic-log.patch
 apply 0095-avicii-goodix-gt9886-touch.patch
+apply 0096-sweet-mountroot-bounded-retry.patch
+apply 0097-sweet-ufs-gpt-bound-check.patch
+apply 0098-sweet-ufs-io-limits.patch
+apply 0099-sweet-hfs-vh-flush-error.patch
+apply 0100-sweet-ufs-write-retire-retry.patch
+apply 0101-sweet-ufs-write-power-mode.patch
+apply 0102-sweet-ufs-write-short-transfer.patch
+apply 0103-sweet-ufs-write-durability.patch

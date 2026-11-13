@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -192,6 +192,25 @@
+ 	    (status == UPIU_STATUS_CHECK && (key == SENSE_NOT_READY || key == SENSE_UNIT_ATTENTION));
+ }
+ 
++static int ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write);
++
++/*
++ * Leave the power mode the bootloader put the device in. The UFS Device
++ * well-known LU accepts START STOP UNIT with POWER CONDITION = ACTIVE (Linux
++ * ufshcd_set_dev_pwr_mode does the same): a LU in a power save state answers
++ * every command, writes included, with CHECK CONDITION 2/04/02.
++ */
++static void
++ufs_device_active(void)
++{
++	static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++	uint8_t lun = su.lun;
++
++	su.lun = 0xd0;
++	(void)ufs_scsi(ssu, sizeof(ssu), 0, false);
++	su.lun = lun;
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -315,6 +334,10 @@
+ 		    " status 0x%x sense %x/%02x/%02x attempt %u\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], key, asc, ascq,
+ 		    attempt);
++		if (status == UPIU_STATUS_CHECK && key == SENSE_NOT_READY &&
++		    asc == 0x04 && ascq == 0x02) {
++			ufs_device_active();
++		}
+ 		if (ufs_retryable(status, key) && attempt++ < UFS_RETRIES) {
+ 			delay(1000 * (int)attempt);     /* 1, 2, 3 ms */
+ 			goto again;

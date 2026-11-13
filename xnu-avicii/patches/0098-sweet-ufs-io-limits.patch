@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -458,9 +458,25 @@
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+ 		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
+ 		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXBYTECOUNTWRITE:
++		*o = BOUNCE_SIZE;
++		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
++		/*
++		 * The buffer cache and the journal cap one I/O at segments * PAGE_SIZE,
++		 * so this is what a 1 MiB command has to look like from above; the
++		 * driver splits it into 256 KiB PRDT chunks internally.
++		 */
++		*o = BOUNCE_SIZE / PAGE_SIZE;
++		return 0;
++	case DKIOCGETFEATURES:
++		/* no FUA, no barrier, no UNMAP: nothing to claim */
++		*f = 0;
++		return 0;
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
+ 		return 0;
+ 	default:
+ 		return ENOTTY;

@@ -1,0 +1,124 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -74,6 +74,7 @@
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++#define UFS_RETRIES     3u                      /* transient conditions only */
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+ 
+@@ -104,6 +105,7 @@
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+ 	uint8_t tag;
++	uint8_t sense_key;                      /* of the last CHECK CONDITION, 0 when good */
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+@@ -142,6 +144,55 @@
+ }
+ 
+ /*
++ * The host retires the slot itself, but the device may still own the bounce
++ * buffer until it does. A late DMA into a buffer that has already been rebuilt
++ * for the next command lands that command's data somewhere else on disk, so the
++ * slot is only reused once it is retired - bounded, and cleared if it is not.
++ */
++static void
++ufs_retire(void)
++{
++	for (int i = 0; i < 1000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++		delay(1000);
++	}
++	if (ufs_rd(REG_UTRLDBR) & 1) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++	}
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++}
++
++/* Response UPIU: response at 6, status at 7, residual at 12, fixed sense at 34. */
++#define UPIU_STATUS_CHECK       0x02
++#define UPIU_STATUS_BUSY        0x08
++#define UPIU_STATUS_TSFULL      0x28
++#define SENSE_NOT_READY         0x02
++#define SENSE_UNIT_ATTENTION    0x06
++
++static inline uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++/* Sense key of the last response, 0 when there is no fixed-format sense data. */
++static inline uint8_t
++ufs_sense_key(const struct ucd *ucd)
++{
++	return ucd->resp[33] >= 14 ? (uint8_t)(ucd->resp[36] & 0x0f) : 0;
++}
++
++/*
++ * Whether repeating the command can help. Every command this driver issues is
++ * idempotent (same LBA, same data), so a write is retried like a read.
++ */
++static inline bool
++ufs_retryable(uint8_t status, uint8_t key)
++{
++	return status == UPIU_STATUS_BUSY || status == UPIU_STATUS_TSFULL ||
++	    (status == UPIU_STATUS_CHECK && (key == SENSE_NOT_READY || key == SENSE_UNIT_ATTENTION));
++}
++
++/*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+@@ -151,7 +202,9 @@
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
++	unsigned attempt = 0;
+ 
++again:
+ 	assert(len <= BOUNCE_SIZE);
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+@@ -219,8 +272,13 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			uint32_t is = ufs_rd(REG_IS), hcs = ufs_rd(REG_HCS);
++			ufs_retire();
++			printf("SWEET UFS: command 0x%02x timed out: is 0x%x hcs 0x%x"
++			    " attempt %u\n", cdb[0], is, hcs, attempt);
++			if (attempt++ < UFS_RETRIES) {
++				goto again;
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -249,10 +307,21 @@
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		uint8_t status = ucd->resp[0] == 0x21 ? ucd->resp[7] : 0;
++		uint8_t key = ufs_sense_key(ucd);
++		uint8_t asc = ucd->resp[46], ascq = ucd->resp[47];
++		su.sense_key = key;
++		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x"
++		    " status 0x%x sense %x/%02x/%02x attempt %u\n",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], key, asc, ascq,
++		    attempt);
++		if (ufs_retryable(status, key) && attempt++ < UFS_RETRIES) {
++			delay(1000 * (int)attempt);     /* 1, 2, 3 ms */
++			goto again;
++		}
+ 		return EIO;
+ 	}
++	su.sense_key = 0;
+ 	return 0;
+ }
+ 

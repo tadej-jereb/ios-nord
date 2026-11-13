@@ -1,0 +1,90 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -111,6 +111,8 @@
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool fua;                               /* boot-arg ufsfua=1: FUA on every write */
++	bool syncwrites;                        /* boot-arg ufssync=1: flush after each write */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -118,6 +120,7 @@
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
++static bool su_fua_bp;                          /* B_FUA buffer, set by the strategy */
+ 
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+@@ -386,8 +389,14 @@
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	/*
++	 * FUA makes the device commit before the status, which is the only ordering a
++	 * journal commit gets here: nothing in this tree sets B_FUA on its own (there
++	 * is no DK_FEATURE_FUA), so the boot-arg is the opt-in and B_FUA an extra.
++	 */
++	uint8_t fua = su.fua || su_fua_bp;
+ 	uint8_t cdb[10] = {
+-		0x2a, 0,
++		0x2a, fua ? 0x08 : 0,              /* byte 1 bit 3: FUA, write through the device cache */
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+@@ -556,6 +565,7 @@
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+ 		} else {
++			su_fua_bp = (buf_flags(bp) & B_FUA) != 0;
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
+ 				error = ufs_read_blocks(su.first_block + lba, blocks);
+@@ -571,6 +581,11 @@
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++	/* Nothing else ever flushes the device cache for the file system. */
++	if (!rd && su.syncwrites && !error) {
++		error = ufs_sync_cache();
++	}
++	su_fua_bp = false;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	buf_unmap(bp);
+ 
+@@ -640,7 +655,7 @@
+ 		*o = BOUNCE_SIZE / PAGE_SIZE;
+ 		return 0;
+ 	case DKIOCGETFEATURES:
+-		/* no FUA, no barrier, no UNMAP: nothing to claim */
++		/* no barrier, no UNMAP; FUA is a boot-arg and not advertised */
+ 		*f = 0;
+ 		return 0;
+ 	case DKIOCISSOLIDSTATE:
+@@ -734,6 +749,11 @@
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	uint32_t fua = 0, syncwrites = 0;
++	PE_parse_boot_argn("ufsfua", &fua, sizeof(fua));
++	PE_parse_boot_argn("ufssync", &syncwrites, sizeof(syncwrites));
++	su.fua = (fua == 1);
++	su.syncwrites = (syncwrites == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -779,9 +799,10 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+-	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+-	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+-	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx"
++	    "%s%s\n", want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
++	    su.writable ? "read-write" : "read-only", su.dma_pa,
++	    su.fua ? ", fua per write" : "", su.syncwrites ? ", sync per write" : "");
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

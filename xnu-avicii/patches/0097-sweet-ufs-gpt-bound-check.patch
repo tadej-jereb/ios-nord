@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -256,6 +256,8 @@
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
++	uint64_t last_usable;
++	memcpy(&last_usable, b + 48, 8);
+ 	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+@@ -282,7 +284,15 @@
+ 		uint64_t first, last;
+ 		memcpy(&first, e + 32, 8);
+ 		memcpy(&last, e + 40, 8);
+-		if (last < first) {
++		/*
++		 * Writes are bounded by this entry alone: hfs writes the alternate
++		 * volume header 1024 bytes below the *partition* end (not the volume
++		 * end) whenever the volume is smaller than the partition, so an entry
++		 * that runs past the last usable LBA writes into whatever follows.
++		 */
++		if (last < first || last > last_usable) {
++			printf("SWEET UFS: partition \"%s\": blocks 0x%llx-0x%llx, GPT usable end 0x%llx\n",
++			    want, first, last, last_usable);
+ 			return ENXIO;
+ 		}
+ 		su.first_block = first;

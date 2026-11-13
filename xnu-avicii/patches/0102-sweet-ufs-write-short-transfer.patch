@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -344,6 +344,16 @@
+ 		}
+ 		return EIO;
+ 	}
++	/*
++	 * SCSI status GOOD with a nonzero residual means the tail of the range never
++	 * moved. The file system would take a short write as a complete one.
++	 */
++	uint32_t resid = be32(&ucd->resp[12]);
++	if (len && resid) {
++		printf("SWEET UFS: command 0x%02x short transfer: %u of %u bytes, residual %u\n",
++		    cdb[0], len - MIN(resid, len), len, resid);
++		return EIO;
++	}
+ 	su.sense_key = 0;
+ 	return 0;
+ }

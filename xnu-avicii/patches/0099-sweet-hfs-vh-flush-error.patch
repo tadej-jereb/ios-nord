@@ -1,0 +1,19 @@
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -706,7 +706,15 @@
+ 	/* mark the volume dirty (clear clean unmount bit) */
+ 	vcb->vcbAtrb &=	~kHFSVolumeUnmountedMask;
+ 	if (hfsmp->jnl && (hfsmp->hfs_flags & HFS_READ_ONLY) == 0) {
+-		hfs_flushvolumeheader(hfsmp, HFS_FVH_WAIT);
++		OSErr sweet_vh_error = hfs_flushvolumeheader(hfsmp, HFS_FVH_WAIT);
++		/*
++		 * SWEET: the mount continues either way, but a write path that is
++		 * already broken here is otherwise invisible until launchd.
++		 */
++		if (sweet_vh_error) {
++			printf("hfs: SWEET: marking the volume dirty failed (%d); continuing\n",
++			    sweet_vh_error);
++		}
+ 	}
+ 
+ 	/* kHFSHasFolderCount is only supported/updated on HFSX volumes */

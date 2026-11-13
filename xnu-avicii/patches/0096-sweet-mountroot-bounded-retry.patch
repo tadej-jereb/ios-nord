@@ -1,0 +1,32 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -856,6 +856,14 @@
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
+ 
++	/*
++	 * SWEET: there is no fsck and no recovery volume on this port, so a root
++	 * that cannot be mounted is final - but the loop below retries at full
++	 * speed forever and prints the same line, which on a framebuffer console
++	 * is indistinguishable from a hang. Pace it and give up with the errno
++	 * in the panic string instead.
++	 */
++	unsigned root_mount_tries = 0;
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+ 		int err;
+@@ -884,7 +892,13 @@
+ 			/*NOTREACHED*/
+ 		}
+ #endif
+-		printf("cannot mount root, errno = %d\n", err);
++		if (++root_mount_tries > 20) {
++			panic("bsd_init: cannot mount root after %u tries, errno = %d",
++			    root_mount_tries - 1, err);
++		}
++		printf("cannot mount root, errno = %d (try %u of 20, retrying in 2 s)\n",
++		    err, root_mount_tries);
++		IOSleep(2000);
+ 	}
+ 
+ 	IOSecureBSDRoot(rootdevice);
