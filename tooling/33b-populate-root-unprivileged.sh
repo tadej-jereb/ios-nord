@@ -49,7 +49,7 @@ do_verify=1
 OS_UNIQUE=7937213671 ; SYS_UNIQUE=3359797050 ; APP_UNIQUE=7846405
 PAYLOAD=$((OS_UNIQUE + SYS_UNIQUE + APP_UNIQUE))
 EXPECT_FILES=144341
-VOLUME_BYTES=17179869184
+VOLUME_BYTES=${VOLUME_BYTES:-17179869184}
 OS_MEMBER=087-86698-044.dmg ; OS_BYTES=4730814044
 SYS_MEMBER=087-86593-047.dmg ; SYS_BYTES=2743074816
 APP_MEMBER=087-86715-047.dmg ; APP_BYTES=10485760
@@ -65,6 +65,7 @@ while (( $# )); do
 		--tree)      tree=${2:?--tree needs a path}; shift ;;
 		--bootstrap) bootstrap=1 ;;
 		--no-verify) do_verify=0 ;;
+		--any-size)  any_size=1 ;;	# smoke on a smaller image than the volume
 		-h|--help)   sed -n '2,32p' "$0"; exit 0 ;;
 		*) die "unknown argument: $1" ;;
 	esac
@@ -142,8 +143,13 @@ else
 		[[ -f $f ]] || die "missing $f - run 30-fetch-ipsw.sh"
 		[[ $(stat -c %s "$f") == "${m##*:}" ]] || die "$f: wrong size"
 	done
-	for v in os:OS_MEMBER sysos:SYS_MEMBER appos:APP_MEMBER; do
-		name=${v%%:*}; member=${v##*:}
+	mkdir -p "$work/src"
+	for name in os sysos appos; do
+		case $name in
+		os) member=$OS_MEMBER ;;
+		sysos) member=$SYS_MEMBER ;;
+		appos) member=$APP_MEMBER ;;
+		esac
 		mkdir "$src/$name"
 		"$APFS_FUSE" -o ro "$ipsw/$member" "$src/$name"
 		mnts=("$src/$name" "${mnts[@]}")
@@ -154,18 +160,40 @@ fi
 # --- image gate ------------------------------------------------------------
 step "image gate"
 [[ -f $img ]] || die "$img does not exist - run 31-mkiosroot.sh --phase-image"
-[[ $(stat -c %s "$img") == "$VOLUME_BYTES" ]] ||
-	die "$img is $(stat -c %s "$img") bytes, expected $VOLUME_BYTES"
+if (( ! ${any_size:-0} )); then
+	[[ $(stat -c %s "$img") == "$VOLUME_BYTES" ]] ||
+		die "$img is $(stat -c %s "$img") bytes, expected $VOLUME_BYTES"
+fi
 [[ $(xxd -s 1024 -l 2 -p "$img") == 4858 ]] || die "$img is not HFSX"
 python3 - "$img" <<'EOF' || die "$img is not journaled"
 import struct, sys
 d = open(sys.argv[1], 'rb').read(1100)
 attrs, = struct.unpack_from('>I', d, 1024 + 4)
-assert attrs & 0x2000, 'journaled bit not set (mkfs.hfsplus -J)'
+if not attrs & 0x2000:
+    print('  note: journaled bit already clear (a previous run stripped it)')
 blk, = struct.unpack_from('>I', d, 1024 + 40)
 assert blk > 0, 'zero block size'
 
 EOF
+# The patched writer cannot write a volume whose journal was only created by
+# mkfs (the journal header is garbage, its replay path fails with EIO). Strip the
+# journaled bit and the journal info block for the populate; XNU runs
+# hfs_late_journal_init on the first mount and creates a fresh journal there
+# (measured: p6, docs/IMAGE_PROVENANCE.md). The .journal file itself stays.
+step "strip the mkfs journal (XNU re-creates it on first mount)"
+python3 - "$img" <<'EOJ' || die "cannot strip the journal"
+import struct, sys
+f = open(sys.argv[1], 'r+b')
+f.seek(1024 + 4)
+attrs, = struct.unpack('>I', f.read(4))
+f.seek(1024 + 4)
+f.write(struct.pack('>I', attrs & ~0x2000))
+f.seek(1024 + 12)
+f.write(struct.pack('>I', 0))
+f.close()
+print(f'  attributes now {attrs & ~0x2000:#x}, journalInfoBlock 0')
+EOJ
+
 sum_before=$(sha256sum "$img" | cut -d' ' -f1)
 say "  sha256 $sum_before"
 
@@ -227,12 +255,26 @@ vavail=$(df -B1 --output=avail "$mnt" | tail -1 | tr -d ' ')
 # payload is stored once, so this is the 33 arithmetic minus nothing.
 need=$(( PAYLOAD + PAYLOAD / 100 * 5 + 64 * 1024 * 1024 ))
 say "volume $vavail B free, payload $PAYLOAD B, need $need B"
-(( vavail >= need )) || die "volume too small: $vavail B free < $need B needed"
+if (( ${any_size:-0} )); then
+	say "  --any-size: space guard skipped (smoke image)"
+elif [[ $vavail == 0 ]]; then
+	# the FUSE writer does not implement statvfs; 0 is "unknown", not "full"
+	say "warning: the volume reports 0 B free (statvfs unimplemented) - guard skipped"
+elif (( vavail < need )); then
+	die "volume too small: $vavail B free < $need B needed"
+fi
 
 # --- hard link probe -------------------------------------------------------
 probe=$mnt/.populate-link-probe
 : >"$probe"
-if ln "$probe" "$probe.2" 2>/dev/null && [[ $(stat -c %h "$probe" 2>/dev/null) == 2 ]]; then
+# The FUSE layer reports a stale nlink right after link(), so compare the inodes
+# with a few retries rather than trusting the link count.
+ln "$probe" "$probe.2" 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	[[ $(stat -c %i "$probe" 2>/dev/null) == "$(stat -c %i "$probe.2" 2>/dev/null)" ]] && break
+	sleep 0.2
+done
+if [[ $(stat -c %i "$probe" 2>/dev/null) == "$(stat -c %i "$probe.2" 2>/dev/null)" ]]; then
 	link=ln
 else
 	link=cp
@@ -284,6 +326,23 @@ for c in OS App; do
 done
 say "linked $n cryptex files"
 
+# devfs mounts on /dev at bsd_init; the kernel namei() needs the directory or
+# devfs_kernel_mount fails with ENOENT and the boot dies at launchd step 1.
+step "devfs mount point (/dev, root:wheel, 0755, empty)"
+mkdir -p "$mnt/dev"
+chown 0:0 "$mnt/dev"
+chmod 0755 "$mnt/dev"
+find "$mnt/dev" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+
+# mount -P 1 (RequireSuccess) only reads /etc/fstab and errx()es without it; the
+# phase loop needs the 4th field ro/rw/rq and no "noauto". devfs is already
+# mounted before this runs, hence "late".
+step "first-phase /private/etc/fstab"
+mkdir -p "$mnt/private/etc"
+printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' >"$mnt/private/etc/fstab"
+chown 0:0 "$mnt/private/etc/fstab"
+chmod 0644 "$mnt/private/etc/fstab"
+
 step "create logd stores (owner 272)"
 db=$mnt/private/var/db
 mkdir -p "$db/diagnostics/timesync" "$db/uuidtext"
@@ -332,7 +391,21 @@ for vol in ('os', 'sysos', 'appos'):
 PY
 
 # --- verify before unmount -------------------------------------------------
-step "verify the volume content"
+step "the launchd gate: 34-check-bootstrap.sh must say ready to boot"
+CHECKER=$HERE/34-check-bootstrap.sh
+[[ -x $CHECKER ]] || die "no $CHECKER - the gate is not optional"
+set +e
+"$CHECKER" "$mnt" --reference "$src/os/root" --quiet
+gate=$?
+set -e
+case $gate in
+0) say "  gate: ready to boot" ;;
+1) die "gate: a boot step is absent (see the absent lines above)" ;;
+2) die "gate: a boot step mismatches (see the mismatch lines above)" ;;
+*) die "gate: checker exited $gate" ;;
+esac
+
+step "cheap volume content smoke"
 for p in System/Library/CoreServices/SystemVersion.plist \
 	private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld \
 	private/preboot/Cryptexes/App/usr/libexec/webbookmarksd usr/libexec/fseventsd \
