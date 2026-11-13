@@ -105,9 +105,9 @@ jobs:
             [ "$verb" = copy ] || continue
             echo "::group::stage $file"
             MACHINE_CONFIG="$MACHINE_CONFIG" MACOS_VERSION="$MACOS_VERSION" \
-              bash "../../../xnu-avicii/patches/$file"
+              bash "../../xnu-avicii/patches/$file"
             echo "::endgroup::"
-          done < ../../../xnu-avicii/series
+          done < ../../xnu-avicii/series
 
       - name: Apply the series
         # --check first, per file, so the failing patch is named. `set -e` at
@@ -120,7 +120,7 @@ jobs:
             case "$verb" in ''|'#'*) continue;; esac
             [ "$verb" = apply ] || continue
             n=$((n + 1))
-            p="../../../xnu-avicii/patches/$file"
+            p="../../xnu-avicii/patches/$file"
             if ! out=$(git apply --check --whitespace=nowarn "$p" 2>&1); then
               echo "::error::does not apply: $file (entry $n)"
               echo "$out"
@@ -128,7 +128,7 @@ jobs:
             fi
             git apply --whitespace=nowarn "$p"
             echo "applied $n: $file"
-          done < ../../../xnu-avicii/series
+          done < ../../xnu-avicii/series
           echo "$n patches applied in series order"
           # Nothing may be left in the dir build.sh globs, or it would try to
           # re-apply and warn.
