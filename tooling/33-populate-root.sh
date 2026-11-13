@@ -33,6 +33,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+here=$root/tooling
 refs=${SWEET_REFS:-$root/refs/ios-sweet}
 tweaks=${SWEET_TWEAKS:-$refs/sweet-root-tweaks.py}
 TWEAKS_SHA256=d604e9fd74f8344b87a351cf573346f4b8d2a3f73e9b3948cb720abcefd56398
@@ -353,6 +354,17 @@ if ! have_stage keybag; then
 	mark keybag
 fi
 
+if ! have_stage bootset; then
+	# The two items the launchd first-run set needs and the DMGs do not carry:
+	# the devfs mount point (namei'd by bsd_init before launchd) and the phase-1
+	# fstab (mount -P 1 reads only /etc/fstab and errx es without it).
+	step "boot set: /dev mount point and /private/etc/fstab"
+	install -d -m 0755 -o 0 -g 0 "$mnt/dev"
+	printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' > "$mnt/private/etc/fstab"
+	chown 0:0 "$mnt/private/etc/fstab"
+	mark bootset
+fi
+
 if ! have_stage tweaks; then
 	step "apply bring-up tweaks"
 	python3 "$tweaks" "$mnt"
@@ -374,6 +386,11 @@ apparent=$(du -sb --apparent-size "$mnt" | cut -f1)
 say "files $files, $used B in blocks, $apparent B apparent (hard links counted twice)"
 (( files > 180000 )) || die "only $files files on the volume, expected > 180000"
 (( used > 11000000000 )) || die "only $used B allocated, expected > 11e9"
+
+# The ordered launchd first-run set, checked independently of this script. It
+# must reach "ready to boot" or the boot is not worth the round trip.
+step "launchd first-run set (tooling/34-check-bootstrap.sh)"
+"$here/34-check-bootstrap.sh" "$mnt" --quiet || die "bootstrap set not ready (see 34-check-bootstrap.sh)"
 if [[ $link == ln ]]; then
 	[[ "$(stat -c %h "$mnt/System/Library/Caches/com.apple.dyld"/* | sort -u | tr '\n' ' ')" == "2 "* ]] || \
 		echo "warning: dyld cache files are not hard-linked" >&2
