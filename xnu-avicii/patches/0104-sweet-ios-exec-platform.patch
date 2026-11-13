@@ -1,0 +1,65 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7325,6 +7325,36 @@
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET runs an iOS userland on a macOS-configuration kernel
++ * (XNU_TARGET_OS_OSX), so an iOS platform binary is only let through the
++ * platform check below by com.apple.private.security.no-sandbox, which needs
++ * an entitlements implementation. Our AMFI stand-in (bsd/kern/sweet_amfi.c)
++ * has none but an empty one, so every plain execve() of an iOS binary --
++ * load_init_program's launchd among them -- was refused here and killed
++ * CS_KILLED with EXEC_EXIT_REASON_WRONG_PLATFORM, one step before dyld.
++ *
++ * Accept the binary when its signature already validated through this exec:
++ * CS_SIGNED is only set once the page hashes have checked out (by the kernel
++ * or by our stand-in), so genuinely unsigned code keeps the stock refusal.
++ *
++ * sweet_ios_exec_platform=0 restores the exact stock check;
++ * unentitled_ios_sim_launch=1 keeps working unchanged.
++ */
++static TUNABLE(bool, sweet_ios_exec_platform, "sweet_ios_exec_platform", true);
++
++static bool
++sweet_ios_exec_platform_ok(struct image_params *imgp)
++{
++	if (!sweet_ios_exec_platform || (imgp->ip_csflags & CS_SIGNED) == 0) {
++		return false;
++	}
++	printf("SWEET: signed iOS binary, taken past the OSX platform check\n");
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+ {
+@@ -7405,7 +7435,11 @@
+ 				    (int64_t)imgp->ip_arch_offset, "com.apple.private.security.no-sandbox");
+ 			}
+ #endif /* DEBUG || DEVELOPMENT */
+-			if (!no_sandbox_entitled) {
++			if (!no_sandbox_entitled
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			    && !sweet_ios_exec_platform_ok(imgp)
++#endif
++			    ) {
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
+@@ -7419,7 +7453,11 @@
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+ 			    "boot-arg set to true\n", p->p_name);
+ #endif
+-		} else if (psa->psa_platform != PLATFORM_IOS) {
++		} else if (psa->psa_platform != PLATFORM_IOS
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		    && !sweet_ios_exec_platform_ok(imgp)
++#endif
++		    ) {
+ 			/* Simulator binary spawned with wrong platform */
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 			    EXEC_EXIT_REASON_WRONG_PLATFORM);

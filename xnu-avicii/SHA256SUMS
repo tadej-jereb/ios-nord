@@ -1,8 +1,8 @@
-fd9767790cd39df4c6de91b1f5e45581abf86b23659066edb5ec6f97c3affadf  series
+205360c3a2997075efcf7debbdc6d1fe3060059519a935cf2a615566c4ebbec5  series
 c057dea49d5bcccbc7d317d60f91cc8062689fd26d3d739f709e279bddb56a1c  patches/0001-new-clang-drop-removed-auto-var-init-flag.patch
 19f7571eb90608ef66f1d8cf9dee5333d4fbbccbfeee9ea244b90cb4a4240727  patches/0002-new-clang-backport-UIO_STACKBUF.patch
 ff08f768b0e7d830efd1cab98b8cb18e66c60935c4b640e74146e5c1cbb5371c  patches/0003-sweet-framebuffer-serial-console.patch
-27548a4dfae9a1f2e8fb538e2756f2213d1b7a147479f6f6bc92dd1ce35b6978  patches/0004-sweet-machine-config.patch
+567a44a681f46fc33e1aa92b5ac10a732ed1ca3c535b00919fb8b498927d6456  patches/0004-sweet-machine-config.patch
 b84deb9b9e5b8426aca7b713c3c5b5829e4e22354dd86d64329f14b15704d58c  patches/0005-non-pac-build-fixes.patch
 c7cf993c8362a689371f2b819903792be2deb5032e9ea7edc20a4abd627e233f  patches/0006-sweet-master-config-open-source-asm-pmap.patch
 8c8e43ac50591a2c6e4f1c1bff4edeb1935f8e02b28db50596f3be9a3a80c8e5  patches/0007-sweet-stub-apple-internal-headers.patch
@@ -97,3 +97,4 @@ b9a997943d05b975aedef08a6358339b5e9a677e9b930477bf73d040322bfb77  patches/0100-s
 33489e605f2feb296bb8cde2c305e90989e2f6da1692a7521c71cbb86472b7c4  patches/0101-sweet-ufs-write-power-mode.patch
 0101e0f19eb747b55304fcd228d2e908a03fd548c04185740ea06f85a2139510  patches/0102-sweet-ufs-write-short-transfer.patch
 285a755aaa48acf69f64c006cbc7714a77210c6092014500f0d6c607ef442a21  patches/0103-sweet-ufs-write-durability.patch
+7674bc4d535897385da4854cdd442ec3388f4c235bae9e0c2da13ef406b93a52  patches/0104-sweet-ios-exec-platform.patch
