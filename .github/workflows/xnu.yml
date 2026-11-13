@@ -187,7 +187,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
+          # The KDK install step runs xnu's lldbmacros tooling, whose Python
+          # relative imports break on the runner's Python 3, so `make install`
+          # can abort after the kernel is already linked. Take it from the
+          # object dir as well as from the fakeroot.
           cp -v dxb/fakeroot/System/Library/Kernels/kernel.* out/ 2>/dev/null || true
+          find dxb/build -maxdepth 4 -type f -name 'kernel.*' -exec cp -v {} out/ \; 2>/dev/null || true
           ls -la out || true
           ( cd out && shasum -a 256 kernel.* > SHA256SUMS ) || true
           cat out/SHA256SUMS 2>/dev/null || true
