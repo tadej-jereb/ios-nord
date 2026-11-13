@@ -168,7 +168,17 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
           set -o pipefail
-          bash build.sh 2>&1 | tee ../build.log
+          # lldbmacros' Python relative imports break on the runner's python3, so
+          # `make install` aborts *after* the kernel linked. Tolerate exactly that:
+          # fail only when no valid Mach-O came out.
+          bash build.sh 2>&1 | tee ../build.log || {
+            k=build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
+            if [ -f "$k" ] && file "$k" | grep -q 'Mach-O'; then
+              echo "::warning::build.sh exited nonzero but the kernel is linked (lldbmacros install abort); continuing"
+            else
+              exit 1
+            fi
+          }
 
       - name: Fail on skipped or unapplied project patches
         if: always()
