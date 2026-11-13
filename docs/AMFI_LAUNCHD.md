@@ -104,9 +104,10 @@ Loop, unattended, 30 s per run, no device:
 `cpu-factor=10` is added to the given cmdline because TCG trips the IRQ-off
 watchdog at 13 s without it (`/tmp/amfi-base`, 13.53 s: `Interrupts held disabled
 for 14286688 nanoseconds`). The cmdline is otherwise the same string in every run.
-(The decoder's `screen.png` step fails intermittently in `60-qemu-boot.sh` —
-`bash: line 489: syntax error` — independent of the boot; `screen.txt` and
-`result.json` are always complete.)
+(`screen.png` was missing on runs 3-5 because `60-qemu-boot.sh` was being edited
+elsewhere at the time — `bash: line 489: syntax error`; `screen.txt` and
+`result.json` were unaffected. Run 6 was taken after that edit settled and renders
+both PNGs.)
 
 | # | out | kernel | extra on the cmdline | result | panic line |
 |---|---|---|---|---|---|
@@ -115,6 +116,7 @@ for 14286688 nanoseconds`). The cmdline is otherwise the same string in every ru
 | 3 | `/tmp/amfi-after` | after (`0104`) | none | panic 30.79 s, **past the SIGKILL** | `SWEET EARLY PANIC:  initproc failed to start -- exit reason namespace 6 subcode 0x1 description: Library not loaded: /usr/lib/libSystem.B.dylib` |
 | 4 | `/tmp/amfi-off` | after (`0104`) | `sweet_ios_exec_platform=0` | panic 30.59 s, wall back | byte-identical to run 1 |
 | 5 | `/tmp/amfi-unsigned` | after (`0104`) | none, **unsigned** init binary | panic 30.58 s, wall back | byte-identical to run 1 |
+| 6 | `/tmp/amfi-after2` | after (`0104`) | none, repeat of run 3 | panic 30.70 s, **past the SIGKILL** | same dyld line as run 3 |
 
 Runs 1–2 fix the wall's identity: the *only* difference between them is the
 platform escape in step 2, and it moves the stop from the CS_KILLED panic to
