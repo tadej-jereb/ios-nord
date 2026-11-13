@@ -60,20 +60,18 @@ Constraints that came out of `docs/ROOTFS_READY.md`: the DMGs mount read-only th
 `tooling/opt/apfs-fuse` (unprivileged, verified), the tree is 68.5 % of the 16 GiB volume, and
 the shared cache is in **no trust cache** (see `lp-sip1`/`asmb` in the ADT and patch 0015).
 
-Second agent deliverable, equally needed: `docs/LAUNCHD_BOOTSTRAP.md` +
+A second deliverable exists now: `docs/LAUNCHD_BOOTSTRAP.md` +
 `tooling/34-check-bootstrap.sh` — the ordered minimal file/devfs set launchd needs for its
 first exec, derived statically from the binaries. Validate a populated root with
 `34-check-bootstrap.sh` **before** wasting a boot; do not boot a root that has not passed it.
 
 ## Hypotheses for the two failures that are not just "empty volume"
 
-1. **`devfs_kernel_mount: kernel_mount failed: 2`** (ENOENT). Either `/dev` does not exist on
-   the volume (a populate artefact — expected to clear itself once the root is real), or XNU's
-   devfs mount is ordered such that it never creates the mount point at all. Discriminator:
-   create `/dev` as an empty directory in the image and re-boot p6's exact cmdline. If the
-   line becomes `devfs_mount` success, it was the artefact and there is nothing else to do; if
-   it stays ENOENT with `/dev` present, take it up with patch ordering in `bsd_init`
-   (`devfs_kernel_mount` runs before the root is usable in some configs).
+1. ~~**`devfs_kernel_mount: kernel_mount failed: 2`**~~ **ANSWERED** by
+   `docs/LAUNCHD_BOOTSTRAP.md` §1 and §5 step 1: `devfs_init` already creates console, tty,
+   null, zero, urandom, klog and fd *before* `bsd_init:977` calls `kernel_mount`; the only
+   missing piece is the `/dev` directory on the volume. No code change. The populate step must
+   create `/dev` empty, root-owned, 0755 — `tooling/34-check-bootstrap.sh` step 1 checks it.
 2. **`root volume is not authenticated (error 25); continuing unsealed`** — `lp-sip0 = 0x6f`
    with `lp-sip1 = 1` from the ADT `/asmb` node is what allows this to continue instead of
    refusing. If a later stage refuses anyway, the CSR knobs are there; do not "fix" it by

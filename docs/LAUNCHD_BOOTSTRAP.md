@@ -98,7 +98,8 @@ that function, in order:
 | `0x1000169cc` | `getenv("LAUNCH_DID_REEXEC")`, `getenv("XPC_USERSPACE_REBOOTED")`, `sysctlbyname("kern.initproc_spawned")` | strings at 0x586b1, 0x586c3, 0x586da |
 | `0x100016a44` | `isatty(1)`; on 0 prints `%s cannot be run directly (stdout: %d)` (0x5870c) - not fatal | |
 | `0x100016a94` | `getpid() != 1` prints `%s cannot be run directly (pid = %d)` (0x58733) then `abort_with_reason(7,1,…)` via `0x10003d3c0` | `0x100016ab4`; `abort_with_reason` at `0x10003d408` |
-| `0x100016ad4` | stdio, three calls `(0,0) (1,1) (2,2)` to `0x100016fa0`, which **`open("/dev/console", O_WRONLY\|O_NOCTTY, 0666)`** (`0x100016fc0`, string 0x57f56, `_open` stub `0x100051520`, flags `#0x20001`, mode 438) and `dup2()`s it onto the fd; skipped entirely when the lean/restore byte at 0x1000728b9 is set | failure is silent: `dup2(-1, fd)` just errors, stdio stays closed |
+| `0x100016ad4` | fd 0, 1, 2 are each pointed at `/dev/null`: three `(0,0) (1,1) (2,2)` calls to `0x100016fa0`, which `open("/dev/null", O_RDWR\|O_NOCTTY, 0666)` (`0x100016fc0`, string 0x57f56) and `dup2()`s it; skipped when the lean/restore byte at 0x1000728b9 is set | failure tolerated: `dup2(-1, fd)` only errors |
+| `0x100010dd0` | `console_log()`: formats the line, then `dispatch_sync_f` to `console_write` (`0x100010e30`), which **`open("/dev/console", O_WRONLY\|O_NOCTTY, 0666)`** once (cached in the global at 0x1000721e0), `write()`s, and drops the fd again on `EPIPE` | `0x100010e54` string 0x57467, `_open` stub `0x100051520`, flags `#0x20001`, mode 438 |
 | `0x100016af8` | `memorystatus_control` with selector `0x22000040`, jetsam watermark | |
 | `0x100016b00` | config read `0x1000452e0` (boot-args, limits plist), then log `hello` (0x58758, level 5) | |
 | `0x100016c0c` | `sysctlbyname("kern.bootargs")` (0x5875e, wrapper `0x10003de58`) then logs `boot-args = %s` (0x5876c) | |
@@ -119,9 +120,13 @@ fatal ones: `could not set up inheritance port` (0x588cb), `could not get
 unique pid` (0x5880c), `Could not chdir to /` and `Could not set login name to
 "root"` (0x53ae1 is only the argument).
 
-Note what launchd does **not** do at startup: it does not read
-`/private/etc/fstab`, does not create `/var/run`, does not touch a plist before
-it has a bootstrap port. Its first file operation is `/dev/console`.
+So launchd's own stdout/stderr are not a terminal and not the console: console
+output is a separate, lazily opened fd that only log lines above the stderr
+level use. Everything else goes through `os_log`. Note also what launchd does
+**not** do at startup: it does not read `/private/etc/fstab`, does not create
+`/var/run`, does not touch a plist before it has a bootstrap port. Its first
+file operations are `/dev/null` (three times) and, on the first log line,
+`/dev/console`.
 
 ### The compiled-in boot table
 
@@ -147,10 +152,11 @@ The same plist also carries `Bootstrap/Paths` (the directories launchd scans:
 `HighWatermark` 50. `performAfterUserspaceReboot` marks the jobs whose
 cold-boot behaviour is in section 8.
 
-`launchd` opens `/dev/null` too: `0x100016fa0` has a second entry point that
-opens `/dev/null` `O_RDWR|O_NOCTTY` and dup2()s it (used where a job's stdio is
-null), and the spawn path adds `/dev/console` with `posix_spawn_file_actions_addopen`
-for fd 0/1/2 (`0x1000249c4`, `0x1000249e8`, `0x100024a0c`).
+The same two helpers are what jobs get: `dup_devnull` (`0x100016fa0`) for a
+job's null stdio, and the spawn path adds `/dev/console` with
+`posix_spawn_file_actions_addopen` for fd 0/1/2 (`0x1000249c4`, `0x1000249e8`,
+`0x100024a0c`). `/dev/null` and `/dev/console` are therefore on the very first
+spawned job's path, not only on launchd's.
 
 ### What it reads later
 
@@ -179,7 +185,7 @@ having on a bring-up kernel. It also reads `security.mac.amfi.developer_mode_sta
 
 `launchd` links only `/usr/lib/libSystem.B.dylib` (1319.100.3) and
 `/usr/lib/libobjc.A.dylib` (228.0.0), and `LC_LOAD_DYLINKER /usr/lib/dyld`
-(both at load command 9/14/15). **Neither dylib exists as a file anywhere** -
+(load commands 9, 14 and 15). **Neither dylib exists as a file anywhere** -
 not on the root volume, not in the cryptex (`/usr/lib` there holds only
 `libstdc++`, trampolines). They exist only inside the dyld shared cache.
 
@@ -282,7 +288,7 @@ means it was reached, so a boot is judged by *where it stops*, not by whether it
 | # | item | why it is here | stop line if missing/wrong |
 |---|---|---|---|
 | 0 | the volume is populated at all (≥144 341 files) | empty volume = current state | `load_init_program: … errno 2` |
-| 1 | `/dev` exists, empty, root-owned, 0555/0755 | namei mount point for devfs (`bsd_init.c:977`) | `devfs_kernel_mount: kernel_mount failed: 2`, then no console at all |
+| 1 | `/dev` exists, empty, root-owned, 0555/0755 | namei mount point for devfs (`bsd_init.c:977`); devfs then provides null/console/tty/zero/urandom/klog/fd | `devfs_kernel_mount: kernel_mount failed: 2`, then no stdio and no console output |
 | 2 | `/sbin/launchd`: regular, 0755, arm64 `MH_EXECUTE`, `LC_LOAD_DYLINKER /usr/lib/dyld`, ad-hoc sig, CD page hashes + slot -5 correct, 22 entitlements | the exec target; `CS_SIGNED`/`CS_PLATFORM_BINARY` depend on it | `Process 1 exec of /sbin/launchd failed, errno N` (85 EBADEXEC / 86 EBADARCH / 88 EBADMACHO) |
 | 3 | `/usr/lib/dyld`: arm64 `MH_DYLINKER`, 0755, sha256 `58068345…` | `LC_LOAD_DYLINKER`, loaded by the kernel before userland | `exec` printed, then 6 ENXIO |
 | 4 | shared cache at `/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64` + 43 further files incl. `.dyldlinkedit`, path table containing `libSystem.B.dylib` and `libobjc.A.dylib`; cryptex files hard-linked at their root paths | the only home of libSystem/libobjc | `exec launchd` then a dyld error (`dyld: Library not loaded: /usr/lib/libSystem.B.dylib`) |
@@ -350,11 +356,18 @@ answers those.
 Each rung is one boot, judged by where it stops; nothing below is edited in the
 kernel or the shim.
 
-1. Populate (stage `os` + `sysos` + `appos` + `dyld` + `cryptexlinks` + `keybag`
-   + `logdirs`), run `34-check-bootstrap.sh` until `ready to boot`.
-2. Add `/private/etc/fstab` with the one line for the data volume; re-check.
-3. Boot with `launchd_log_serial=1 launchd_disable_all_timeouts=1 -v`. Expect
-   `exec launchd`, then either the console log from launchd or a dyld error.
+1. Populate (stages `os` `sysos` `appos` `dyld` `cryptexlinks` `keybag`
+   `logdirs`), then check until `ready to boot`:
+
+       tooling/34-check-bootstrap.sh /mnt/iosroot
+
+2. Add the fstab line on the mounted volume, then re-check:
+
+       printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' | sudo tee /mnt/iosroot/private/etc/fstab
+
+3. Boot with `launchd_log_serial=1 launchd_disable_all_timeouts=1 -v` on the
+   kernel command line. Expect `exec launchd`, then either launchd's console
+   log or a dyld error.
 4. If it stops in a boot job, read the job name: `mount-phase-1` → fstab/APFS
    framework, `keybag` → AppleKeyStore selectors, `fsck` → `/sbin/fsck` and the
    HFS journal, `tzinit` → `/usr/share/zoneinfo`.
@@ -370,9 +383,11 @@ kernel or the shim.
 * **Ordering inside `launchd`.** The `Boot` dict order is the plist order, but
   launchd may start `auearlyboot` and the scan concurrently; only a boot shows
   it.
-* **Whether a missing `/dev/console` is survivable.** The `dup2(-1, fd)` result
-  is discarded (`0x100016fd8`), so statically it is non-fatal, but then no
-  output exists either - the failure mode is indistinguishable from a hang.
+* **Whether missing `/dev/null` or `/dev/console` is survivable.** Both
+  `dup2(-1, fd)` results are discarded (`0x100016fd8`, and the console write
+  just returns short), so statically both are non-fatal, but with neither node
+  there is no stdio for children and no output at all - indistinguishable from
+  a hang.
 * **How `setfsent()` reports a missing file.** The branch at `0x100004f30`
   distinguishes `errno != 0` (errx) from `errno == 0` (also errx via the exit
   code helper), so both end the job, but which one a Darwin `setfsent()` with no
@@ -403,6 +418,7 @@ kernel or the shim.
 
 | claim | where |
 |---|---|
+| observed state | `logs/p6-kernel-ring.clean.txt:145-152`, `docs/IMAGE_PROVENANCE.md:334` |
 | devfs ENOENT | `bsd/miscfs/devfs/devfs_vfsops.c:487-501`, `bsd/vfs/vfs_syscalls.c:291-337`, `bsd/kern/bsd_init.c:973-980` |
 | exec path and panic texts | `bsd/kern/kern_exec.c:6834-6842, 6873-6930, 6751-6831` |
 | devfs nodes | `bsd/miscfs/devfs/devfs_vfsops.c:109-155`, `bsd/dev/random/randomdev.c:99-119` |

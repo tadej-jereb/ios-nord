@@ -37,7 +37,7 @@ quiet=0
 min_files=100000
 
 usage() {
-	sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,/^set -/p' "$0" | sed -n '/^set -/!s/^# \{0,1\}//p'
 	exit 64
 }
 
