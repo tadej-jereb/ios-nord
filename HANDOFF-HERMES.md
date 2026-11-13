@@ -1,186 +1,138 @@
-# Handoff for Hermes — test the dtb-section fix, then climb the diag ladder
+# Handoff — to Hermes: make the payload boot observable, then make XNU speak
 
-Written 2026-11-12 by Claude Code in answer to `HANDOFF-CLAUDE.md`. You are the
-orchestrator: you own the phone and the sub-agents. Read §1–§3, then start §4 and §5 at
-the same time.
+Written 2026-11-13 by Claude Code for Hermes. It follows `HANDOFF-XNU.md`, checks it
+against the code, and corrects it where the code disagrees. Read `AGENTS.md` first. Its
+rules apply here unchanged.
 
-## 1. Finding (answers `HANDOFF-CLAUDE.md` §5)
+## How to work
 
-The compiled shim is not what ABL refuses. The refused images carry the wrong DTB in the
-boot image's dtb section.
+### Use multiple agents
 
-| dtb section | images | recorded outcome |
-|---|---|---|
-| 406620 B, sha256 `48b0902a…` (stock's) | `h1`, `S6`, stock control | park / boot |
-| 337226 B, sha256 `8d3818a2…` (`src/avicii-board.dtb`) | `off3`, `psm`, `s0`, `n2`, `n2c`, `v2s1` | refused ~6 s |
-| none (header v1, or `dtb_size 0`) | every earlier build | refused ~6 s |
+Split the work into parallel lanes and give each lane its own sub-agent. Use one
+coordinator (you). The coordinator owns the device, the build, the commit and
+`docs/IMAGE_PROVENANCE.md`. Sub-agents never touch the phone and never run `fastboot`.
 
-- VERIFIED (`dtc -I dtb -O dts src/avicii-board.dtb | grep -c fragment@` = 620):
-  `src/avicii-board.dtb` is the **overlay** from `dtbo.img`. It has no `qcom,msm-id`.
-- VERIFIED (`fdtget -t x avicii/shim/hybrid/sections/dtb-stock / qcom,msm-id` =
-  `190 10000 1b8 10000`): stock's section is the **SoC base tree**, zero fragments.
-- VERIFIED: `avicii/tools/mkbootimg_v1.sh:195` defaults `DTB_FILE` to the overlay, so
-  every `build.sh` image got it. `hybrid/mk.sh` and `avicii/build/mk.sh` use stock's.
-- VERIFIED: `S6` already contains compiled shim code behind its park and it parks.
-- HYPOTHESIS: ABL finds no `qcom,msm-id` match in an overlay-only section and returns
-  to fastboot before jumping. Not yet tested on hardware — that is T1/T2 below.
-- CORRECTION: `h4` has no `.result` file. Only `h1` and `S6` have recorded parks.
-
-## 2. Images already built (do not rebuild)
-
-Both are the compiled shim, `off3` layout (code0 `b +0x80000`, `text_offset 0x80000`),
-full `_start` prologue, then `wfe; b .` before `shim_main` (`-DPARK_AFTER_ENTRY`).
-Their kernel sections are byte-identical (`cmp` = 0 differences). The dtb section is the
-only variable. Both `--verify` PASS.
-
-| id | image | dtb section | sha256 | expected |
-|---|---|---|---|---|
-| T1 | `avicii/shim/out-diag/dtbfix-park/shim-boot.img` | stock base | `69cdca532998f06f965855fd6a84018a2e12a6f88ee7d1476923f32cb121f6dc` | PARK |
-| T2 | `avicii/shim/out-diag/dtbfix-neg/shim-boot.img` | overlay | `2b1a18098230734f4065513811bdb6aeed9eb820107f09a1458559dc5e09327e` | REFUSED ~6 s |
-
-Restore image: `backup/64f70df8/boot_b.img`,
-sha256 `39ed8eeaf9053a9a53028b3b2ba03f45ab288df38e8f9430ca0a6fda545b1ef0`.
-
-## 3. Agent plan — one device lane, everything else in parallel
-
-The phone is a single serial resource. Exactly **one** agent touches USB; a second
-agent issuing `adb`/`fastboot` corrupts the timing and can flash over a parked run.
-Every other agent is host-only and starts immediately, without waiting for T1.
-
-| agent | starts | touches device | job | deliverable |
-|---|---|---|---|---|
-| **Flasher** | t=0 | YES, sole owner | run §4 queue in order, one image at a time | one result line per image (§6) |
-| **Packer** | t=0 | no | §5.1 packer fix + verify gate | patch, `--verify` proof on T1/T2 |
-| **Ladder** | t=0 | no | §5.2 build rungs with the stock dtb | images + sha256 list handed to Flasher |
-| **Contingency** | t=0 | no | §5.3 prepare the T1-refused branch | 3 images, ready but not queued |
-| **Scribe** | on first result | no | §5.4 docs | commits to `PROGRESS.txt`, `docs/` |
-
-Rules that keep it cheap:
-
-- Spawn all four host agents in one message. Give each only its own section of this
-  file plus §1, §2, §7. Do not paste the long docs; give paths.
-- Agents return a result table and file paths, never file dumps or disassembly.
-- No agent re-tests anything listed in `HANDOFF-CLAUDE.md` §3 or re-derives §1.
-- The Flasher never builds. Builders never flash. The Flasher takes images only from a
-  list with a sha256 per line and re-hashes before flashing.
-- Cancel **Contingency** the moment T1 parks. Cancel **Ladder** the moment T1 is
-  refused. Do not let a dead branch keep spending.
-- One flash per question. Do not repeat a run unless its result contradicts §2.
-
-## 4. Flasher queue (device lane)
-
-Gate before every flash: `sha256sum` of the image equals the listed value, and the
-device answers `fastboot devices`.
-
-T1 — the decisive run:
-
-```
-1. cd /home/tadej/ios-nord
-2. source tooling/env.sh
-3. sha256sum avicii/shim/out-diag/dtbfix-park/shim-boot.img
-4. adb kill-server
-5. tooling/50-boot-timing.sh --image avicii/shim/out-diag/dtbfix-park/shim-boot.img --runs 1
-```
-
-T1 has no self-reset. After a park, hold **Power 30 s**, then enter fastboot.
-
-Restore, after every run, always:
-
-```
-6. fastboot flash boot_b backup/64f70df8/boot_b.img
-7. fastboot reboot
-8. adb kill-server
-9. adb wait-for-device
-```
-
-If ABL flipped the slot: `fastboot --set-active=b` before step 7.
-
-T2 — the negative control, only if T1 parked (it turns a correlation into a
-one-variable proof; skip it if T1 was refused):
-
-```
-10. sha256sum avicii/shim/out-diag/dtbfix-neg/shim-boot.img
-11. adb kill-server
-12. tooling/50-boot-timing.sh --image avicii/shim/out-diag/dtbfix-neg/shim-boot.img --runs 1
-13. fastboot flash boot_b backup/64f70df8/boot_b.img
-14. fastboot reboot
-```
-
-Decision:
-
-| T1 | T2 | meaning | next |
+| lane | agent | owns | output |
 |---|---|---|---|
-| PARK | REFUSED | dtb section was the gate, proven | flash the Ladder list, lowest rung first |
-| PARK | PARK | first run of the pair lied; repeat T1 once | then decide |
-| REFUSED | — | dtb theory dead, prologue suspect | flash the Contingency list (§5.3) |
+| A | shim-logging | `avicii/shim/shim.c`, `loader.c`, `console.[ch]`, `diaglog.[ch]` | ring logging on the loader path (task 1) |
+| B | boot-args-diff | read-only: `refs/edi194-ios-fajita/shim/loader.c`, `refs/edi194-ios-fajita/NOTES.md`, `avicii/tools/mkpayload.py`, `avicii/tools/mkadt_avicii.py` | a line-by-line diff of the `boot_args`/ADT/cmdline differences between fajita and avicii, each tied to a hypothesis below |
+| C | ring-reader | `tooling/42-log-pull.sh`, `logs/` | a decoder that prints a pulled ring as text and flags the last `LOADER`/`JUMP` line |
+| D | reviewer | read-only, the whole diff | reviews A's patch before the coordinator builds it: correctness, size, no new constants without a `CONSTANTS.md` citation |
 
-Ladder runs (after T1 PARK + T2 REFUSED): flash in the order Ladder hands over. Stop at
-the first rung that does not park and report it; do not skip ahead. After each rung with
-`DIAG_LOG=1`, restore, boot LineageOS, then `tooling/42-log-pull.sh` and attach the ring.
+Rules for the lanes:
+- Lanes A, B and C start together. D starts when A says it is done.
+- Each agent returns a short report with file:line references, not a narrative.
+- Two agents never edit the same file. If a lane needs a change in a file it does not
+  own, it asks the coordinator.
+- If two agents disagree, the coordinator settles it by measuring (a host test, a
+  build, or a boot), not by picking one answer.
+- Only the coordinator boots, and only after A's patch has passed D's review and the
+  build.
 
-## 5. Host-side work (all parallel, no device)
+### Code quality: clean, efficient, optimised
 
-### 5.1 Packer
+- **Clean:** keep the existing style: kernel C, tabs, short functions, a comment only
+  where the *why* is not obvious. Write one helper rather than copy-pasting a pair of
+  `con_*` + `dlog_*` calls at every site. Leave no dead code, commented-out experiments
+  or stray debug prints in the commit.
+- **Efficient:** the shim runs with the MMU and caches off, so every store goes to Device
+  memory and every ring line is a UFS WRITE+SYNC. Do not log inside loops (no line per
+  segment unless it is behind a flag). Format each line once and send it to both sinks.
+  Do not grow `.bss` needlessly: `diaglog.c` already keeps 80 KB of static buffers.
+- **Optimise where it is safe and measurable:**
+  - `copy64`/`zero64` in `loader.c` use `volatile` 8-byte accesses on purpose, because
+    the MMU is off and the memory is Device type. Measure before you change them. One
+    option is `ldp/stp` pairs (16 B per access, still aligned and still allowed on
+    Device-nGnRnE). Time the 16.6 MB copy with `cntpct_el0` before and after, and keep
+    the change only if the boot still works and the copy is measurably faster. Record
+    both numbers in the commit message.
+  - Do not "optimise" away `dsb sy; ic iallu; dsb sy; isb` before the jump.
+  - Everything must still pass `-Wall -Wextra` with no new warnings, plus
+    `host_test.c` where it applies.
 
-- Extract stock's dtb section to `src/avicii-soc.dtb` from `src/los21-boot.img`
-  (406620 B, must hash to `48b0902a99c10a11ff52680bf81e9fec2574ad687c58ea35a00fdbf7aefe40ce`).
-- Change the `DTB_FILE` default at `avicii/tools/mkbootimg_v1.sh:195` to it.
-- Make `--verify` FAIL when the dtb section has no `qcom,msm-id` or contains
-  `__overlay__`. Proof required: T1 image PASS, T2 image FAIL.
-- Fix the same default in `avicii/shim/build-diag.sh` only for the section; the
-  `DTB=` variable in `build.sh` is the gzip-appended copy and is unused by the v2 path.
-- Do not touch `shim/*.c`, `start.S`, `shim.ld`.
+## Verified against the code (2026-11-13)
 
-### 5.2 Ladder
+1. **No ring on the payload path. Confirmed, and wider than `HANDOFF-XNU.md` says.**
+   - `diag.c:733-737`: at `DIAG_STAGE < 1`, `diag_run()` returns 0 before
+     `dlog_init()` (`diag.c:774`).
+   - `shim.c:389-399`: `shim_main()` then calls `loader_boot()`, and every loader line
+     goes through `con_*` only. Nothing on this path calls `dlog_line()`.
+     **Initialising the ring alone fixes nothing.** The loader's output has to reach
+     the ring too.
+2. **`con_hex2` truncates to 32 bits** (`console.h:26`: `uint32_t va, vb`). The loader
+   passes 64-bit values to it: `PHYS base=0x180000000` shows as `80000000`, and
+   `SEGS end=`, `BOOTARG pa=` and `top=` are truncated the same way. Any photo of the
+   panel from p1/p2 misreports high-bank addresses. Fix this together with the ring
+   logging, with 64-bit pairs.
+3. **The loader path clears the panel to RED** (`shim.c:396`, `con_clear(RED)`), not
+   magenta. Use this panel key instead of the one in `HANDOFF-XNU.md` hypothesis 4:
+   - red with no text = the shim reached the loader and died before its first line
+   - red with text = read the last line
+   - anything else = XNU drew it
+4. **Hypothesis 5 is half wrong.** The working fajita port *does* use `debug=0xc`
+   (`refs/edi194-ios-fajita/NOTES.md:41,244`). Its proven phone cmdline is:
 
-Build with `DTB_FILE=/home/tadej/ios-nord/avicii/shim/hybrid/sections/dtb-stock` until
-5.1 lands. Order, one variable per step:
+       debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress
 
-| rung | build | why |
+   `NOTES.md:312` says why `-enable_kprintf_spam` is required: DEVELOPMENT kernels
+   disable kprintf output even when `DB_KPRT` is set (`pexpert/arm/pe_kprintf.c`). The
+   avicii payload has neither `-enable_kprintf_spam` nor `cpus=1`. Use the fajita
+   cmdline (plus avicii's own `sweet*` flags) as the baseline for p3.
+5. **Hypothesis 3 gains weight.** Fajita's working boot loaded the kernel in the *low*
+   bank (`NOTES.md:244`: entry PA `0xb146b488`, boot_args PA `0xb2000000`). Avicii puts
+   it at `0x180000000`. That makes the low-bank A/B a strong second boot.
+
+## Task 1: ring on the payload path (lane A)
+
+Required behaviour:
+- In `shim_main()`, under `#if DIAG_LOG`, call `dlog_init()` once before
+  `loader_boot()` when `DIAG_STAGE < 1`. Write its return code to the panel. A failure
+  must not block the jump: no ring is still better than no boot.
+- Add one output helper that sends each loader line to both the panel and the ring. Use
+  it for every `INITRD`, `PHYS`, `VIRT`, `ENTRY`, `SEGS`, `BOOTARG`, `JUMP` and `XNU`
+  line, and log `loader_boot()`'s return string as `LOADER <why>`.
+- Log `/chosen` `linux,initrd-start/-end` *before* the magic check (hypothesis 2). On
+  failure, log which property is missing.
+- Write the last ring line (`JUMP <entry_pa>`) **before** the cache maintenance and
+  the branch. `dlog_line` already syncs per line, so the line is on flash before the
+  jump.
+- Make `con_hex2` 64-bit, or add a 64-bit variant and switch the loader to it.
+- Leave the UFS host quiescent before the jump: no command in flight. XNU will not
+  touch UFS this early, but do not leave a doorbell set.
+
+Done when: `DIAG_STAGE=0 DIAG_LOG=1` builds clean, D has approved the patch, and a
+host-side read of the image shows the new strings.
+
+## Task 2: boots, in order (coordinator only)
+
+Each boot is one `fastboot boot`, then a ring pull, then one line in `logs/`.
+
+| image | change from p2 | discriminates |
 |---|---|---|
-| L0 | `DIAG_STAGE=0 DIAG_LOG=0`, park planted at top of `shim_main` (the `psm` shape) | first C frame, stack and bss proven |
-| L1 | `DIAG_STAGE=1 DIAG_LOG=0` (`ro1` shape) | rung 1, writes nothing |
-| L2 | `DIAG_STAGE=1 DIAG_LOG=1` (`v2s1` shape) | first UFS ring write |
-| L3 | `DIAG_STAGE=2 DIAG_LOG=1` | next rung |
+| p3 | task 1 + fajita baseline cmdline, high bank | does the loader reach `JUMP`? what does XNU print? |
+| p4 | p3 with `phys_base` in the low bank, taken from the live FDT `0x80000000` extent and checked against `CONSTANTS.md` | hypothesis 3 |
+| p5 | only if B finds a real `boot_args`/ADT difference | hypothesis 6 |
 
-Each: `avicii/tools/mkbootimg_v1.sh --verify` PASS, dtb section sha `48b0902a…`,
-`sha256sum` recorded. Hand the Flasher a four-line list, nothing else. `park()` in
-`diag.c` self-resets after 60 s, so L1+ need no power button; L0 does if its park is a
-bare `wfe; b .`.
+Stop after any boot that leaves XNU output (a banner or a panic) on the panel or in the
+ring. Capture it in `logs/` and name the cause before you change anything else.
 
-### 5.3 Contingency (only used if T1 is refused)
+Device state: the phone was **off USB after p2**. Recover it by holding power for about
+30 s, then follow the ring-pull steps in `HANDOFF-XNU.md`. Build and boot commands are
+the reproduction block in `HANDOFF-XNU.md` with `OUT=.../p3`.
 
-All with the stock dtb section, park as the last instruction before the point named:
+## Definition of done
 
-| id | change vs T1 | names |
-|---|---|---|
-| C1 | park as the first instruction of `_start` at `0x80000` | entry reached at all |
-| C2 | park after `mov sp, x1`, `msr spsel, #1` removed | `spsel` |
-| C3 | park after `msr vbar_el1` + `isb`, before the bss loop | bss clear / image extent |
+Unchanged from `HANDOFF-XNU.md`:
+- The ring shows the loader's lines through `JUMP`, and XNU then prints something of
+  its own.
+- Every booted image has a sha256 line in `docs/IMAGE_PROVENANCE.md`.
+- `docs/STATUS.md` is updated.
+- Everything goes in one commit, with the copy-timing numbers in its message if the
+  copy was optimised.
 
-Build and verify all three now; queue none unless T1 is refused.
+## Rules that do not bend
 
-### 5.4 Scribe
-
-After each Flasher result: one row in `docs/HYBRID.md`, the sha256 + outcome in
-`docs/IMAGE_PROVENANCE.md`, a dated entry in `PROGRESS.txt`. On T1 PARK + T2 REFUSED also
-correct `docs/SHIM_BOOT.md:168`, `docs/STAGED.md:17` and `docs/STATUS.md:66`:
-`avicii-board.dtb` is the dtbo overlay and must never be the boot image's dtb section.
-Record `h4` as untested. Commit docs only; never commit under `refs/`.
-
-## 6. Result line format (Flasher → orchestrator)
-
-```
-<id> <sha256[:16]> <PARK|REFUSED|BOOT> first-USB=<ms or none/90s> kind=<fastboot|adb|none> restore=<ok|FAIL>
-```
-
-PARK = no USB for 90 s. REFUSED = fastboot within ~10 s. BOOT = adb present.
-`restore=FAIL` stops the whole queue until a human looks.
-
-## 7. Hard rules (unchanged)
-
-- Flash `boot_b` only. Never `boot_a`, never unslotted `boot`, never `fastboot boot`.
-- Never write `persist`, `modemst1/2`, `fsg`, `xbl`, `abl`, `tz`, or the GPT.
-- `adb kill-server` before every reboot check.
-- Restore `backup/64f70df8/boot_b.img` after every run, pass or fail.
-- Mark every claim VERIFIED (with the command) or HYPOTHESIS. Do not soften a failure.
+`fastboot boot` only. Nothing is flashed. Do not touch `persist`, `modemst1/2`, `fsg`,
+`xbl`, `abl`, `tz` or the GPT. Every constant comes from `CONSTANTS.md` or the live FDT.
+Procedures are numbered transcripts with one command per line. Sub-agents never touch
+the device.
