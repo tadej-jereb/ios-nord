@@ -409,7 +409,11 @@ kernel or the shim.
 
 3. Boot with `launchd_log_serial=1 launchd_disable_all_timeouts=1 -v` on the
    kernel command line. Expect `exec launchd`, then either launchd's console
-   log or a dyld error.
+   log or a dyld error. That is rung p8 (`docs/IMAGE_PROVENANCE.md:341`):
+   launchd's own records will appear after `load_init_program: attempting to
+   load /sbin/launchd` (p6 ring line 152) where the p6/p7 rings carry nothing —
+   see §2 "`launchd_log_serial` and `launchd_disable_all_timeouts`, exactly"
+   before reading anything into them.
 4. If it stops in a boot job, read the job name: `mount-phase-1` → fstab/APFS
    framework, `keybag` → AppleKeyStore selectors, `fsck` → `/sbin/fsck` and the
    HFS journal, `tzinit` → `/usr/share/zoneinfo`.

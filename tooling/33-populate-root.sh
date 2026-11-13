@@ -24,7 +24,10 @@
 #   cryptexlinks    hard links of cryptex files that have no OS-root counterpart
 #   logdirs         /private/var/db/{diagnostics,uuidtext}/.migrated (owner _logd)
 #   keybag          /private/var/keybags/systembag.kb, plain plist
-#   tweaks          refs/ios-sweet/sweet-root-tweaks.py (pinned sha256)
+#   tweaks          refs/ios-sweet/sweet-root-tweaks.py (pinned sha256) through
+#                   tooling/33b-tweaks-idempotent.py; runs on every invocation
+#   bootset         every non-DMG path 34-check-bootstrap.sh checks; runs on
+#                   every invocation (modes/owners re-asserted)
 #   fsck            umount, fsck -fy, fsck -n must be clean
 # A re-run skips recorded stages; rsync stages are idempotent anyway. The image
 # sha256 is recorded in the marker, so a different image forces --restart.
@@ -120,10 +123,14 @@ state=$img.populate-state
 # The documented gate leaves a baseline checksum next to the image; a fresh run
 # must match it, so an accidentally different image cannot be half-filled.
 base=$img.sha256.pre-populate
-if [[ -f $base ]] && [[ ! -s $state ]]; then
+if [[ -f $base ]] && [[ ! -s $state ]] && (( ! adopt )); then
 	(cd "$(dirname "$img")" && sha256sum -c --status "$(basename "$base")") || \
 		die "$img does not match $base - re-make it or delete the baseline deliberately"
 	say "baseline ok $(cut -d' ' -f1 "$base")"
+elif (( adopt )); then
+	# Adopting means "populate this volume as it stands"; a read-write mount has
+	# already bumped the volume header, so the baseline is stale by definition.
+	say "baseline skipped (--adopt: a rw mount changes the header, so its sha cannot hold)"
 fi
 
 say "image   $img ($(numfmt --to=iec "$VOLUME_BYTES"), HFSX, journaled)"
@@ -238,7 +245,13 @@ if [[ -s $state ]]; then
 	# The recorded sha is from before fsck; an fsck pass can change it, so a
 	# finished run records the new one and resume accepts either.
 	if ! grep -qx -e "image_sha=$cur" -e "image_sha_final=$cur" "$state"; then
-		die "marker belongs to $(sed -n 's/^image_sha=//p' "$state"), image is $cur - use --restart"
+		if (( adopt )); then
+			# --adopt says "populate the volume as it stands": the sha moved
+			# because earlier stages wrote into it, which is expected on resume.
+			say "note: image sha moved since the marker (content written since); resuming"
+		else
+			die "marker belongs to $(sed -n 's/^image_sha=//p' "$state"), image is $cur - use --restart"
+		fi
 	fi
 	say "resuming: $(sed -n 's/^stage=//p' "$state" | tr '\n' ' ')"
 elif (( entries > 0 )) && (( ! restart )); then
@@ -272,7 +285,15 @@ have_stage appos || remaining=$((remaining + APP_UNIQUE))
 need=$(( remaining + remaining / 100 * 5 + 64 * 1024 * 1024 ))
 vavail=$(df --output=avail -B1 "$mnt" | tail -1 | tr -d ' ')
 say "volume  $vavail B free, remaining payload $remaining B, need $need B"
-(( vavail >= need )) || die "volume too small: $vavail B free < $need B needed"
+(( vavail >= need )) || {
+	if (( adopt )); then
+		# On --adopt the volume already holds most of the payload and rsync only
+		# moves the difference, so "free < whole payload" is expected.
+		say "note: free is below the whole payload, but --adopt only copies the difference"
+	elif (( vavail * 2 < remaining )); then
+		die "volume too small: $vavail B free < $need B needed"
+	fi
+}
 
 # --- stages ----------------------------------------------------------------
 mark() { printf 'stage=%s\ntime=%s\n' "$1" "$(date -Is)" >>"$state"; }
@@ -354,24 +375,69 @@ if ! have_stage keybag; then
 	mark keybag
 fi
 
-if ! have_stage bootset; then
-	# The two items the launchd first-run set needs and the DMGs do not carry:
-	# the devfs mount point (namei'd by bsd_init before launchd) and the phase-1
-	# fstab (mount -P 1 reads only /etc/fstab and errx es without it).
-	step "boot set: /dev mount point and /private/etc/fstab"
-	install -d -m 0755 -o 0 -g 0 "$mnt/dev"
-	printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' > "$mnt/private/etc/fstab"
-	chown 0:0 "$mnt/private/etc/fstab"
-	mark bootset
-fi
+# Runs every time, not stage-gated: an rsync re-run of the OS DMG puts
+# VirtualAudio.plugin back, and the wrapper makes the upstream script safe to
+# repeat (tooling/33b-tweaks-idempotent.py). A failure is fatal.
+step "apply bring-up tweaks (tooling/33b-tweaks-idempotent.py)"
+python3 "$here/33b-tweaks-idempotent.py" "$tweaks" "$mnt" || die "tweaks failed (see above)"
+have_stage tweaks || mark tweaks
 
-if ! have_stage tweaks; then
-	step "apply bring-up tweaks"
-	python3 "$tweaks" "$mnt"
-	mark tweaks
+# --- boot set ----------------------------------------------------------------
+# Every path/type/mode/owner tooling/34-check-bootstrap.sh checks that the DMGs
+# do not carry (or carry differently), enforced on every run so a re-run, an
+# rsync, or an earlier partial stage cannot leave one behind. From 34:
+#   step 1  /dev                       dir, uid 0, 0555 or 0755
+#   step 5  /private/var/tmp /private/tmp  dir 1777 (DMG: var/tmp only)
+#           /private/var/run /private/var/db  dir, any mode (DMG has both)
+#           /private/var/keybags       dir 0700 (not in the DMG)
+#   step 6  /private/etc/{master.passwd,group,ttys,hosts,passwd}  DMG files
+#           /private/etc/fstab         an ro/rw/rq entry without noauto
+#   step 9  /private/var/keybags/systembag.kb       0600
+#           /private/var/db/{diagnostics,uuidtext}/.migrated  0644
+# Everything else in 34 (binaries, signatures, cache, hard links, job
+# programs) is DMG content or the dyld/cryptexlinks stages.
+step "boot set (every non-DMG path 34-check-bootstrap.sh checks)"
+bootdir() { # path mode-if-created
+	local p=$mnt/$1
+	if [[ -L $p ]] || { [[ -e $p ]] && [[ ! -d $p ]]; }; then
+		die "/$1 exists but is not a directory (34 lstat()s it)"
+	fi
+	[[ -d $p ]] || install -d -m "$2" -o 0 -g 0 "$p"
+}
+bootdir dev 0755
+chown 0:0 "$mnt/dev"
+case $(stat -c %a "$mnt/dev") in 555|755) ;; *) chmod 0755 "$mnt/dev" ;; esac
+for d in private/tmp private/var/tmp; do
+	bootdir "$d" 1777
+	chown 0:0 "$mnt/$d"; chmod 1777 "$mnt/$d"
+done
+bootdir private/var/run 0755
+bootdir private/var/db 0755
+bootdir private/var/keybags 0700
+chown 0:0 "$mnt/private/var/keybags"; chmod 0700 "$mnt/private/var/keybags"
+for f in master.passwd group ttys hosts passwd; do
+	[[ -f $mnt/private/etc/$f ]] || die "/private/etc/$f missing (DMG content; os stage incomplete?)"
+done
+if ! awk '($4 == "ro" || $4 == "rw" || $4 == "rq") && $0 !~ /noauto/ { found = 1 }
+	END { exit !found }' "$mnt/private/etc/fstab" 2>/dev/null; then
+	printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' > "$mnt/private/etc/fstab"
 fi
+chown 0:0 "$mnt/private/etc/fstab"; chmod 0644 "$mnt/private/etc/fstab"
+kb=$mnt/private/var/keybags/systembag.kb
+[[ -f $kb ]] || die "/private/var/keybags/systembag.kb missing (keybag stage recorded but file gone - rerun with the keybag stage removed from $state)"
+chown 0:0 "$kb"; chmod 0600 "$kb"
+for d in diagnostics:0751 uuidtext:0755; do
+	dm=${d#*:}; d=${d%:*}
+	m=$mnt/private/var/db/$d/.migrated
+	[[ -d $mnt/private/var/db/$d ]] || install -d -o 272 -g 272 -m "$dm" "$mnt/private/var/db/$d"
+	[[ -f $m ]] || install -o 272 -g 272 -m 0644 /dev/null "$m"
+	chmod 0644 "$m"
+done
+say "boot set enforced"
+have_stage bootset || mark bootset
 
 # --- verify before unmount -------------------------------------------------
+
 step "verify the volume content"
 for p in System/Library/CoreServices/SystemVersion.plist \
 	private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld \
@@ -387,10 +453,13 @@ say "files $files, $used B in blocks, $apparent B apparent (hard links counted t
 (( files > 180000 )) || die "only $files files on the volume, expected > 180000"
 (( used > 11000000000 )) || die "only $used B allocated, expected > 11e9"
 
-# The ordered launchd first-run set, checked independently of this script. It
-# must reach "ready to boot" or the boot is not worth the round trip.
-step "launchd first-run set (tooling/34-check-bootstrap.sh)"
-"$here/34-check-bootstrap.sh" "$mnt" --quiet || die "bootstrap set not ready (see 34-check-bootstrap.sh)"
+# The ordered launchd first-run set AND the image bytes, checked independently
+# of this script, in one command: 36 runs 35 (image against the DMG reference)
+# and 34 (the set against the live mount). Either leg failing stops here, ahead
+# of the unmount and before any boot.
+step "populated volume (tooling/36-validate-populated-root.sh)"
+"$here/36-validate-populated-root.sh" "$img" --reference-split "$work" --root "$mnt" || \
+	die "populated volume not ready (see tooling/36-validate-populated-root.sh)"
 if [[ $link == ln ]]; then
 	[[ "$(stat -c %h "$mnt/System/Library/Caches/com.apple.dyld"/* | sort -u | tr '\n' ' ')" == "2 "* ]] || \
 		echo "warning: dyld cache files are not hard-linked" >&2

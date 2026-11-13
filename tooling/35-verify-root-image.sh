@@ -85,6 +85,7 @@ while (($#)); do
 	--limit) limit=${2:-}; shift 2 || usage ;;
 	--keep) keep=1; shift ;;
 	--no-fsck) do_fsck=0; shift ;;
+	--mounted) mounted=1 ;;   # the volume is live: dirty bits are expected
 	--reader) BIN=${2:-}; shift 2 || usage ;;
 	-h | --help) usage ;;
 	-*) printf '%s: unknown option %s\n' "$PROG" "$1" >&2; usage ;;
@@ -112,7 +113,12 @@ ref=$(cd "$ref" && pwd)
 # plus the patch that exposes the two hard link fields its public API drops
 # (fdType and the BSD "special" word). Rebuilt when the binary is gone.
 build_reader() {
-	command -v cargo >/dev/null || die "no cargo, cannot build the reader (or pass --reader)" 3
+	# sudo resets PATH, so a user-installed cargo is not on it; look were it
+	# actually is before giving up.
+	for c in cargo "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo; do
+		command -v "$c" >/dev/null 2>&1 && { CARGO=$c; break; }
+	done
+	[ -n "${CARGO:-}" ] || die "no cargo, cannot build the reader (or pass --reader)" 3
 	local src
 	src=$(ls -d "$HOME"/.cargo/registry/src/*/hfsplus-"$CRATE_VER" 2>/dev/null | head -1)
 	[[ -n $src ]] || die "hfsplus $CRATE_VER missing from the cargo registry" 3
@@ -344,7 +350,7 @@ build_reader() {
 	    );
 	}
 	EOF
-	( cd "$b" && cargo build --release --offline --quiet ) || die "reader build failed" 3
+	( cd "$b" && "$CARGO" build --release --offline --quiet ) || die "reader build failed" 3
 	mkdir -p "$SUITE/bin"
 	install -m 0755 "$b/target/release/hfsinv" "$BIN"
 }
@@ -382,8 +388,10 @@ else
 	vfail=1
 fi
 if (((16#$attrs & 0x100) != 0)); then say "   unmounted bit    set                              ok"
+elif (( ${mounted:-0} )); then say "   unmounted bit    clear                            note  (mounted)"
 else say "   unmounted bit    clear                            FAIL  (volume not cleanly unmounted)"; vfail=1; fi
-if (((16#$attrs & 0x800) != 0)); then say "   inconsistent     set                              FAIL  (kHFSBootVolumeInconsistent)"; vfail=1
+if (((16#$attrs & 0x800) != 0)); then
+	if (( ${mounted:-0} )); then say "   inconsistent     set                              note  (mounted)"; else say "   inconsistent     set                              FAIL  (kHFSBootVolumeInconsistent)"; vfail=1; fi
 else say "   inconsistent     clear                             ok"; fi
 if (((16#$attrs & 0x2000) != 0)); then say "   journaled        set (mkfs -J)"; else note "journaled bit clear"; fi
 if [[ $bs =~ ^[0-9]+$ ]] && ((bs >= 512 && bs <= 65536)); then say "   block size       $bs"

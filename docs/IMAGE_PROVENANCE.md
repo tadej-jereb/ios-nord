@@ -338,8 +338,29 @@ journal is always written, so an HFS root cannot mount without them.
 | image | Image sha256 | payload | result |
 |---|---|---|---|
 | `out-pay/p7` | `3e3a84e5…` | `fdb4a8f3…`, cmdline = p6 | pending. First kernel with the bounded mountroot retry, GPT bound check and the UFS write fixes; a mount failure now has a deadline instead of looping. |
+| `out-pay/p8` | `3e3a84e5…` (Image and shim identical to p7) | `6c66d706…`, cmdline = p7 **+ `launchd_log_serial=1 launchd_disable_all_timeouts=1`** | pending. Same `Image`, same ADT (`435d4407…`, `avicii/shim/out-pay/pay0/avicii.adt`) and same shim as p7: the only difference to `out-pay/pay0/payload-p7.bin` is 77 bytes inside the cmdline field, so a p7 result carries over and only the two flags' own effect is new — and neither flag is kernel-side (`docs/LAUNCHD_BOOTSTRAP.md` §2). The boot line: |
+
+    BUILD:  DTB=$PWD/avicii/shim/hybrid/sections/dtb-stock DIAG_STAGE=0 DIAG_LOG=1 OUT=$PWD/avicii/shim/out-pay/p8 \
+            ./avicii/shim/build.sh $PWD/avicii/shim/out-pay/pay0/payload-p8.bin
+    IMAGE:  avicii/shim/out-pay/p8/shim-boot.img  sha256 86c5aebdb46d26370ae29a457346b9883b5ddba1137c990b3b9fe38777012c22
+    BOOT:   fastboot boot avicii/shim/out-pay/p8/shim-boot.img
+
+Full cmdline, p7's with the two flags inserted before `-v` (144 -> 196 of 608 bytes):
+
+    sweetsmp=1 cpus=8 sweettouch=0 sweetkeys=0 sweetfb_console=1 sweetecon=1 rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 launchd_log_serial=1 launchd_disable_all_timeouts=1 -v debug=0x144 keepsyms=1
+
+Gate before this boot, on the host, on the populated but unbooted image — both
+legs must say pass and it must print `READY TO BOOT`:
+
+    tooling/36-validate-populated-root.sh build/ios16-root.img <DMG reference tree> --ref-mount <apfs-fuse OS mount>
+
+Expect on the ring: p7's record plus launchd's own console records after
+`load_init_program: attempting to load /sbin/launchd`; launchd stops being
+killed after seconds (SIGKILLTimeout 600 s) if it stalls.
 
 CI note: the run is red only because `make install` aborts in `lldbmacros` (Python relative
 imports); the kernel had already linked and was collected. The workflow now fails only when no
 Mach-O is produced. The 131 MB `.a` still keeps the kernel dir out of git.
+
+| `out-pay/p9` | `3e3a84e5…` (shim unchanged) | `0x180000000`/`0xfff00000` | p8 cmdline | pending. **First kernel with `0104`**: takes a signed iOS binary past the OSX platform check, so `launchd` may exec instead of being SIGKILLed. payload `sha256 10e2c465…` |
 

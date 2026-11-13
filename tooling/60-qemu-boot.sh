@@ -15,6 +15,12 @@
 #   tooling/60-qemu-boot.sh --ramdisk r.img --cmdline 'rd=md0 -v debug=0x144'
 #   tooling/60-qemu-boot.sh --until 'Waiting on <dict'   # stop at the ladder point
 #   tooling/60-qemu-boot.sh --gdb                # halt at entry, stub on :1234
+#   tooling/60-qemu-boot.sh --view               # open screen.png when done
+#
+# Every run that dumps fb.raw also renders it (python3 stdlib only) to
+# screen.png (1080x2400 RGB) and screen-half.png (540x1200, every 2nd pixel:
+# the 2x-scaled fbcon font comes back at its native 8x16, still legible).
+# --view opens screen.png with xdg-open, else gwenview, else eog.
 #
 # Kernel debug session (the reason to do this at all). QEMU gets
 # "-S -gdb tcp::1234"; print the run's own "guest:" line for the addresses:
@@ -55,6 +61,7 @@ OUTDIR=""
 GDB=0
 UART0=0
 KEEP=0
+VIEW=0
 UNTIL=""
 RAMDISK=""
 
@@ -71,7 +78,8 @@ while [ $# -gt 0 ]; do
 	--gdb) GDB=1; shift ;;
 	--uart0) UART0=1; shift ;;
 	--keep) KEEP=1; shift ;;
-	-h | --help) sed -n '2,44p' "$0"; exit 0 ;;
+	--view) VIEW=1; shift ;;
+	-h | --help) sed -n '2,47p' "$0"; exit 0 ;;
 	*) echo "error: unknown argument $1" >&2; exit 1 ;;
 	esac
 done
@@ -214,8 +222,20 @@ root, _ = adt.parse(open(f"{out}/avicii-qemu.adt", "rb").read())
 pram = struct.unpack_from("<Q", next(c for c in root.children if c.name == "pram").prop("reg"))[0]
 
 mon = f"{out}/mon.sock"
+# DISPLAY=none is the headless loop (the screen comes back as fb.raw +
+# screen.txt). DISPLAY=gtk opens a window on $DISPLAY, DISPLAY=vnc:N serves the
+# same screen over VNC - both keep the decoded artifacts.
+disp = os.environ.get("DISPLAY", "").strip()
+if not disp or disp == "none":
+    disp_args = ["-nographic"]
+elif disp.startswith("vnc:"):
+    disp_args = ["-display", f"vnc:{disp[4:]}"]
+else:
+    # ":0" and friends are X displays, not QEMU display names - QEMU's own name
+    # for a host window is gtk, and it reads $DISPLAY itself.
+    disp_args = ["-display", "gtk" if disp.startswith(":") else disp]
 cmd = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-cpu", "cortex-a76",
-       "-smp", str(smp), "-m", "4G", "-nographic",
+       "-smp", str(smp), "-m", "4G", *disp_args,
        "-serial", f"file:{out}/serial.txt", "-qmp", f"unix:{mon},server,nowait",
        "-d", "int,guest_errors", "-D", f"{out}/qemu.log", "-no-reboot",
        "-device", f"loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on",
@@ -422,6 +442,62 @@ if not keep:
 sys.exit({"panic": 2, "timeout_printing": 3}.get(result["status"], 0))
 PY
 rc=$?
+
+# --- 4. fb.raw -> screen.png / screen-half.png (stdlib zlib, no PIL/numpy) ----
+if [ -r "$OUTDIR/fb.raw" ]; then
+	python3 - "$OUTDIR" <<'PY' || echo "warning: PNG render failed" >&2
+import struct, sys, zlib
+
+out = sys.argv[1]
+W, H, STRIDE = 1080, 2400, 4320           # a8r8g8b8 LE: bytes B,G,R,A
+raw = open(f"{out}/fb.raw", "rb").read()
+
+
+def png(path, w, h, rows):
+	def chunk(tag, data):
+		return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+	body = bytearray()
+	for row in rows:
+		body += b"\0" + row                   # filter type 0
+	with open(path, "wb") as f:
+		f.write(b"\x89PNG\r\n\x1a\n")
+		f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+		f.write(chunk(b"IDAT", zlib.compress(bytes(body), 6)))
+		f.write(chunk(b"IEND", b""))
+
+
+def rgb(line, step):
+	px = line[0::4 * step], line[1::4 * step], line[2::4 * step]   # B, G, R
+	n = len(px[0])
+	o = bytearray(3 * n)
+	o[0::3], o[1::3], o[2::3] = px[2], px[1], px[0]
+	return o
+
+
+h = min(H, len(raw) // STRIDE)
+if h == 0:
+	sys.exit("fb.raw is empty")
+full = [rgb(raw[y * STRIDE:y * STRIDE + 4 * W], 1) for y in range(h)]
+png(f"{out}/screen.png", W, h, full)
+half = [rgb(raw[y * STRIDE:y * STRIDE + 4 * W], 2) for y in range(0, h, 2)]
+png(f"{out}/screen-half.png", W // 2, len(half), half)
+print(f"screen: {out}/screen.png ({W}x{h}), {out}/screen-half.png ({W // 2}x{len(half)})")
+PY
+fi
+
+if [ "$VIEW" = 1 ]; then
+	if [ ! -r "$OUTDIR/screen.png" ]; then
+		echo "warning: --view: no screen.png to open" >&2
+	elif command -v xdg-open >/dev/null; then
+		xdg-open "$OUTDIR/screen.png" >/dev/null 2>&1 &
+	elif command -v gwenview >/dev/null; then
+		gwenview "$OUTDIR/screen.png" >/dev/null 2>&1 &
+	elif command -v eog >/dev/null; then
+		eog "$OUTDIR/screen.png" >/dev/null 2>&1 &
+	else
+		echo "warning: --view: no xdg-open, gwenview or eog" >&2
+	fi
+fi
 
 case $rc in
 0) echo "ok: reached the target point, no panic (logs/qemu, result.json)" ;;
