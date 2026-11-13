@@ -130,11 +130,13 @@ jobs:
             echo "applied $n: $file"
           done < ../../xnu-avicii/series
           echo "$n patches applied in series order"
-          # Nothing may be left in the dir build.sh globs, or it would try to
-          # re-apply and warn.
-          if compgen -G "../patches/*.patch" >/dev/null; then
-            echo "::error::dxb/patches is not empty; build.sh would apply patches twice"
-            exit 1
+          # build.sh globs ../patches for a 13.5 build: it would re-run the same
+          # stage scripts and re-apply the upstream .patch files this series
+          # already carries. Move them out of its glob rather than deleting them.
+          if [ -n "$(ls -A ../patches 2>/dev/null)" ]; then
+            mkdir -p ../patches-upstream
+            mv ../patches/* ../patches-upstream/
+            echo "moved $(ls -A ../patches-upstream | wc -l) upstream entries out of dxb/build.sh's glob"
           fi
 
       - name: Dry-run summary
