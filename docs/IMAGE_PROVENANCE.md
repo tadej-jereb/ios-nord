@@ -291,3 +291,45 @@ Reproducing a sha256 from the commit does not work: `build.sh` regenerates the e
 each time (`cpio` writes ino/mtime), so only the kernel section is stable. Rebuilt
 `EXTRA_CFLAGS=-DSEC_ENTRY_REAL` for `l17`: `Image` byte-identical (`0afdece8…`), `shim-boot.img`
 differs. Compare `Image`, not the boot image, when re-checking a rebuild.
+
+## Phase 2 — XNU payload boots
+
+Payload boots jump into xnu; the shim never resets, so every entry is `fastboot boot`,
+`DIAG_STAGE=0`, and the panel is the only channel until the ring (`p3`) and the UFS pull do
+the reporting. Kernel artifact in all entries: `out/kernel/kernel.development.sweet`,
+`sha256 c5565e1d…` (CI download). ADT from `avicii-live` extents, `--fdt-json logs/mem-live.json`.
+
+| image | Image sha256 | payload phys/mem | cmdline delta | result |
+|---|---|---|---|---|
+| `out-payload/p1` | `fb5c85c7…` | `0x180000000`/`0xfff00000` | none (empty ramdisk) | jump, no evidence: base 0x8000 vs payload 0x80000, kernel copied with MMU on |
+| `out-payload/p2` | `0d40342d…` | `0x180000000`/`0xfff00000` | none (loader copies, MMU off) | **booted blind**: loader ran to its jump, XNU tore down the panel, no ring record, no kernel output, parked in recovery (`HEAD:c2ed4d25…`) |
+| `out-pay/p3` | `774764bd…` | `0x180000000`/`0xfff00000` | `-v debug=0x144` | **booted to `dlil_init`**: full loader, Mach/BSD init, AMFI/sandbox stand-ins, HFS, `wbinit` 164 MB pool, then `dlil_init: Waiting for all the created dlil kernel threads to get scheduled…` and hung. `cpus=1`/`sweetsmp=0`, all CPU nubs skipped. Panel photo `photos/p3-panel.jpg`. USB dies at the jump, no adb: ring unreachable until a manual reset. Ring pulled (`logs/p3-ring.bin`, text `logs/p3-ring.txt`): `/chosen` carries `linux,initrd-start=0xb6e2b000`/`-end=0xb7dfed90` (payload present, hypothesis 2 dead), 10 segments copied at `0x180000000`, `BOOTARG pa=0x1824c800`, last line `JUMP 0x18148c488` |
+
+`p3` = ring on the payload path (`dlog_init` in `shim_main`), a line per loader step, `/chosen`
+dump, and `dlog_last("ENTRYPA …")` with the header deliberately left stale. All three only
+change what is recorded, not what is computed: `p3`'s loader arithmetic is `p2`'s.
+| `out-pay/p4` | `774764bd…` (Image identical to p3) | `0x180000000`/`0xfff00000` | `sweetsmp=1 cpus=8` | **one CPU was the `dlil` wall**: all eight cores started (`cpu=N mpidr=0xN00 came alive; SGI1 OK`, `8/8 CPUs initialized (SGI1 verified)`), `dlil_init` and the `lo0`/`gif0`/`stf0` scheduling waits all completed, then the kernel stopped at the root-device wait: `Waiting on <dict ID="0"><key>IOProviderClass</key><string>Apple_HFS</string>`. Panel photo `photos/p4-panel.jpg`. Ring pulled (`logs/p4-ring.txt`): same 10 segments, `JUMP`/`ENTRYPA 0x18148c488` last, so the loader side of p3 repeats byte for byte |
+
+`p4` changes only boot args, so `Image` is byte-identical to `p3`; the ramp is in the payload
+(`out-pay/pay0/payload-p4.bin`, `sha256 5d30e60d92bd43cb…`). The ladder already proved PSCI `CPU_ON` returns 0
+for all seven secondaries (`out-diag/l16`, `l17`), so `cpus=8` is the cheap discriminator for
+"one CPU cannot schedule the `dlil` threads" and exercises the GIC/PSCI path `sweetsmp=0` skipped.
+| `out-pay/p5` | `774764bd…` (Image identical to p3/p4) | `0x180000000`/`0xfff00000` | `rd=ufsroot0 ufsroot=userdata` | **UFS read path works end to end**: the SweetUFS driver attached, userdata became BSD disk `ufsroot0` major 1 minor 0, blocks were read, `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature` rejected the ext4 bytes, `mount` retried in a loop. Panel photo `photos/p5-panel.jpg`. payload `sha256 e2e4eb3b…` |
+
+p5's cmdline added only `rd=ufsroot0 ufsroot=userdata`, so it also repeats the loader record of p3/p4.
+
+## Gate: overwrite userdata with an HFSX root volume (destructive)
+
+`userdata` (`sda16`, 108 196 737 024 bytes) currently holds the LineageOS/Magisk data. The
+approved plan puts the iOS root there and accepts losing it; `boot_b` keeps a bootable
+LineageOS. Gate contents: image `build/final-1g.img` (1 GiB, fsck-clean HFSX, volume signature
+`HX` at 0x400, sha256 `d0bdf0fa…`), written to the partition start only — the partition is 100x
+larger, the volume header carries the real size.
+
+    adb exec-out "dd of=/dev/block/sda16 bs=1M conv=fsync" < build/final-1g.img
+| `out-pay/p5` (rerun on the HFSX volume) | `774764bd…` | `0x180000000`/`0xfff00000` | as above | volume header **validated** (no more unknown signature), then `hfs: Initializing the journal (joffset 0x402008 sz 0x600000)` -> `Jnl: b(1,8): do_jnl_io: strategy err 0x1e` (EROFS) -> `journal_create: failed to write journal header` -> mount 22. Panel photo `photos/p5b-panel.jpg` |
+
+Root cause of the 0x1e: writes are opt-in, `ufsrw=1` (patch 0030) and `rootrw=1` (patch 0031). The
+journal is always written, so an HFS root cannot mount without them.
+| `out-pay/p6` | `774764bd…` (Image identical) | `0x180000000`/`0xfff00000` | `+ ufsrw=1 rootrw=1` | **ROOT MOUNTED**: journal created through the UFS write path, `hfs: mounted iOSRoot on device ufsroot0`, `root volume is not authenticated (error 25); continuing`, devfs mounted, `POST boot-arg set`, `Swap Subsystem is ON`, then `load_init_program: opening of /sbin/launchd failed, errno 2` (volume is empty) and a panic that flushed 6392 bytes into the ring. payload `sha256 86b63c89…`, panel photo `photos/p6-panel.jpg` |
+

@@ -1,3 +1,11 @@
+# Status — 2026-11-13, first userland rung
+
+Read `HANDOFF-CLAUDE-USERLAND.md`. The loader blindness, the jump and the boot chain are
+closed; `docs/IMAGE_PROVENANCE.md` is the boot log of record for p1-p6. The wall is the empty
+root volume: the kernel mounts it and panics on the missing `/sbin/launchd`. Populate the
+image (`tooling/33b`, no sudo) and validate it (`tooling/34-check-bootstrap.sh`) before the
+next boot.
+
 # Status — 2026-11-11 (evening), host preparation
 
 Bootloader unlock is planned for **2026-11-12**. Until then: no device writes, only host-side

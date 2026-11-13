@@ -12,3 +12,5 @@ build/
 __pycache__/
 *.adt
 *.dtb
+avicii/shim/out/
+avicii/shim/out-*/
