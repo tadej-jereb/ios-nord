@@ -28,7 +28,7 @@
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
-@@ -256,6 +268,467 @@ touch_irq(void)
+@@ -256,6 +268,594 @@ touch_irq(void)
  	return st.irq_last;
  }
  
@@ -493,10 +493,137 @@
 +	return 0;
 +}
 +
++
++/*
++ * ---- touch 1.8 V enable: PM8150L GPIO 1 over SPMI ----
++ * Live FDT Goodix node: enable1v8_gpio = <&pm8150l_gpios 1 1>, and
++ * pm8150l_gpios is qcom,pm8150l@4 pinctrl@c000. The OnePlus touchpanel driver
++ * drives it with the legacy gpio API (value 1, active-low flag ignored). qcom
++ * spmi-gpio LV/MV (pinctrl-spmi-gpio.c): MODE_CTL 0x40 = 1 digital output,
++ * DIG_OUT_SOURCE_CTL 0x44 bit 7 = output value, EN_CTL 0x46 bit 7 = enable.
++ * PMIC arbiter v5 (spmi-pmic-arb.c, live FDT reg-names): core 0xc440000,
++ * chnls 0xc600000 (0x10000 per APID), obsrvr 0xe600000, cnfg 0xc40a000;
++ * EXT_WRITEL opcode 0, cmd = opc << 27 | (addr & 0xff) << 4 | bc. Only written
++ * when EE 0 owns the APID and the peripheral reads back as a GPIO LV/MV.
++ */
++#define T18_CORE_PA      0x0c440000u
++#define T18_CHNL_PA      0x0c600000u
++#define T18_OBS_PA       0x0e600000u
++#define T18_CNFG_PA      0x0c40a000u
++#define T18_PPID         0x4c0u     /* SID 4, peripheral 0xc0 = gpio 1 */
++
++static vm_offset_t t18_core, t18_obs, t18_cnfg, t18_chnl;
++static unsigned t18_apid = 0xffffu;
++
++static int
++t18_read(uint8_t reg, uint8_t *out)
++{
++	uint32_t off = 0x80u * t18_apid;
++	touch_wr(t18_obs, off, (1u << 27) | ((uint32_t)reg << 4));
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t stat = touch_rd(t18_obs, off + 0x08u);
++		if (stat & 1u) {
++			if (stat & 0x0eu) {
++				return EIO;
++			}
++			*out = (uint8_t)touch_rd(t18_obs, off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++t18_write(uint8_t reg, uint8_t val)
++{
++	touch_wr(t18_chnl, 0x10u, val);
++	touch_wr(t18_chnl, 0x00u, ((uint32_t)reg << 4));
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t stat = touch_rd(t18_chnl, 0x08u);
++		if (stat & 1u) {
++			return (stat & 0x0eu) ? EIO : 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++touch_enable_1v8(bool write)
++{
++	t18_core = ml_io_map(T18_CORE_PA, 0x2000);
++	t18_obs = ml_io_map(T18_OBS_PA, 0x10000);
++	t18_cnfg = ml_io_map(T18_CNFG_PA, 0x1000);
++	if (!t18_core || !t18_obs || !t18_cnfg) {
++		printf("SWEET TOUCH: 1v8 SPMI mapping failed\n");
++		return;
++	}
++	uint32_t ver = touch_rd(t18_core, 0), count = touch_rd(t18_core, 4) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || !count || count > 512) {
++		printf("SWEET TOUCH: 1v8 unsupported SPMI arb %#x/%u\n", ver, count);
++		return;
++	}
++	unsigned owner = 7;
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t map = touch_rd(t18_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != T18_PPID) {
++			continue;
++		}
++		unsigned own = touch_rd(t18_cnfg, 0x700u + 4u * i) & 7u;
++		if (t18_apid == 0xffffu || own == 0) {
++			t18_apid = i;
++			owner = own;
++		}
++	}
++	if (t18_apid == 0xffffu) {
++		printf("SWEET TOUCH: 1v8 PM8150L gpio1 not mapped in the arbiter\n");
++		return;
++	}
++	uint8_t sub = 0, mode = 0, out = 0, en = 0, st = 0;
++	int e = t18_read(0x05, &sub) | t18_read(0x40, &mode) | t18_read(0x44, &out) |
++	    t18_read(0x46, &en) | t18_read(0x08, &st);
++	printf("SWEET TOUCH: 1v8 gpio1 apid %u owner %u err %d subtype %#x mode %#x out %#x en %#x status %#x\n",
++	    t18_apid, owner, e, sub, mode, out, en, st);
++	if (e || sub < 0x10 || sub > 0x13) {
++		printf("SWEET TOUCH: 1v8 not a readable LV/MV GPIO; left alone\n");
++		return;
++	}
++	if ((mode & 3u) == 1u && (out & 0x80u) && (en & 0x80u)) {
++		printf("SWEET TOUCH: 1v8 already driven high\n");
++		return;
++	}
++	if (!write) {
++		printf("SWEET TOUCH: 1v8 off; sweettouch1v8=1 drives it\n");
++		return;
++	}
++	if (owner != 0) {
++		printf("SWEET TOUCH: 1v8 APID owned by EE %u; no write\n", owner);
++		return;
++	}
++	t18_chnl = ml_io_map(T18_CHNL_PA + 0x10000u * t18_apid, 0x1000);
++	if (!t18_chnl) {
++		printf("SWEET TOUCH: 1v8 channel mapping failed\n");
++		return;
++	}
++	gsi_step("1v8 write");
++	int w = t18_write(0x44, 0x80);
++	if (!w) {
++		w = t18_write(0x40, 0x01);
++	}
++	if (!w) {
++		w = t18_write(0x46, 0x80);
++	}
++	(void)t18_read(0x40, &mode), (void)t18_read(0x44, &out);
++	(void)t18_read(0x46, &en), (void)t18_read(0x08, &st);
++	printf("SWEET TOUCH: 1v8 write err %d -> mode %#x out %#x en %#x status %#x\n",
++	    w, mode, out, en, st);
++}
++
  /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
  static int
  touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
-@@ -264,6 +737,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -264,6 +864,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
  		return EIO;
  	}
@@ -506,7 +633,7 @@
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
  		st.dead = true; /* no other SE7 owner is supported */
  		return EBUSY;
-@@ -556,6 +1032,12 @@ touch_se_init(void)
+@@ -556,6 +1159,12 @@ touch_se_init(void)
  	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
  	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
  	    touch_rd(st.se, 0x908));
@@ -519,7 +646,7 @@
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
  	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
  	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-@@ -644,22 +1126,44 @@ touch_thread(void *arg, wait_result_t result)
+@@ -644,22 +1253,48 @@ touch_thread(void *arg, wait_result_t result)
  	 * (lito.dtsi:3998-3999). "ldo13" is the live-tree resource spelling,
  	 * "ldoa13" the DT one: retry the second if the cmd-db lookup misses.
  	 */
@@ -556,6 +683,10 @@
  		goto out;
  	}
 -	touch_gpio(90, 0, 0, 0, true, true); /* SOUTH pin, UNVERIFIED on avicii */
++	unsigned en18 = 0;
++	(void)PE_parse_boot_argn("sweettouch1v8", &en18, sizeof(en18));
++	touch_enable_1v8(en18 != 0);
++	gsi_step("1v8 done");
 +	/* GPIO 90 "board enable" is inherited from sweet; avicii's DT has no such
 +	 * property, so it is driven only on request (sweettouchgpio90=1). */
 +	unsigned g90 = 0;
@@ -570,7 +701,7 @@
  	/* Vendor GT9886 dev_confirm: reset low 2 ms, then high. */
  	touch_gpio(8, 0, 3, 3, true, false);
  	touch_wait(2);
-@@ -672,8 +1176,9 @@ touch_thread(void *arg, wait_result_t result)
+@@ -672,8 +1307,9 @@ touch_thread(void *arg, wait_result_t result)
  	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
  	    st.irq_status);
  	(void)touch_probe_info(0x8240, legacy);
