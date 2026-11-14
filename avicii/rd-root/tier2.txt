@@ -1,0 +1,133 @@
+# Lane 9 - tier-2 program set for tooling/61-mkrd-root.sh --programs.
+#
+# Sources, all verified by stat on the mounted read-only DMGs
+# (build/ipsw-x/087-86698-044.dmg OS + 087-86593-047.dmg SystemOS), not from the phone:
+#
+#   1. the 12 paths of avicii/rd-root/tier1.txt, repeated so the tier-2 root is a
+#      superset of the root that booted at logs/qemu/20261114-103445-kern0105
+#      (launchd, usermanagerd, lockdownd, logd, notifyd, keybagd, configd,
+#      UserEventAgent all exec there);
+#   2. the 62 of the 64 'SWEET EXEC: <path> failed errno 2' Programs of that run
+#      that exist in the OS DMG. Two of the 64 do not exist in either DMG and are
+#      left out on purpose: /usr/appleinternal/sbin/launchd.development (no
+#      /usr/appleinternal at all in 20H392) and /usr/libexec/HorizonSetup (an
+#      iOS 17/18 leftover, docs/RAMDISK_ROOT.md);
+#   3. the Info.plist of each of the 26 bundles those Programs live in, so a
+#      bundle-relative lookup resolves. 25 exist; AppleCredentialManager.framework
+#      carries no Info.plist in either DMG, so only its Program is staged;
+#   4. /usr/libexec/dhcp6d - small, on-demand, staged although it may never run.
+#      /usr/sbin/sntpd and /usr/sbin/syslogd do not exist in the OS DMG under any
+#      name probed (/usr/libexec/sntpd also absent); syslogd is in tier1.txt and
+#      /usr/libexec/logd_helper is in the 62.
+#
+# Everything below is an absolute path in the guest; '#' starts a comment.
+
+# --- 1. tier-1 (the set that booted) ---------------------------------------
+/usr/libexec/logd
+/usr/sbin/notifyd
+/usr/libexec/configd
+/usr/libexec/UserEventAgent
+/usr/libexec/securityd
+/usr/libexec/lockdownd
+/usr/sbin/mDNSResponder
+/usr/sbin/syslogd
+/usr/libexec/diagnosticd
+/System/Library/SystemConfiguration
+/System/Library/UserEventPlugins
+/System/Library/Lockdown
+
+# --- 2. the 62 exec-failed Programs of 20261114-103445 ----------------------
+/System/Library/CoreServices/SpringBoard.app/SpringBoard
+/usr/libexec/sharingd
+/usr/libexec/remoted
+/usr/libexec/locationd
+/usr/sbin/mediaserverd
+/usr/libexec/amfid
+/usr/libexec/DumpPanic
+/usr/libexec/watchdogd
+/usr/libexec/nfcd
+/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd
+/usr/libexec/thermalmonitord
+/usr/libexec/backboardd
+/usr/libexec/timed
+/System/Library/PrivateFrameworks/IMCore.framework/imagent.app/imagent
+/usr/libexec/driverkitd
+/System/Library/PrivateFrameworks/SleepDaemon.framework/sleepd
+/usr/libexec/ptpd
+/usr/sbin/distnoted
+/System/Library/PrivateFrameworks/AppleCredentialManager.framework/AppleCredentialManagerDaemon
+/usr/libexec/rapportd
+/usr/libexec/mtmergeprops
+/usr/sbin/bluetoothd
+/usr/sbin/fairplayd.H2
+/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter
+/usr/bin/IOMFB_FDR_Loader
+/usr/libexec/fseventsd
+/System/Library/PrivateFrameworks/MobileTimer.framework/Executables/mobiletimerd
+/usr/libexec/containermanagerd
+/usr/libexec/logd_helper
+/System/Library/Frameworks/HealthKit.framework/healthd
+/usr/libexec/wcd
+/System/Library/CoreServices/powerd.bundle/powerd
+/usr/libexec/routined
+/System/Library/PrivateFrameworks/MobileAccessoryUpdater.framework/Support/accessoryupdaterd
+/System/Library/PrivateFrameworks/NanoPreferencesSync.framework/nanoprefsyncd
+/usr/libexec/remindd
+/usr/libexec/misd
+/usr/libexec/peakpowermanagerd
+/System/Library/PrivateFrameworks/MediaRemote.framework/Support/mediaremoted
+/System/Library/PrivateFrameworks/BiomeStreams.framework/Support/biomed
+/System/Library/PrivateFrameworks/CoreDuetContext.framework/Resources/contextstored
+/System/Library/PrivateFrameworks/AssistantServices.framework/assistantd
+/usr/libexec/safetyalertsd
+/System/Library/PrivateFrameworks/AppleMediaServices.framework/amsaccountsd
+/System/Library/PrivateFrameworks/FamilyNotification.framework/familynotificationd
+/usr/libexec/dasd
+/usr/libexec/bluetoothuserd
+/System/Library/PrivateFrameworks/PassKitCore.framework/passd
+/usr/libexec/runningboardd
+/System/Library/PrivateFrameworks/People.framework/peopled
+/System/Library/PrivateFrameworks/TCC.framework/Support/tccd
+/System/Library/PrivateFrameworks/MapsSupport.framework/navd
+/System/Library/PrivateFrameworks/AggregateDictionary.framework/Support/aggregated
+/usr/libexec/cloudpaird
+/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated
+/System/Library/Frameworks/ManagedSettings.framework/ManagedSettingsAgent
+/usr/libexec/atc
+/usr/sbin/WirelessRadioManagerd
+/System/Library/PrivateFrameworks/AskPermission.framework/Support/askpermissiond
+/System/Library/PrivateFrameworks/AXAssetLoader.framework/Support/axassetsd
+/usr/libexec/seld
+/System/Library/CoreServices/OTACrashCopier
+
+# --- 3. bundle Info.plists for the 26 framework/bundle-hosted Programs -----
+/System/Library/CoreServices/SpringBoard.app/Info.plist
+/System/Library/PrivateFrameworks/IDS.framework/Info.plist
+/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/Info.plist
+/System/Library/PrivateFrameworks/IMCore.framework/Info.plist
+/System/Library/PrivateFrameworks/IMCore.framework/imagent.app/Info.plist
+/System/Library/PrivateFrameworks/SleepDaemon.framework/Info.plist
+/System/Library/Frameworks/CoreTelephony.framework/Info.plist
+/System/Library/PrivateFrameworks/MobileTimer.framework/Info.plist
+/System/Library/Frameworks/HealthKit.framework/Info.plist
+/System/Library/CoreServices/powerd.bundle/Info.plist
+/System/Library/PrivateFrameworks/MobileAccessoryUpdater.framework/Info.plist
+/System/Library/PrivateFrameworks/NanoPreferencesSync.framework/Info.plist
+/System/Library/PrivateFrameworks/MediaRemote.framework/Info.plist
+/System/Library/PrivateFrameworks/BiomeStreams.framework/Info.plist
+/System/Library/PrivateFrameworks/CoreDuetContext.framework/Info.plist
+/System/Library/PrivateFrameworks/AssistantServices.framework/Info.plist
+/System/Library/PrivateFrameworks/AppleMediaServices.framework/Info.plist
+/System/Library/PrivateFrameworks/FamilyNotification.framework/Info.plist
+/System/Library/PrivateFrameworks/PassKitCore.framework/Info.plist
+/System/Library/PrivateFrameworks/People.framework/Info.plist
+/System/Library/PrivateFrameworks/TCC.framework/Info.plist
+/System/Library/PrivateFrameworks/MapsSupport.framework/Info.plist
+/System/Library/PrivateFrameworks/AggregateDictionary.framework/Info.plist
+/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Info.plist
+/System/Library/Frameworks/ManagedSettings.framework/Info.plist
+/System/Library/PrivateFrameworks/AskPermission.framework/Info.plist
+/System/Library/PrivateFrameworks/AXAssetLoader.framework/Info.plist
+
+# --- 4. small on-demand extra ---------------------------------------------
+/usr/libexec/dhcp6d
