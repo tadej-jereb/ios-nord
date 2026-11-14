@@ -578,3 +578,4 @@ after **`a2e11e3edff9997b60a11c688f71df7fa54c97d49ba225ac21a061d3f3fcea0c`** (al
 
 Phone images are built with `tooling/71-phone-image.sh` from here on (presets `gui`, `touch`,
 `console`, `noinput`; it refuses `sweetfb_console=1` in a GUI preset).
+| `logs/phone/20261114-194619-0110f-touch` | `build/phone/ufsroot.0110f-touch.img` (kernel `kernel-0110f`, CI `43633047407`; `tooling/71-phone-image.sh --preset touch`: `sweettouch=1 sweettouchdelay=45 sweettouchrails=2 sweettouch1v8=1 sweetkeys=1`) | `d484eab4…56e2` | **TOUCH WORKS** (owner, 2026-11-14 ~19:50 UTC). Chain that got there: SE7 FIFO interface disabled → GPI DMA through apps_smmu cb + SIDs 0x36/0x23 (`0110`); L13 3.0 V voted on HLOS's own RSC DRV2 at 0x18220000 with in-place cmd-db (`0111`); PM8150L GPIO 1 (enable1v8) driven high over SPMI; GT9886 protocol per OnePlus's driver (ID 0x452C, frames 0x4100, LE points, 8-bit zero sum) |
