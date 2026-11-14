@@ -1,3 +1,27 @@
+# Status — 2026-11-14, dyld shared cache maps (QEMU)
+
+Read `HANDOFF-HERMES-ETC.md`. The dyld wall (`Library not loaded: /usr/lib/libSystem.B.dylib
+… (no such file, no dyld cache)`) is closed in QEMU, run `logs/qemu/20261114-070727`.
+
+- Cause: the kernel refused the cache, it did not fail to find it. Without trust caches XNU
+  maps a shared cache only when it is owned by uid 0 (`bsd/vm/vm_unix.c` `root_check`), and
+  `build/rd-root.img` carried the cache hard links as `1000:1000` (`tooling/61` built it
+  unprivileged; fstool cannot chown a hard link). Kernel log:
+  `map('dyld_shared_cache_arm64'): owned by uid=1000 instead of 0`.
+- Fix: `tooling/61-mkrd-root.sh` runs `fstool create` under `fakeroot`, so every record,
+  hard links included, is created `0:0`; its probe now asserts the cache is `0:0`. New
+  `build/rd-root.img` sha256 `5e48f808e018b07bb2d113463606abdc19284523b9291e49f1df5a24269cfa6c`.
+- The phone image is not affected: `build/ios16-root.img` (populated as root by `tooling/33`)
+  has the cache at `0:80`; read-only loop check, sha256 unchanged.
+- Now: all 43 cache files map, libSystem loads, launchd runs to `lo0 127.0.0.1` and exits
+  `namespace 7 subcode 0x1: unable to resolve 'mobile': 114 - The specified username does not
+  exist`. `rd-root.img` has no `/etc`, `/var`, `/tmp` symlinks (the phone image has all three).
+- Kernel log channel: `tooling/60-qemu-boot.sh` now writes `msgbuf.txt` (the kernel message
+  buffer read from guest RAM) and `console_flags.json` after every run. The framebuffer
+  console is blank in the high-framebuffer `--ramdisk` layout (`gc_graphics_boot=1`,
+  `disableConsoleOutput=1`: the kernel boots graphical, only the progress bar draws); with the
+  old layout (`--mem 2592M`, fb `0xa0000000`) text renders. Use `msgbuf.txt`, not `screen.txt`.
+
 # Status — 2026-11-13, first userland rung
 
 Read `HANDOFF-CLAUDE-USERLAND.md`. The loader blindness, the jump and the boot chain are

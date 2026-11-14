@@ -22,7 +22,7 @@
 # mounted read-only through tooling/opt/apfs-fuse, never from the phone.
 #
 # Needs: apfs-fuse (32-build-apfsfuse.sh), tooling/opt/fstool (the patched
-# unprivileged HFS+ writer), fuse3, hfsprogs. No root, no loop device.
+# unprivileged HFS+ writer), fuse3, hfsprogs, fakeroot. No root, no loop device.
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -71,6 +71,7 @@ done
 [[ -x $FSCK ]]      || die "$FSCK missing (apt install hfsprogs)"
 [[ -r /dev/fuse && -w /dev/fuse ]] || die "/dev/fuse not writable by $(id -un)"
 command -v fusermount3 >/dev/null || die "fusermount3 missing (apt install fuse3)"
+command -v fakeroot >/dev/null || die "fakeroot missing (apt install fakeroot)"
 [[ -x $CHECK ]]     || die "no checker at $CHECK"
 for d in "$ipsw/$OS_DMG" "$ipsw/$SYS_DMG"; do
 	[[ -r $d ]] || die "missing $d - run tooling/30-fetch-ipsw.sh"
@@ -243,6 +244,20 @@ else
 	say "cache omitted (--no-cache): dyld will stop with 'Library not loaded'"
 fi
 
+# dyld4 looks for the cache under the cryptex roots (its own string table lists
+# /System/Cryptexes/OS, /private/preboot/Cryptexes/OS and
+# /System/Volumes/Preboot/Cryptexes/OS) before the plain path. The cache here is
+# on this volume, so point those roots at the volume root and the same cache
+# resolves through them too.
+step "cryptex roots pointing at this volume"
+mkdir -p "$stage/System/Cryptexes" "$stage/private/preboot/Cryptexes" \
+	"$stage/System/Volumes/Preboot/Cryptexes"
+for l in System/Cryptexes/OS System/Cryptexes/App private/preboot/Cryptexes/OS \
+	 private/preboot/Cryptexes/App System/Volumes/Preboot/Cryptexes/OS; do
+	ln -sfn / "$stage/$l"
+done
+say "5 cryptex roots -> /"
+
 # ---------------------------------------------------------------------------
 # Size. The image is RAM, so it is sized tight: 112 % of the payload plus
 # 16 MiB covers the 4K block rounding and the catalog for ~150 entries, with
@@ -258,7 +273,12 @@ fi
 
 step "building $out ($size, HFS+, unjournaled 4K)"
 rm -f "$out"
-"$FSTOOL" create --type hfs+ --output "$out" --size "$size" \
+# Under fakeroot the staging tree stats as 0:0, so every catalog record -
+# hard links included - is created root-owned. The shared-cache hard links
+# cannot be chown'ed later (see below), and XNU maps a cache that is not in a
+# trust cache only when it is owned by uid 0 (vm_unix.c root_check: "owned by
+# uid=1000 instead of 0" -> EPERM -> dyld "no dyld cache").
+fakeroot -- "$FSTOOL" create --type hfs+ --output "$out" --size "$size" \
 	-O volume_label=RD-root -O block_size=4096 -O journaled=false "$stage"
 # fstool create cannot chown an HFS+ tree, so the owners go on through a mount.
 mkdir -p "$work/img"
@@ -286,6 +306,9 @@ step "applying owners and modes in the image"
 		# hard links" in fsck). Nothing to do - 0755 from the staging is right.
 		*/Caches/com.apple.dyld/*|private/var/db/.rdcache/*) continue ;;
 	esac
+	# fstool cannot chmod a symlink (EPERM on the link inode); -h still sets
+	# its owner, and 0777 is what HFS gives a link anyway
+	if [[ -L $stage/$p ]]; then chown -h 0:0 "$work/img/$p"; continue; fi
 	chown -h 0:0 "$work/img/$p"
 	chmod "$(stat -c %a "$stage/$p")" "$work/img/$p"
 done
@@ -294,13 +317,13 @@ chown -h 272:272 "$work/img/private/var/db/diagnostics" "$work/img/private/var/d
 chmod 0751 "$work/img/private/var/db/diagnostics"
 chmod 0755 "$work/img/private/var/db/uuidtext"
 # Hard-linked files cannot be chown'ed through fstool (silent no-op, the link
-# attrs are synthetic), so the cache keeps the staging uid; 0755 root:wheel
-# would be the DMG's, 1000:1000 reads the same for every user.
+# attrs are synthetic); they are 0:0 from the fakeroot create above, which is
+# what the kernel's shared-region root_check requires. The probe asserts it.
 
 probes=("sbin/launchd:0:0:755" "private/var/keybags/systembag.kb:0:0:600" \
 	"dev:0:0:555" "private/var/tmp:0:0:1777")
 if (( do_cache )); then
-	probes+=("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64:1000:1000:755")
+	probes+=("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64:0:0:755")
 fi
 
 for probe in "${probes[@]}"; do

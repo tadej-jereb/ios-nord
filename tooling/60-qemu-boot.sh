@@ -55,11 +55,13 @@ KERNEL=${KERNEL:-$repo/avicii/shim/out/kernel/kernel.development.sweet}
 # watchdog (osfmk/arm/machine_routines_common.c) panics at 35 ms otherwise.
 CMDLINE=${CMDLINE:--v debug=0x144 cpus=1 sweetsmp=0 sweettouch=0 sweetkeys=0 sweetecon=1 cpu-factor=10}
 RAMDISK=${RAMDISK:-}
+SHARED_CACHE=${SHARED_CACHE:-}
 SECS=${SECS:-45}
 SMP=${SMP:-1}
 OUTDIR=""
 GDB=0
 UART0=0
+FB=""
 KEEP=0
 VIEW=0
 UNTIL=""
@@ -70,10 +72,14 @@ while [ $# -gt 0 ]; do
 	--kernel) KERNEL=${2:?--kernel needs a Mach-O}; shift 2 ;;
 	--cmdline) CMDLINE=${2:?--cmdline needs a string}; shift 2 ;;
 	--ramdisk) RAMDISK=${2:?--ramdisk needs an image}; shift 2 ;;
+	--shared-cache) SHARED_CACHE=${2:?--shared-cache needs an image}; shift 2 ;;
+	--mem) MEM=${2:?--mem needs a size}; shift 2 ;;
 	--secs) SECS=${2:?--secs needs a number}; shift 2 ;;
 	--smp) SMP=${2:?--smp needs a count}; shift 2 ;;
 	--until) UNTIL=${2:?--until needs a regex}; shift 2 ;;
 	--ramdisk) RAMDISK=${2:?--ramdisk needs an image}; shift 2 ;;
+	--shared-cache) SHARED_CACHE=${2:?--shared-cache needs an image}; shift 2 ;;
+	--mem) MEM=${2:?--mem needs a size}; shift 2 ;;
 	--out) OUTDIR=${2:?--out needs a directory}; shift 2 ;;
 	--gdb) GDB=1; shift ;;
 	--uart0) UART0=1; shift ;;
@@ -83,6 +89,19 @@ while [ $# -gt 0 ]; do
 	*) echo "error: unknown argument $1" >&2; exit 1 ;;
 	esac
 done
+
+# A --ramdisk run carries the whole volume inside the payload, so the RAM it needs
+# has to be reserved: -m for QEMU, --mem-size for the ADT the kernel reads. 256 MiB
+# stays outside both for the framebuffer, the panic log and the stack.
+MEM=${MEM:-${QEMU_MEM:-4G}}
+case $MEM in
+*[Gg]) mem_bytes=$(awk -v n="${MEM%[Gg]}" 'BEGIN{printf "%d", n*1073741824}') ;;
+*[Mm]) mem_bytes=$(awk -v n="${MEM%[Mm]}" 'BEGIN{printf "%d", n*1048576}') ;;
+*) mem_bytes=$MEM ;;
+esac
+(( mem_bytes > 0x20000000 )) || { echo "error: --mem $MEM too small" >&2; exit 1; }
+printf -v MEM_SIZE '0x%x' $(( mem_bytes - 0x10000000 ))
+MEM_BYTES=$mem_bytes
 
 QEMU=${QEMU:-qemu-system-aarch64}
 command -v "$QEMU" >/dev/null || { echo "error: $QEMU not in PATH (apt install qemu-system-arm)" >&2; exit 4; }
@@ -100,24 +119,29 @@ printf '%s\n' "$KERNEL" > "$OUTDIR/kernel.path"
 [ -n "$RAMDISK" ] && printf '%s\n' "$RAMDISK" > "$OUTDIR/ramdisk.path"
 
 # --- 1. ADT for QEMU virt, then relocate it for the host ----------------------
-python3 "$repo/avicii/tools/mkadt_avicii.py" "$OUTDIR/adt.raw" --qemu \
+python3 "$repo/avicii/tools/mkadt_avicii.py" "$OUTDIR/adt.raw" --qemu --mem-size "$MEM_SIZE" \
 	> "$OUTDIR/adt.raw.log" 2>&1 || { echo "error: mkadt_avicii.py --qemu failed" >&2; cat "$OUTDIR/adt.raw.log" >&2; exit 4; }
 
-python3 - "$repo" "$OUTDIR/adt.raw" "$OUTDIR/avicii-qemu.adt" "$UART0" <<'PY' || exit 4
+python3 - "$repo" "$OUTDIR/adt.raw" "$OUTDIR/avicii-qemu.adt" "$UART0" "$MEM_BYTES" <<'PY' || exit 4
 import struct, sys
-repo, src, dst, uart0 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+repo, src, dst, uart0, membytes = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                   sys.argv[4] == "1", int(sys.argv[5]))
 sys.path.insert(0, repo + "/avicii/tools")
 import adt
 
-FB, FB_WINDOW = 0xa0000000, 0x1000000      # 16 MiB maps the 10,368,000 B screen
+FB_WINDOW = 0x1000000                     # 16 MiB maps the 10,368,000 B screen
 PRAM_SIZE = 0x100000
-PRAM = FB + FB_WINDOW
 
 root, _ = adt.parse(open(src, "rb").read())
 chosen = next(c for c in root.children if c.name == "chosen")
 fbcon = next(c for c in root.children if c.name == "sweet-fbcon")
 pram = next(c for c in root.children if c.name == "pram")
 base = struct.unpack("<Q", chosen.prop("dram-base"))[0]
+# The framebuffer has to sit above the payload, and a --ramdisk payload is the
+# whole volume: derive it from the RAM size instead of pinning 0xa0000000, which
+# a 3 GiB ramdisk would run straight through.
+FB = membytes - 0x2000000          # absolute: QEMU RAM starts at 0, dram at base
+PRAM = FB + FB_WINDOW
 
 
 def setprop(node, name, blob):
@@ -140,6 +164,7 @@ if uart0:
 	node.props = [("name", 0, b"uart0\0"), ("reg", 0, struct.pack("<QQ", 0x08000000, 0x1000))]
 	arm_io.children.append(node)
 open(dst, "wb").write(adt.serialize(root))
+open(dst + ".fb", "w").write(f"{FB:#x}\n")
 print(f"adt relocated: dram {base:#x}+{PRAM + PRAM_SIZE - base:#x}, "
       f"fbcon {FB:#x}+{FB_WINDOW:#x}, pram {PRAM:#x}+{PRAM_SIZE:#x}"
       + (", uart0 node added (inert on this kernel)" if uart0 else ""))
@@ -148,22 +173,30 @@ PY
 # --- 2. payload, exactly as the phone gets it --------------------------------
 rdarg=()
 [ -n "$RAMDISK" ] && rdarg=(--ramdisk "$RAMDISK")
+[ -n "${SHARED_CACHE:-}" ] && rdarg+=(--shared-cache "$SHARED_CACHE")
 python3 "$repo/avicii/tools/mkpayload.py" "$KERNEL" "$OUTDIR/avicii-qemu.adt" "$OUTDIR/payload.bin" \
 	--cmdline "$CMDLINE" "${rdarg[@]}" > "$OUTDIR/payload.log" 2>&1 || {
 	echo "error: mkpayload.py failed" >&2; cat "$OUTDIR/payload.log" >&2; exit 4; }
 grep -E '^(virt_base|entry|kernel_end|size):' "$OUTDIR/payload.log"
 
+FB=$(cat "$OUTDIR/avicii-qemu.adt.fb")
+[ -n "$FB" ] || { echo "error: no framebuffer address" >&2; exit 4; }
+
 FONTVA=$("$NM" --defined-only "$KERNEL" | awk '$3 == "_iso_font" { print $1 }')
 [ -n "$FONTVA" ] || { echo "error: kernel has no _iso_font; screen cannot be decoded" >&2; exit 4; }
+# Kernel log channel that does not depend on the framebuffer: after the run the
+# message buffer is read out of guest RAM into msgbuf.txt (see section 3).
+KSYMS=$("$NM" --defined-only "$KERNEL" | awk '$3 ~ /^_(msgbufp|gPhysBase|gVirtBase|disableConsoleOutput|serial_console_enabled|gc_graphics_boot|vc_progress_enable)$/ { printf "%s=%s,", substr($3, 2), $1 }')
 
 # --- 3. guest image, run, dump, decode, verdict ------------------------------
-python3 -u - "$OUTDIR" "$SMP" "$SECS" "$GDB" "$UNTIL" "$FONTVA" "$KEEP" "$repo" <<'PY'
-import json, os, re, socket, struct, subprocess, sys, time
+python3 -u - "$OUTDIR" "$SMP" "$SECS" "$GDB" "$UNTIL" "$FONTVA" "$KEEP" "$repo" "$FB" "$MEM" "$KSYMS" <<'PY'
+import json, mmap, os, re, socket, struct, subprocess, sys, time
 
-out, smp, secs, gdb, until, fontva, keep, REPO = sys.argv[1:9]
+out, smp, secs, gdb, until, fontva, keep, REPO, FB, MEM, KSYMS = sys.argv[1:12]
+KSYMS = {k: int(v, 16) for k, v in (x.split("=") for x in KSYMS.split(",") if x)}
 secs, smp, gdb, keep = float(secs), int(smp), gdb == "1", keep == "1"
-fontva = int(fontva, 16)
-PAGE, STUB_PA, FB, STRIDE, W, H = 0x4000, 0x40200000, 0xa0000000, 4320, 1080, 2400
+fontva, FB = int(fontva, 16), int(FB, 16)
+PAGE, STUB_PA, STRIDE, W, H = 0x4000, 0x40200000, 4320, 1080, 2400
 CMDLINE_OFF, SEG_TABLE = 0x48, 0x2a8
 
 # markers of the boot ladder, in the order the kernel reaches them. sweet_early_mark
@@ -189,7 +222,10 @@ LADDER = [
 PANIC = re.compile(r"PANIC|panic\(|panic:|Assertion failed|no PTE for", re.I)
 target = re.compile(until) if until else None
 
-payload = open(f"{out}/payload.bin", "rb").read()
+# mmap both files: a RAMDisk payload is gigabytes and the bytearray copies of it
+# do not fit in the tool cgroup
+_pf = open(f"{out}/payload.bin", "rb")
+payload = mmap.mmap(_pf.fileno(), 0, access=mmap.ACCESS_READ)
 magic, ver, nsegs = struct.unpack_from("<8sII", payload, 0)
 assert magic == b"SWEETXNU", "not a payload"
 virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
@@ -199,18 +235,46 @@ adt_pa = kernel_end + delta
 ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
 top = ba_pa + PAGE
 
-img = bytearray(top - phys_base)
+_rf = open(f"{out}/ram.bin", "w+b")
+_rf.truncate(top - phys_base)
+img = mmap.mmap(_rf.fileno(), top - phys_base)
+CHUNK = 1 << 25
 for i in range(nsegs):
     vmaddr, vmsize, foff, fsize = struct.unpack_from("<4Q", payload, SEG_TABLE + 32 * i)
     o = vmaddr + delta - phys_base
-    img[o:o + fsize] = payload[foff:foff + fsize]
+    # in chunks: a slice of an mmap is a bytes copy, and one 3 GiB segment copy
+    # does not fit the tool cgroup
+    for a in range(0, fsize, CHUNK):
+        n = min(fsize - a, CHUNK)
+        img[o + a:o + a + n] = payload[foff + a:foff + a + n]
 img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
 ba = struct.pack("<HH4x4Q6QI4xQI", 2, 2, virt_base, phys_base, mem_size, top,
                  FB, 1, STRIDE, W, H, 32, 0, adt_pa - delta, adt_size)
 ba += payload[CMDLINE_OFF:CMDLINE_OFF + 608] + b"\0\0\0\0" + struct.pack("<QQ", 0, mem_size)
+assert top < FB, f"payload ends {top:#x} above the framebuffer {FB:#x}"
 assert len(ba) == 736, f"boot_args {len(ba)} != 736"
 img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
-open(f"{out}/ram.bin", "wb").write(bytes(img))
+img.flush()
+img.close()
+_rf.close()
+
+# QEMU's generic loader device read is capped just under 2 GiB (it fails a 3 GiB
+# file with rc=0x7ffff000), so a RAMDisk root is loaded in parts.
+LOAD_CHUNK = 0x60000000
+loaders = []
+if top - phys_base <= LOAD_CHUNK:
+    loaders.append((f"{out}/ram.bin", phys_base))
+else:
+    _sf = open(f"{out}/ram.bin", "rb")
+    _src = mmap.mmap(_sf.fileno(), 0, access=mmap.ACCESS_READ)
+    for n, a in enumerate(range(0, top - phys_base, LOAD_CHUNK)):
+        part = f"{out}/ram.bin.{n}"
+        with open(part, "wb") as pf:
+            for c in range(a, min(a + LOAD_CHUNK, top - phys_base), CHUNK):
+                pf.write(_src[c:min(c + CHUNK, a + LOAD_CHUNK)])
+        loaders.append((part, phys_base + a))
+    _src.close()
+    _sf.close()
 # x0 = boot_args, then branch to the entry (pair of literal loads into x0/x1)
 open(f"{out}/stub.bin", "wb").write(
     struct.pack("<4I2Q", 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_va + delta))
@@ -235,10 +299,16 @@ else:
     # for a host window is gtk, and it reads $DISPLAY itself.
     disp_args = ["-display", "gtk" if disp.startswith(":") else disp]
 cmd = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-cpu", "cortex-a76",
-       "-smp", str(smp), "-m", "4G", *disp_args,
+       "-smp", str(smp), "-m", MEM, *disp_args,
+       # guest RAM in a shared memfd: file-backed, so a 3 GiB RAMDisk payload
+       # becomes reclaimable page cache instead of anonymous RSS (the tool
+       # session runs under a few-GiB memory cgroup that OOM-kills anon RAM)
+       "-object", f"memory-backend-memfd,id=mem,size={MEM},share=on",
+       "-numa", "node,memdev=mem",
        "-serial", f"file:{out}/serial.txt", "-qmp", f"unix:{mon},server,nowait",
        "-d", "int,guest_errors", "-D", f"{out}/qemu.log", "-no-reboot",
-       "-device", f"loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on",
+       *[x for part, addr in loaders
+         for x in ("-device", f"loader,file={part},addr={addr:#x},force-raw=on")],
        "-device", f"loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on",
        "-device", f"loader,addr={STUB_PA:#x},cpu-num=0"]
 if gdb:
@@ -304,6 +374,42 @@ def qmp(f, name, **kw):
     f.write(json.dumps({"execute": name, "arguments": kw} if kw else {"execute": name}) + "\n")
     f.flush()
     return json.loads(f.readline())
+
+
+def dump_msgbuf(f):
+    """Kernel message buffer -> msgbuf.txt, console flags -> console_flags.json.
+
+    Every printf lands here even when the console is paused or graphical (the
+    high-framebuffer layout of a --ramdisk run shows only the progress bar and
+    serial gets nothing but the panic). Statics map linearly from virt_base;
+    the ring itself is translated through gVirtBase/gPhysBase.
+    """
+    flags = {}
+    try:
+        def sva2pa(va):
+            return va - virt_base + phys_base
+        for sym, n in (("disableConsoleOutput", 4), ("serial_console_enabled", 1),
+                       ("gc_graphics_boot", 4), ("vc_progress_enable", 4),
+                       ("gPhysBase", 8), ("gVirtBase", 8), ("msgbufp", 8)):
+            if sym in KSYMS:
+                flags[sym] = int.from_bytes(grab(f, f"k_{sym}.bin", sva2pa(KSYMS[sym]), n), "little")
+        def k2p(va):
+            if virt_base <= va < kernel_end:
+                return sva2pa(va)
+            return va - flags["gVirtBase"] + flags["gPhysBase"]
+        hdr = grab(f, "k_msgbuf_hdr.bin", k2p(flags["msgbufp"]), 24)
+        magic, size, bufx, _bufr, bufc = struct.unpack("<iiiiQ", hdr)
+        flags.update(msgbuf_magic=magic & 0xffffffff, msgbuf_size=size, msgbuf_bufx=bufx)
+        ring = grab(f, "k_msgbuf_ring.bin", k2p(bufc), size)
+        open(f"{out}/msgbuf.txt", "wb").write((ring[bufx:] + ring[:bufx]).replace(b"\0", b""))
+    except Exception as e:                     # never lose the run over the log
+        flags["error"] = repr(e)
+    for tmp in os.listdir(out):
+        if tmp.startswith("k_") and tmp.endswith(".bin"):
+            os.unlink(f"{out}/{tmp}")
+    open(f"{out}/console_flags.json", "w").write(json.dumps(
+        {k: (hex(v) if isinstance(v, int) and v > 0xffff else v) for k, v in flags.items()},
+        indent=1) + "\n")
 
 
 def grab(f, name, pa, size):
@@ -407,6 +513,7 @@ try:
             result["pram_bytes"] = len(text)
         regs = qmp(f, "human-monitor-command", **{"command-line": "info registers"})["return"]
         open(f"{out}/regs.txt", "w").write(regs if isinstance(regs, str) else json.dumps(regs))
+        dump_msgbuf(f)
         qmp(f, "quit")
 finally:
     if p.poll() is None:
@@ -439,6 +546,8 @@ if not keep:
             os.unlink(f"{out}/{tmp}")
         except OSError:
             pass
+payload.close()          # still needed above for the font segment
+_pf.close()
 sys.exit({"panic": 2, "timeout_printing": 3}.get(result["status"], 0))
 PY
 rc=$?
