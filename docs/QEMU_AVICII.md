@@ -33,16 +33,18 @@ code path *around* the device.
 | `--until RE` | stop as soon as the screen matches RE |
 | `--ramdisk IMG` | append IMG as a RAMDisk segment, `rd=md0` it (`mkpayload.py --ramdisk`) |
 | `--smp N` | CPUs for QEMU; see section 5, only `1` works today |
-| `--gdb` | halt at the stub, `-gdb tcp::1234`, no timeout |
+| `--gdb` | halt at the stub, `-gdb tcp::<port>`, no timeout |
+| `--gdb-port N` | pin the stub port; default is the first free one from 1234 (§1.2) |
 | `--uart0` | add an `/arm-io/uart0` ADT node (inert on today's kernel, section 4) |
 | `--keep` | keep `ram.bin` |
-| `--out DIR` | artifact directory, default `logs/qemu/<stamp>` |
+| `--out DIR` | artifact directory, default `logs/qemu/<stamp>`, `-2`/`-3` if that second is taken (§1.2) |
 
 Exit: `0` target point reached, `1` usage, `2` panic decoded, `3` still printing
 when `--secs` ran out (normal for a run without `--until`), `4` host/setup
 problem.
 
-Artifacts in the output directory: `screen.txt` (the screen as text),
+Artifacts in the output directory: `msgbuf.txt` (the kernel message ring read
+out of guest RAM — the real log; `screen.txt` is blank in this fbcon layout),
 `result.json` (`status`, `deepest_marker`, `seconds_to_point`, `panic_at`,
 `panic_line`, `qemu_exceptions`), `fb.raw` (the raw screen), `pram.txt`,
 `regs.txt`, `qemu.log` (every exception with ESR/FAR/ELR), `qemu.cmd` (the exact
@@ -52,6 +54,57 @@ QEMU line), `avicii-qemu.adt`, `cmdline.txt`.
 interrupt-masked watchdog (`osfmk/arm/machine_routines_common.c`) panics at
 35 ms of IRQs-off otherwise — a real TCG timeout, hit at 6.3 s in one run of
 four before the factor was added.
+
+### 1.1 Memory: a run needs a scope, not sudo
+
+A `--ramdisk` run maps the whole payload (3.1 GiB for `rd-root.progs.img`) plus
+guest RAM. Inside a login shell's memory cgroup that is OOM-killed at ~4.1 GiB
+of anon — the run dies with no artifact and no message. A **user** scope is the
+cheap fix, needs no sudo, and leaves everything in the run directory owned by
+the invoking user:
+
+    systemd-run --user --scope -p MemoryMax=12G -q -- /bin/sh -c \
+      'cd /home/tadej/ios-nord && DISPLAY= QEMU_MEM=6G ./tooling/60-qemu-boot.sh \
+       --ramdisk build/rd-root.progs.img --out logs/qemu/<stamp>-<lane> \
+       --cmdline "rd=md0 sweettouch=0 sweetkeys=0 sweetfb_console=1 sweetecon=1 \
+       keepsyms=1 launchd_log_serial=1 launchd_disable_all_timeouts=1 rootrw=1 \
+       -v debug=0x144 cpu-factor=10" --secs 300'
+
+`rootrw=1` is not optional for any root above the boot rung: on a **read-only** `md0`,
+`confstr()` fails its `access(W_OK)` test on `TMPDIR`/`P_tmpdir`, returns 0, and every job that
+wants a temp dir (tccd first) dies in `__os_crash`. Read-only runs show `Read-only file system`
+errors and a service corpse loop; writable runs reach launchd's boot tasks.
+
+`QEMU_MEM` is what the ADT and `-m` are built for, so the scope has to cover it
+plus the memfd payload: `MemoryMax=12G` for `QEMU_MEM=6G`. The host has 62 GiB;
+three such scopes fit, a fourth is not safe. `DISPLAY=` keeps the run headless
+(otherwise `-display gtk` opens a window per run).
+
+### 1.2 Two runs at once
+
+The run directory is the only thing runs could share, so each one gets its own:
+
+* Always pass `--out logs/qemu/<stamp>-<lane>`; the lane suffix is what makes the
+  two runs tellable apart in `ls`. Without `--out` the script mints
+  `logs/qemu/<stamp>` and, if another run took that second, `<stamp>-2`,
+  `<stamp>-3` … (`mkdir` is the test-and-set, not a `date` string); a hand-written
+  `--out` that is already populated only earns a warning.
+* Everything inside the directory is per-run — `payload.bin`, `adt.raw`,
+  `avicii-qemu.adt`, `stub.bin`, `mon.sock`, `msgbuf.txt`, `screen.png` — and
+  nothing is written outside it except `avicii/tools/__pycache__`.
+* `--gdb` takes the first free TCP port from 1234 and prints the one it got
+  (`--gdb-port N` to pin it), so two debug sessions never fight over `:1234`.
+
+### 1.3 Judging a run
+
+    tooling/62-msgbuf-summary.sh logs/qemu/<stamp>-<lane> logs/qemu/20261114-094151
+
+One screen: the last timestamp and its line, the `Early boot complete` time (or
+that it was not reached), the `exec xpcproxy` count, every other `exec <name>`
+with its time, the `SWEET` lines after early boot grouped with counts, any panic
+string, and — with the second argument — which exec names appeared or vanished
+and how counts moved against that baseline run. Exit `0` no panic, `2` panic,
+`1` usage/empty run dir. It only reads; it does not boot.
 
 ## 2. How it works
 
@@ -72,8 +125,10 @@ The shim's job on the phone (`avicii/shim/loader.c`) is reproduced by the host:
 
 ## 3. Debug session
 
-QEMU is started with `-S -gdb tcp::1234` by `--gdb`, and the exact line is saved
-as `qemu.cmd`. `--gdb` also writes `kernel.noctf` next to the artifacts: LLDB 18
+QEMU is started with `-S -gdb tcp::<port>` by `--gdb` (1234, or the first free
+port above it; the run prints `gdb stub on :<port>` and `--gdb-port N` pins it
+for a scripted session), and the exact line is saved as `qemu.cmd`. `--gdb` also
+writes `kernel.noctf` next to the artifacts: LLDB 18
 crashes in its CTF reader on the kernel's `__ctf` section, so the section name
 is renamed in that copy (file only, the payload is untouched).
 

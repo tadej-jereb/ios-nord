@@ -20,11 +20,13 @@ Payload layout (little endian, all offsets from payload start):
   0x048  char  cmdline[608]
   0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
---ramdisk appends IMAGE as one more segment right after the kernel and moves
+--ramdisk appends IMAGE as one more segment after the kernel and moves
 kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
-turn into md0 (boot with rd=md0).
+turn into md0 (boot with rd=md0).  If that would put the image inside the
+bootstrap console's framebuffer it is moved above it instead (see EARLY_FB_*),
+and --ramdisk-addr ADDR overrides the physical address explicitly.
 """
 import argparse, mmap, os, struct, sys
 
@@ -36,6 +38,19 @@ PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+
+# The bootstrap console (xnu-avicii patches 0010/0012) paints the panel straight
+# at physical 0xa0000000: start.s fills a 32-row band at 0xa0000000+2368*4320 and
+# sweet_early_clear_row() repaints 32 more rows per printed line from row 0 down,
+# so with sweetecon=1 the whole 1080x2400 panel is rewritten in 0xff000000 words
+# from 0xa0000000 to 0xa0000000 + 2400*4320 = 0xa09e3400.  A ramdisk rooted at
+# kernel_end (0x924c8000 for the 8G tier-2 payload) starts inside that window and
+# its first ~10MB - file offset 0xdb38000 onward - is exactly what the console
+# overwrites, which is what produced 'does not start with MH_MAGIC: 0xFF000000'.
+EARLY_FB_PA = 0xa0000000
+EARLY_FB_BAND = 2400 * 4320		# 0x9e3400: whole panel, EARLY_STRIDE bytes/row
+RAMDISK_FLOOR = 0xa0200000		# never place the root image below this
+RAMDISK_CLEAR = 0xa1000000		# 16MB up: clear of the whole 0xa09e3400 band
 
 
 def parse_macho(buf):
@@ -156,7 +171,8 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_cache_path=None):
+def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_cache_path=None,
+          ramdisk_addr=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -177,12 +193,33 @@ def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_ca
     if ramdisk_path:
         image = open(ramdisk_path, 'rb').read()
         rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
-        rd_va = kernel_end
+        assert EARLY_FB_PA + EARLY_FB_BAND <= RAMDISK_CLEAR, 'RAMDISK_CLEAR is inside the early console band'
+        kernel_pa_end = kernel_end - virt_base + PHYS_BASE
+        if ramdisk_addr is None:
+            rd_pa = kernel_pa_end
+            # Leave a hole over the bootstrap console's framebuffer instead of
+            # dropping the root image into the words the kernel repaints.
+            if rd_pa < RAMDISK_FLOOR:
+                rd_pa = RAMDISK_CLEAR
+        else:
+            rd_pa = ramdisk_addr
+        if rd_pa & (PAGE - 1):
+            raise SystemExit(f'--ramdisk-addr {rd_pa:#x} is not {PAGE:#x}-aligned')
+        if rd_pa < kernel_pa_end:
+            raise SystemExit(f'--ramdisk-addr {rd_pa:#x} runs into the kernel, which ends at '
+                             f'{kernel_pa_end:#x}')
+        rd_va = rd_pa - PHYS_BASE + virt_base
+        if rd_pa < EARLY_FB_PA + EARLY_FB_BAND and rd_pa + rd_size > EARLY_FB_PA:
+            print(f'warning: ramdisk {rd_pa:#x} overlaps the early console band '
+                  f'[{EARLY_FB_PA:#x}, {EARLY_FB_PA + EARLY_FB_BAND:#x})', file=sys.stderr)
+        hole = rd_pa - kernel_pa_end
         kernel_end = rd_va + rd_size
-        rd_pa = rd_va - virt_base + PHYS_BASE
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+        ramdisk_va = f'va {rd_va:#x}, hole {hole:#x}'
+    else:
+        ramdisk_va = None
     if shared_cache_path:
         # iBoot hands the kernel the dyld shared cache as a /chosen/memory-map
         # region and the arm kernel maps it before initproc; without the region
@@ -233,7 +270,7 @@ def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_ca
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk,
-                shared_cache=shared_cache, size=total,
+                ramdisk_va=ramdisk_va, shared_cache=shared_cache, size=total,
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     out.flush()
     out.close()
@@ -246,11 +283,16 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--ramdisk-addr', type=lambda s: int(s, 0), default=None,
+                    help='physical address for --ramdisk (default: after the kernel, or '
+                         f'{RAMDISK_CLEAR:#x} when that would land in the early console band)')
     ap.add_argument('--shared-cache', help='dyld shared cache to place as /chosen/memory-map "dyld shared cache"')
     a = ap.parse_args()
-    info = build(a.kernel, a.adt, a.out, a.cmdline, a.ramdisk, a.shared_cache)
+    info = build(a.kernel, a.adt, a.out, a.cmdline, a.ramdisk, a.shared_cache, a.ramdisk_addr)
     for k, v in info.items():
         if k != 'segs':
             print(f'{k}: {v}')
+    if info['ramdisk']:
+        print(f'ramdisk_placement: phys {info["ramdisk"][0]} size {info["ramdisk"][1]} {info["ramdisk_va"]}')
     for s in info['segs']:
         print('  ', *s)

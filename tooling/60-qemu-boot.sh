@@ -14,7 +14,8 @@
 #   tooling/60-qemu-boot.sh --cmdline '-v debug=0x144 ...'
 #   tooling/60-qemu-boot.sh --ramdisk r.img --cmdline 'rd=md0 -v debug=0x144'
 #   tooling/60-qemu-boot.sh --until 'Waiting on <dict'   # stop at the ladder point
-#   tooling/60-qemu-boot.sh --gdb                # halt at entry, stub on :1234
+#   tooling/60-qemu-boot.sh --gdb                # halt at entry, stub on a free port from 1234
+#   tooling/60-qemu-boot.sh --gdb --gdb-port 1236  # explicit stub port
 #   tooling/60-qemu-boot.sh --view               # open screen.png when done
 #
 # Every run that dumps fb.raw also renders it (python3 stdlib only) to
@@ -22,10 +23,25 @@
 # the 2x-scaled fbcon font comes back at its native 8x16, still legible).
 # --view opens screen.png with xdg-open, else gwenview, else eog.
 #
+# Every run gets its own directory: --out names it, otherwise it is minted from
+# the clock and, if that second is already taken, suffixed -2, -3, ... (mkdir is
+# the test-and-set, so two runs started in the same second never share one).
+# Inside it everything is private - payload.bin, adt, stub.bin, mon.sock,
+# msgbuf.txt, sweetlog.txt, screen.png - nothing is written outside it except a __pycache__
+# next to avicii/tools/. Two runs at once need no coordination beyond that and a
+# distinct --gdb port, which the script picks and prints. tooling/62-msgbuf-summary.sh
+# reads the dir afterwards.
+#
+# sweetlog.txt/sweetlog.raw are patch 0047's _sweet_log_ring: every byte
+# _cnputs() gets, appended *before* the disableConsoleOutput gate.  That is
+# where dyld4::console's "dyld cache '...' not loaded: ..." for pid 1 goes when
+# the serial, the screen and msgbuf all show nothing (docs/CACHE_TRIM.md 3).
+#
 # Kernel debug session (the reason to do this at all). QEMU gets
-# "-S -gdb tcp::1234"; print the run's own "guest:" line for the addresses:
+# "-S -gdb tcp::<port>", port 1234 unless that is busy; print the run's own
+# "guest:" line for the addresses:
 #   tooling/60-qemu-boot.sh --gdb &
-#   tooling/opt/llvm/bin/lldb -o 'gdb-remote 1234' \
+#   tooling/opt/llvm/bin/lldb -o 'gdb-remote <port>' \
 #       -o 'b *<entry PA>' -o c -o 'b *<mmu-on PA>' -o c <out>/kernel.noctf
 # The x86 gdb in /usr/bin has no aarch64 target and rejects the stub; use the
 # repo's lldb (18.1.8), on the kernel.noctf copy -- plain kernel.development.sweet
@@ -44,7 +60,10 @@
 # the early io_map window can take) - see docs/QEMU_AVICII.md section 4.
 #
 # Exit: 0 target point reached, 1 usage, 2 panic decoded, 3 still printing when
-# --secs ran out, 4 host/setup problem.
+# --secs ran out, 4 host/setup problem - including `msgbuf=` on the command line
+# with a ring that came out 0 B (msgbuf.txt is never left silently empty) - and
+# 5 the same for _sweet_log_ring: a non-zero _sweet_log_total with a 0 B
+# sweetlog.txt is a harness failure, not a guest that said nothing.
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -60,6 +79,7 @@ SECS=${SECS:-45}
 SMP=${SMP:-1}
 OUTDIR=""
 GDB=0
+GDB_PORT=""
 UART0=0
 FB=""
 KEEP=0
@@ -82,10 +102,11 @@ while [ $# -gt 0 ]; do
 	--mem) MEM=${2:?--mem needs a size}; shift 2 ;;
 	--out) OUTDIR=${2:?--out needs a directory}; shift 2 ;;
 	--gdb) GDB=1; shift ;;
+	--gdb-port) GDB_PORT=${2:?--gdb-port needs a port number}; shift 2 ;;
 	--uart0) UART0=1; shift ;;
 	--keep) KEEP=1; shift ;;
 	--view) VIEW=1; shift ;;
-	-h | --help) sed -n '2,47p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,59p' "$0"; exit 0 ;;
 	*) echo "error: unknown argument $1" >&2; exit 1 ;;
 	esac
 done
@@ -112,8 +133,41 @@ NM=${NM:-$(command -v llvm-nm || echo "$repo/tooling/opt/llvm/bin/llvm-nm")}
 [ -x "$NM" ] || { echo "error: llvm-nm not found, needed to locate iso_font" >&2; exit 4; }
 
 stamp=$(date +%Y%m%d-%H%M%S)
-[ -n "$OUTDIR" ] || OUTDIR=$repo/logs/qemu/$stamp
-mkdir -p "$OUTDIR" || exit 4
+if [ -z "$OUTDIR" ]; then
+	# mkdir is the test-and-set: a second run started in the same second gets -2.
+	OUTDIR=$repo/logs/qemu/$stamp
+	n=1
+	while ! mkdir "$OUTDIR" 2>/dev/null; do
+		n=$((n + 1))
+		(( n <= 99 )) || { echo "error: cannot mint a run dir under $repo/logs/qemu" >&2; exit 4; }
+		OUTDIR=$repo/logs/qemu/$stamp-$n
+	done
+else
+	mkdir -p "$OUTDIR" || exit 4
+	[ -z "$(ls -A "$OUTDIR" 2>/dev/null)" ] ||
+		echo "warning: $OUTDIR is not empty; a concurrent run with the same --out will collide" >&2
+fi
+
+# A pinned 1234 makes two --gdb runs fight over the one stub socket; take the
+# first free port instead (and say which one). --gdb-port / GDB_PORT override.
+if [ "$GDB" = 1 ] && [ -z "$GDB_PORT" ]; then
+	GDB_PORT=$(python3 - <<'PY'
+import socket
+for p in range(1234, 1334):
+    s = socket.socket()
+    try:
+        s.bind(("", p))
+    except OSError:
+        s.close()
+        continue
+    s.close()
+    print(p)
+    break
+PY
+	)
+	[ -n "$GDB_PORT" ] || { echo "error: no free gdb port in 1234-1333" >&2; exit 4; }
+	[ "$GDB_PORT" = 1234 ] || echo "note: :1234 is taken, gdb stub on :$GDB_PORT" >&2
+fi
 echo "$CMDLINE" > "$OUTDIR/cmdline.txt"
 printf '%s\n' "$KERNEL" > "$OUTDIR/kernel.path"
 [ -n "$RAMDISK" ] && printf '%s\n' "$RAMDISK" > "$OUTDIR/ramdisk.path"
@@ -186,13 +240,19 @@ FONTVA=$("$NM" --defined-only "$KERNEL" | awk '$3 == "_iso_font" { print $1 }')
 [ -n "$FONTVA" ] || { echo "error: kernel has no _iso_font; screen cannot be decoded" >&2; exit 4; }
 # Kernel log channel that does not depend on the framebuffer: after the run the
 # message buffer is read out of guest RAM into msgbuf.txt (see section 3).
-KSYMS=$("$NM" --defined-only "$KERNEL" | awk '$3 ~ /^_(msgbufp|gPhysBase|gVirtBase|disableConsoleOutput|serial_console_enabled|gc_graphics_boot|vc_progress_enable)$/ { printf "%s=%s,", substr($3, 2), $1 }')
+# cpu_ttep is the kernel's own TTBR1_EL1 value (common_start does
+# `msr TTBR1_EL1, [cpu_ttep]`), so it is what a kalloc'd `msgbuf=<n>` ring has
+# to be translated through.  sweet_log_ring/sweet_log_total are patch 0047's
+# console ring: every byte _cnputs() is handed is appended there *before* the
+# disableConsoleOutput gate, so it holds what dyld4::console wrote to
+# /dev/console and nothing else on this host can see (docs/CACHE_TRIM.md 3).
+KSYMS=$("$NM" --defined-only "$KERNEL" | awk '$3 ~ /^_(msgbufp|cpu_ttep|gPhysBase|gVirtBase|disableConsoleOutput|serial_console_enabled|gc_graphics_boot|vc_progress_enable|sweet_log_ring|sweet_log_total)$/ { printf "%s=%s,", substr($3, 2), $1 }')
 
 # --- 3. guest image, run, dump, decode, verdict ------------------------------
-python3 -u - "$OUTDIR" "$SMP" "$SECS" "$GDB" "$UNTIL" "$FONTVA" "$KEEP" "$repo" "$FB" "$MEM" "$KSYMS" <<'PY'
+python3 -u - "$OUTDIR" "$SMP" "$SECS" "$GDB" "$UNTIL" "$FONTVA" "$KEEP" "$repo" "$FB" "$MEM" "$KSYMS" "$GDB_PORT" <<'PY'
 import json, mmap, os, re, socket, struct, subprocess, sys, time
 
-out, smp, secs, gdb, until, fontva, keep, REPO, FB, MEM, KSYMS = sys.argv[1:12]
+out, smp, secs, gdb, until, fontva, keep, REPO, FB, MEM, KSYMS, gdbport = sys.argv[1:13]
 KSYMS = {k: int(v, 16) for k, v in (x.split("=") for x in KSYMS.split(",") if x)}
 secs, smp, gdb, keep = float(secs), int(smp), gdb == "1", keep == "1"
 fontva, FB = int(fontva, 16), int(FB, 16)
@@ -312,7 +372,7 @@ cmd = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-cpu", "cortex-a76",
        "-device", f"loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on",
        "-device", f"loader,addr={STUB_PA:#x},cpu-num=0"]
 if gdb:
-    cmd += ["-S", "-gdb", "tcp::1234"]
+    cmd += ["-S", "-gdb", f"tcp::{gdbport}"]
     # lldb 18 crashes in SymbolFileCTF on the kernel's __ctf section: hand out a
     # copy with that section renamed (file only, not the payload).
     kbuf = bytearray(open(open(f"{out}/kernel.path").read().strip(), "rb").read())
@@ -353,7 +413,7 @@ print(f"guest: phys_base={phys_base:#x} entry={entry_va + delta:#x} boot_args={b
 if gdb:
     print(f"gdb: kernel.noctf is the symbol file; breakpoints by physical address "
           f"(entry={entry_va + delta:#x}" + (f", mmu-on={mmu_pa:#x}" if mmu_pa else "") +
-          "); see the header of this script")
+          f"); stub on :{gdbport}; see the header of this script")
 
 font_seg = None
 for i in range(nsegs):
@@ -381,8 +441,29 @@ def dump_msgbuf(f):
 
     Every printf lands here even when the console is paused or graphical (the
     high-framebuffer layout of a --ramdisk run shows only the progress bar and
-    serial gets nothing but the panic). Statics map linearly from virt_base;
-    the ring itself is translated through gVirtBase/gPhysBase.
+    serial gets nothing but the panic).
+
+    Two rings come out of the same QMP connection: this one (msgbuf.txt, the
+    kernel's printf ring) and patch 0047's _sweet_log_ring (sweetlog.raw exact
+    bytes / sweetlog.txt text), which holds every byte _cnputs() was handed -
+    including the /dev/console writes of dyld for pid 1 that no other channel
+    on this host shows.  console_flags.json records what each read did.
+
+    Statics (msgbufp, the console flags) live in the kernel image and map
+    linearly from gVirtBase.  The ring does not always: the default 128 KiB
+    ring is the kernel's static msgbufc[] in .data, but `msgbuf=<n>` makes the
+    kernel allocate a new one, which lands in kernel_map - VAs around
+    0xfffffe20xxxxxxxx, a page-granular mapping ~128 GiB above the linear
+    window.  `va - gVirtBase + gPhysBase` then points outside guest RAM and
+    reads zeros (run 20261114-120631: msgbuf=1048576 honoured, 373 788 B
+    logged, msgbuf.txt 0 B).  So the ring is read through the kernel's own
+    page tables: common_start does `msr TTBR1_EL1, [cpu_ttep]`, i.e. that
+    global holds the level-0 table's physical address, and every 16 KiB page
+    of the ring VA is translated and read on its own (a 1 MiB kernel
+    allocation is not one physical run, so one pmemsave would not do).
+
+    A 0 B dump while `msgbuf=` is on the command line is a harness failure,
+    not an empty log: it is reported on stderr and the run exits 4.
     """
     flags = {}
     try:
@@ -393,23 +474,284 @@ def dump_msgbuf(f):
                        ("gPhysBase", 8), ("gVirtBase", 8), ("msgbufp", 8)):
             if sym in KSYMS:
                 flags[sym] = int.from_bytes(grab(f, f"k_{sym}.bin", sva2pa(KSYMS[sym]), n), "little")
+
         def k2p(va):
             if virt_base <= va < kernel_end:
                 return sva2pa(va)
             return va - flags["gVirtBase"] + flags["gPhysBase"]
+
+        # --- the ring, through the kernel's own TTBR1_EL1 --------------------
+        # sweet runs a 16 KiB granule (see docs/STATUS.md machine config); the
+        # 4 KiB walk is only a second try in case that ever changes.
+        LEVELS = {"16k": (((47, 0x1), (36, 0x7ff), (25, 0x7ff), (14, 0x7ff)), 14),
+                  "4k": (((39, 0x1ff), (30, 0x1ff), (21, 0x1ff), (12, 0x1ff)), 12)}
+        tt_cache, tt_root = {}, None
+        if "cpu_ttep" in KSYMS:
+            ttb = int.from_bytes(grab(f, "k_cpu_ttep.bin", sva2pa(KSYMS["cpu_ttep"]), 8), "little")
+            # cpu_ttep is the L0 table arm_vm_init installs; a boot that shows it
+            # empty can be walked with the live value instead (-gdb run:
+            # `lldb -o 'register read ttbr1_el1'`), MSGBUF_TTBR1=0x...
+            over = os.environ.get("MSGBUF_TTBR1", "").strip()
+            if over:
+                flags["msgbuf_ttep_override"] = over
+                ttb = int(over, 16)
+            flags["msgbuf_ttep"] = ttb
+            tt_root = ttb & 0x0000ffffffffffff   # drop CnP/ASID
+
+        def tt_page(pa):
+            if pa not in tt_cache:
+                tt_cache[pa] = grab(f, "k_tt.bin", pa, 0x4000)
+            return tt_cache[pa]
+
+        def xlate(va, levels, page_shift):
+            """VA -> PA through the current TTBR1 tables; None if unmapped."""
+            amask = 0x0000ffffffffffff
+            tmask = amask & ~((1 << page_shift) - 1)   # a table is one granule: 2048x8 B (16k) or 512x8 B (4k)
+            pa = tt_root & tmask
+            for i, (shift, mask) in enumerate(levels):
+                e = ((va >> shift) & mask) * 8
+                tbl = tt_page(pa)
+                if e + 8 > len(tbl):
+                    return None
+                d = int.from_bytes(tbl[e:e + 8], "little")
+                if not d & 1:                     # invalid
+                    return None
+                if i and d & 3 == 1:              # block descriptor (L1/L2)
+                    bmask = amask & ~((1 << shift) - 1)
+                    return (d & bmask) | (va & ((1 << shift) - 1))
+                pa = d & tmask                    # next-level table
+            return pa | (va & ((1 << page_shift) - 1))
+
+        def ring_bytes(bufc, size):
+            """size bytes at kernel VA bufc, page by page -> (bytes, how)."""
+            if tt_root is None:
+                return None, "no cpu_ttep"
+            for name, (levels, pshift) in LEVELS.items():
+                step = 1 << pshift
+                base = bufc & ~(step - 1)         # page-align: translate, then cut
+                off0 = bufc - base
+                npages = (off0 + size + step - 1) // step
+                pas = []
+                for p in range(npages):
+                    pa = xlate(base + p * step, levels, pshift)
+                    if pa is None:
+                        break
+                    pas.append(pa)
+                if len(pas) != npages:
+                    continue
+                buf, i, runs = bytearray(), 0, 0
+                while i < len(pas):
+                    j = i
+                    while j + 1 < len(pas) and pas[j + 1] == pas[j] + step:
+                        j += 1
+                    buf += grab(f, "k_ring.bin", pas[i], (j - i + 1) * step)
+                    runs += 1
+                    i = j + 1
+                return bytes(buf[off0:off0 + size]), \
+                    f"ttbr1-walk/{name}/{len(pas)}p/{runs}run"
+            return None, "unmapped"
+
+        def trace(va, levels, pshift):
+            """The walk's working: (level, table PA, index, descriptor) per level."""
+            amask = 0x0000ffffffffffff
+            tmask = amask & ~((1 << pshift) - 1)
+            pa, out = tt_root & tmask, []
+            for i, (shift, mask) in enumerate(levels):
+                idx = (va >> shift) & mask
+                tbl = tt_page(pa)
+                d = int.from_bytes(tbl[idx * 8:idx * 8 + 8], "little")
+                out.append(f"L{i}:tbl={pa:#x},i={idx},d={d:#x}")
+                if not d & 1 or (i and d & 3 == 1):
+                    break
+                pa = d & tmask
+            return "; ".join(out)
+
+        def scan_ring(size, bufx):
+            """Last resort: find the ring in guest RAM, 16 KiB page by page.
+
+            The ring's VA range is contiguous but its physical pages are not
+            (a 1 MiB kmem_alloc is a run of single pages - run 20261114-125638
+            read the head contiguously and got 34 KB of log followed by other
+            pages' contents), so the head is found by its first record and each
+            following page by the text that must continue it: a page's first 48
+            bytes are the last 48 bytes of the page before it.  One pass over
+            RAM indexes every 16 KiB page that starts with printable text.
+            """
+            step = 0x4000
+            head = re.compile(rb"\[ *\d+\.\d{6}\]:")
+            tsre = re.compile(rb"\[ *(\d+\.\d{6})\]:")
+            lo, hi = (kernel_end + delta) & ~(step - 1), phys_base + mem_size
+            chunk, pages, cands = 0x8000000, [], []
+            pa = lo
+            while pa < hi:
+                n = min(chunk, hi - pa)
+                blob = grab(f, "k_scan.bin", pa, n)
+                for off in range(0, len(blob) - 64, step):
+                    if not 0x20 <= blob[off] <= 0x7e:
+                        continue                # a log page starts with text
+                    m = tsre.search(blob[off:off + 0x1000])
+                    if m is None:
+                        continue                # no kprintf record: not a log page
+                    pages.append((float(m.group(1)), pa + off))
+                    if len(cands) < 8 and m.start() == 0:
+                        cands.append(pa + off)  # a page that starts a record
+                if n <= step:
+                    break
+                pa += n - step
+            pages.sort()
+            for start in cands:
+                # everything from the write pointer on is zeros (never written),
+                # so only the pages covering [0, bufx) have to be chained
+                need = min(size, bufx) or size
+                out, cur, seen, ok = bytearray(), start, set(), True
+                while len(out) < need:
+                    if cur in seen:
+                        ok = False
+                        break
+                    seen.add(cur)
+                    page = grab(f, "k_page.bin", cur, step)
+                    if not any(32 <= b < 127 for b in page[:64]):
+                        ok = False
+                        break
+                    out += page
+                    if len(out) >= need:
+                        break
+                    ts = [float(x) for x in tsre.findall(page)]
+                    if not ts:
+                        ok = False
+                        break
+                    # the ring's next page is the one whose first record comes
+                    # right after this page's last one; other logs in RAM (the
+                    # 128 KiB static ring) sit far away in time
+                    nxt = [(t, p) for t, p in pages
+                           if p not in seen and ts[-1] <= t <= ts[-1] + 5.0]
+                    if not nxt:
+                        ok = False
+                        break
+                    cur = min(nxt)[1]
+                if not ok:
+                    continue
+                body = (bytes(out[:need]) + b"\0" * (size - need))[:size]
+                text = body[:min(bufx, 0x10000)]
+                printable = sum(1 for b in text if b in (9, 10, 13) or 32 <= b < 127)
+                if not text or printable / len(text) < 0.95:
+                    continue                    # not a log: kernel data can start with '['
+                if len(head.findall(body[:min(bufx, 0x40000)])) < 4:
+                    continue
+                return start, body
+            return None
+
         hdr = grab(f, "k_msgbuf_hdr.bin", k2p(flags["msgbufp"]), 24)
         magic, size, bufx, _bufr, bufc = struct.unpack("<iiiiQ", hdr)
-        flags.update(msgbuf_magic=magic & 0xffffffff, msgbuf_size=size, msgbuf_bufx=bufx)
-        ring = grab(f, "k_msgbuf_ring.bin", k2p(bufc), size)
-        open(f"{out}/msgbuf.txt", "wb").write((ring[bufx:] + ring[:bufx]).replace(b"\0", b""))
+        flags.update(msgbuf_magic=magic & 0xffffffff, msgbuf_size=size, msgbuf_bufx=bufx,
+                     msgbuf_bufc=bufc)
+        ring, how = ring_bytes(bufc, size)
+        if ring is None or not any(ring):
+            # keep the walk's working: a failed translate has to be debuggable
+            if tt_root is not None:
+                flags["tt_trace"] = (trace(bufc, *LEVELS["16k"]) + " | "
+                                     + trace(bufc, *LEVELS["4k"]))
+            hit = scan_ring(size, bufx)
+            if hit is not None:                 # already stitched page by page
+                ring, how = hit[1], f"ram-scan/{hit[0]:#x}"
+                flags["msgbuf_ram_scan_pa"] = hit[0]
+        if ring is None or not any(ring):
+            lin = grab(f, "k_msgbuf_ring.bin", k2p(bufc), size)   # the old guess
+            flags["linear_ok"] = bool(any(lin))
+            if any(lin):
+                ring, how = lin, "linear"
+            else:
+                flags["msgbuf_ring_pa"] = k2p(bufc)
+        if ring is not None and any(ring):
+            if how.startswith("ttbr1-walk"):
+                flags["msgbuf_ring_pa"] = xlate(bufc, *LEVELS[how.split("/")[1]])
+            flags["msgbuf_ring_via"] = how
+            open(f"{out}/msgbuf.txt", "wb").write((ring[bufx:] + ring[:bufx]).replace(b"\0", b""))
+        else:
+            flags["msgbuf_ring_via"] = how
+
+        # --- patch 0047: _sweet_log_ring (what dyld said) --------------------
+        # dyld4::console writes pid 1's reason to /dev/console -> console_write
+        # -> _cnputs, which returns at once while disableConsoleOutput is set:
+        # no serial, no screen, no msgbuf.  0047 appends those bytes to a 4 MiB
+        # static ring first, so the only record of why dyld rejected the cache
+        # is in guest RAM.  Ring offset of byte n is n % size, and _sweet_log_total
+        # counts every byte ever appended, so a wrapped ring starts at
+        # total % size.  Reading it is the same problem as a ring VA: try the
+        # linear map (it is a .bss static like the console flags) and fall back
+        # to the kernel's own page tables.
+        sl_size = 4 << 20                     # SWEET_LOG_SIZE in patches/0047
+        if "sweet_log_ring" not in KSYMS or "sweet_log_total" not in KSYMS:
+            flags["sweetlog_via"] = "no symbol"
+        else:
+            ring_va, total_va = KSYMS["sweet_log_ring"], KSYMS["sweet_log_total"]
+            flags["sweetlog_ring_sym"], flags["sweetlog_total_sym"] = ring_va, total_va
+            flags["sweetlog_ring_pa"] = ring_va - flags["gVirtBase"] + flags["gPhysBase"]
+            total = int.from_bytes(grab(f, "k_sweetlog_total.bin", k2p(total_va), 8), "little")
+            flags["sweetlog_total"] = total
+            flags["sweetlog_ring_size"] = sl_size
+            if total:                          # 0 = nothing ever reached _cnputs
+                want = min(total, sl_size)
+                blob = grab(f, "k_sweetlog.bin", ring_va - flags["gVirtBase"] + flags["gPhysBase"], want)
+                how = "linear"
+                if not any(blob):              # not where the linear map says
+                    blob, how = ring_bytes(ring_va, want)
+                    if blob is not None and any(blob):
+                        flags["sweetlog_ring_pa"] = xlate(ring_va, *LEVELS[how.split("/")[1]])
+                    else:
+                        if tt_root is not None:
+                            flags["sweetlog_tt_trace"] = trace(ring_va, *LEVELS["16k"])
+                        blob = None
+                if blob is not None:
+                    body = blob[:want]
+                    if total > sl_size:        # ring wrapped: reorder from the oldest byte
+                        off = total % sl_size
+                        body = body[off:] + body[:off]
+                    flags["sweetlog_via"] = how
+                    flags["sweetlog_bytes"] = len(body)
+                    flags["sweetlog_wrapped"] = total > sl_size
+                    txt = body.replace(b"\0", b"")       # text form: no NUL padding
+                    sl_lines = txt.split(b"\n")
+                    flags["sweetlog_not_loaded"] = sum(1 for l in sl_lines if b"not loaded:" in l)
+                    flags["sweetlog_dyld_reject"] = sum(
+                        1 for l in sl_lines if b"dyld cache" in l and b"not loaded:" in l)
+                    flags["sweetlog_head"] = txt.split(b"\n")[0][:120].decode("latin-1")
+                    flags["sweetlog_printable"] = round(
+                        sum(1 for b in txt[:0x4000] if b in (9, 10, 13) or 32 <= b < 127)
+                        / max(1, len(txt[:0x4000])), 3)
+                    open(f"{out}/sweetlog.raw", "wb").write(body)   # exact bytes
+                    open(f"{out}/sweetlog.txt", "wb").write(txt)
+                else:
+                    flags["sweetlog_via"] = how + " (total %d B, unreadable)" % total
+            else:
+                flags["sweetlog_via"] = "total 0"
     except Exception as e:                     # never lose the run over the log
         flags["error"] = repr(e)
     for tmp in os.listdir(out):
         if tmp.startswith("k_") and tmp.endswith(".bin"):
             os.unlink(f"{out}/{tmp}")
+    n = os.path.getsize(f"{out}/msgbuf.txt") if os.path.exists(f"{out}/msgbuf.txt") else 0
+    sl = os.path.getsize(f"{out}/sweetlog.txt") if os.path.exists(f"{out}/sweetlog.txt") else 0
+    cmd_line = open(f"{out}/cmdline.txt").read() if os.path.exists(f"{out}/cmdline.txt") else ""
+    failed = n == 0 and "msgbuf=" in cmd_line
+    if failed:
+        flags["msgbuf_dump_failed"] = True
+        print(f"error: msgbuf= is on the command line but msgbuf.txt came out 0 B - the "
+              f"ring was not readable (size {flags.get('msgbuf_size')}, bufx "
+              f"{flags.get('msgbuf_bufx')}, bufc {flags.get('msgbuf_bufc')}, via "
+              f"{flags.get('msgbuf_ring_via')}, error {flags.get('error')}); "
+              f"see {out}/console_flags.json", file=sys.stderr)
+    # the ring holds bytes but none came out: a harness failure, not a silent guest
+    if flags.get("sweetlog_total") and not sl:
+        flags["sweetlog_dump_failed"] = True
+        print(f"error: _sweet_log_total says {flags['sweetlog_total']} B but sweetlog.txt "
+              f"came out 0 B (ring {flags.get('sweetlog_ring_sym')}, pa "
+              f"{flags.get('sweetlog_ring_pa')}, via {flags.get('sweetlog_via')}, trace "
+              f"{flags.get('sweetlog_tt_trace')}); see {out}/console_flags.json", file=sys.stderr)
     open(f"{out}/console_flags.json", "w").write(json.dumps(
         {k: (hex(v) if isinstance(v, int) and v > 0xffff else v) for k, v in flags.items()},
         indent=1) + "\n")
+    return n, failed, sl
 
 
 def grab(f, name, pa, size):
@@ -456,7 +798,7 @@ to_point = None
 deepest = -1
 try:
     if gdb:
-        print("halted at entry; gdb stub on :1234. Ctrl-C here when done.")
+        print(f"halted at entry; gdb stub on :{gdbport}. Ctrl-C here when done.")
         p.wait()
         result["status"] = "gdb"
     else:
@@ -513,7 +855,11 @@ try:
             result["pram_bytes"] = len(text)
         regs = qmp(f, "human-monitor-command", **{"command-line": "info registers"})["return"]
         open(f"{out}/regs.txt", "w").write(regs if isinstance(regs, str) else json.dumps(regs))
-        dump_msgbuf(f)
+        msgbuf_bytes, msgbuf_failed, sweetlog_bytes = dump_msgbuf(f)
+        result["msgbuf_bytes"] = msgbuf_bytes
+        result["sweetlog_bytes"] = sweetlog_bytes
+        if msgbuf_failed:
+            result["msgbuf_dump_failed"] = True
         qmp(f, "quit")
 finally:
     if p.poll() is None:
@@ -540,6 +886,13 @@ print(f"status={result['status']} deepest={result['deepest_marker']} "
       f"seconds_to_point={result['seconds_to_point']} "
       f"panic_at={result.get('panic_at')} exceptions={result['qemu_exceptions']}")
 print(f"artifacts: {out}")
+try:
+    _fl = json.load(open(f"{out}/console_flags.json"))
+except (OSError, ValueError):
+    _fl = {}
+print(f"sweetlog: {result.get('sweetlog_bytes', 0)} B of {_fl.get('sweetlog_total', 0)} "
+      f"appended, via {_fl.get('sweetlog_via')}, dyld rejected the cache "
+      f"{_fl.get('sweetlog_dyld_reject', 0)}x -> {out}/sweetlog.txt")
 if not keep:
     for tmp in ("ram.bin",):
         try:
@@ -548,7 +901,12 @@ if not keep:
             pass
 payload.close()          # still needed above for the font segment
 _pf.close()
-sys.exit({"panic": 2, "timeout_printing": 3}.get(result["status"], 0))
+code = {"panic": 2, "timeout_printing": 3}.get(result["status"], 0)
+if result.get("msgbuf_dump_failed") and code != 2:   # panic stays the headline
+    code = 4
+if _fl.get("sweetlog_dump_failed") and code == 0:    # ring held bytes, dump did not
+    code = 5
+sys.exit(code)
 PY
 rc=$?
 
@@ -612,5 +970,7 @@ case $rc in
 0) echo "ok: reached the target point, no panic (logs/qemu, result.json)" ;;
 2) echo "panic decoded - see screen.txt / result.json" ;;
 3) echo "still printing when --secs ran out - raise --secs to see further" ;;
+4) echo "error: msgbuf= was asked for but the kernel ring could not be read (0 B dump)" ;;
+5) echo "error: _sweet_log_total is non-zero but sweetlog.txt came out 0 B (ring unreadable)" ;;
 esac
 exit $rc

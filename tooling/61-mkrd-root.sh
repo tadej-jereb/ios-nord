@@ -15,12 +15,43 @@
 #   --staging DIR  default build/rd-root.stage (kept; the checker runs on it)
 #   --size SIZE    image size; default is the measured set x1.12 + 16 MiB
 #   --no-cache     omit the dyld shared cache (43 files, 2.61 GiB)
+#   --vardirs      add the per-user /private/var tree the reference root has and
+#                  this one did not: /private/var/folders (0755 0:0),
+#                  /private/var/mobile (0700 501:501), /private/var/mobile/tmp
+#                  (1777 501:501), /private/var/root (0700 0:0). confstr(
+#                  _CS_DARWIN_USER_TEMP_DIR) - and every per-user lookup - has
+#                  nowhere to resolve without them. Off by default: the images
+#                  built without it stay byte-for-byte what they were.
 #   --qemu         hand the image to tooling/60-qemu-boot.sh if it exists
+#   --jobenv LABEL:VAR=VALUE
+#                  add VAR=VALUE to the EnvironmentVariables dict of the job
+#                  plist for LABEL, after the plists are copied as-is. Repeatable.
+#                  This is how a per-job override (TMPDIR, DIRHELPER_*) is put in
+#                  front of a daemon without touching the DMG or the job table.
+#                  Off by default: no --jobenv means every staged plist is
+#                  byte-for-byte what the DMG holds.
+#   --share        also stage /usr/share/icu and /usr/share/zoneinfo from the
+#                  System volume, whole subtrees, DMG modes preserved. The root
+#                  otherwise has no /usr/share at all, and libicucore resolves
+#                  its data through the hard-coded /usr/share/icu/, so
+#                  CFDateFormatterCreate() returns NULL and the ISO8601 call
+#                  dereferences it (the containermanagerd crash of
+#                  logs/qemu/20261114-151140-rootrw-pristine); CFTimeZone reads
+#                  /usr/share/zoneinfo the same way. Off by default: the images
+#                  built without it stay byte-for-byte what they were.
+#   --programs FILE
+#                  also stage every absolute path named in FILE, one per line
+#                  ('#' comments and blank lines ignored): the tier-1 daemons
+#                  the job table spawns beyond the boot table, plus the bundle
+#                  files they load. Mach-O files get 0755, everything else
+#                  0644, a directory recurses with the same rule. A path that
+#                  neither DMG has is fatal, not skipped. Sizing follows it.
 #
 # The image carries the ordered minimal set of docs/LAUNCHD_BOOTSTRAP.md
 # section 5 (steps 1-9) plus launchd's job table and the 492 job plists (no
-# job Programs beyond the boot table). Source files come from the DMGs
-# mounted read-only through tooling/opt/apfs-fuse, never from the phone.
+# job Programs beyond the boot table unless --programs adds them). Source
+# files come from the DMGs mounted read-only through tooling/opt/apfs-fuse,
+# never from the phone.
 #
 # Needs: apfs-fuse (32-build-apfsfuse.sh), tooling/opt/fstool (the patched
 # unprivileged HFS+ writer), fuse3, hfsprogs, fakeroot. No root, no loop device.
@@ -41,6 +72,10 @@ stage=$REPO/build/rd-root.stage
 want_size=""
 do_cache=1
 do_qemu=0
+do_vardirs=0
+do_share=0
+programs_file=""
+jobenvs=()
 
 OS_DMG=087-86698-044.dmg        # System volume - launchd, dyld, /private/etc
 SYS_DMG=087-86593-047.dmg       # SystemOS cryptex - the dyld shared cache
@@ -60,8 +95,12 @@ while (( $# )); do
 		--staging) stage=${2:?--staging needs a path}; shift ;;
 		--size)    want_size=${2:?--size needs a value}; shift ;;
 		--no-cache) do_cache=0 ;;
+		--vardirs) do_vardirs=1 ;;
+		--share)   do_share=1 ;;
 		--qemu)    do_qemu=1 ;;
-		-h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
+		--programs) programs_file=${2:?--programs needs a file}; shift ;;
+		--jobenv)  jobenvs+=("${2:?--jobenv needs LABEL:VAR=VALUE}"); shift ;;
+		-h|--help) sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
 		*) die "unknown argument: $1" ;;
 	esac
 	shift
@@ -141,6 +180,20 @@ dirs=(
 	"/System/Library/PrivateFrameworks/MobileAccessoryUpdater.framework:0755:0:0"
 	"/System/Library/PrivateFrameworks/MobileAccessoryUpdater.framework/Support:0755:0:0"
 )
+
+# --vardirs: the per-user /private/var tree the reference root carries and this
+# one did not (33-populate-root.sh:469 asserts /private/var/mobile). confstr
+# (_CS_DARWIN_USER_TEMP_DIR), and every per-user path, resolves through these;
+# without them confstr returns 0 and tccd __os_crash()es in
+# -[TCCDServer setupTemporaryDirectoryForName:]. Off by default.
+if (( do_vardirs )); then
+	dirs+=(
+		"/private/var/folders:0755:0:0"
+		"/private/var/mobile:0700:501:501"
+		"/private/var/mobile/tmp:1777:501:501"
+		"/private/var/root:0700:0:0"
+	)
+fi
 
 # The boot table, verbatim from /sbin/launchd __TEXT,__config Boot dict
 # (file 411743..420021, 29 entries). 18 of the 25 Program keys resolve in
@@ -227,6 +280,158 @@ for f in private/var/db/diagnostics/.migrated private/var/db/uuidtext/.migrated;
 	install -m 0644 /dev/null "$stage/$f"
 done
 
+# ---------------------------------------------------------------------------
+# --share: /usr/share/icu and /usr/share/zoneinfo from the System volume.
+#
+# The root has no /usr/share at all, and libicucore opens its data through the
+# compile-time path /usr/share/icu/ (icudt70l.dat here; a build that splits the
+# data out also drops icudt*.res there, so the whole subtree goes in). Without
+# it uloc/ucol cannot open a data file, CFDateFormatterCreate() returns NULL and
+# CFDateFormatterCreateISO8601Formatter() dereferences it one instruction later
+# (`add x8,x0,#8; ldar x8,[x8]`, far 0x8) - the containermanagerd crash of
+# logs/qemu/20261114-151140-rootrw-pristine. CFTimeZone reads /usr/share/zoneinfo
+# the same way. In 20H392 the DMG holds /usr/share/zoneinfo as a *symlink* to
+# /var/db/timezone/zoneinfo, which is on the data volume this root does not have
+# (tzinit copies it there at boot, from the same source), while the bytes ship in
+# /usr/share/zoneinfo.default - so --share materialises that tree at
+# /usr/share/zoneinfo as a real directory, with the DMG's modes. Off by default.
+# ---------------------------------------------------------------------------
+share_files=0
+share_bytes=0
+share_dirs=0
+if (( do_share )); then
+	step "staging /usr/share/icu and /usr/share/zoneinfo from the OS volume"
+
+	share_tree() {	# share_tree SRC REL - whole directory, modes and links as in the DMG
+		local src=$1 rel=$2 f b
+		install -d -m "$(stat -c %a "$src")" "$stage/$rel"
+		share_dirs=$((share_dirs + 1))
+		for f in "$src"/*; do
+			[[ -e $f || -L $f ]] || continue
+			b=$(basename "$f")
+			if [[ -L $f ]]; then
+				ln -sfn "$(readlink "$f")" "$stage/$rel/$b"
+			elif [[ -d $f ]]; then
+				share_tree "$f" "$rel/$b"
+			else
+				install -m "$(stat -c %a "$f")" "$f" "$stage/$rel/$b"
+				cmp -s "$f" "$stage/$rel/$b" || die "/$rel/$b differs from its DMG source"
+				share_files=$((share_files + 1))
+				share_bytes=$((share_bytes + $(stat -c %s "$f")))
+				add_bytes "$f"
+			fi
+		done
+	}
+
+	install -d -m 0755 "$stage/usr/share"
+	[[ -d $os/usr/share/icu ]] || die "no /usr/share/icu in $OS_DMG"
+	share_tree "$os/usr/share/icu" usr/share/icu
+	# the path libicucore actually opens, asserted on the staging tree below
+	shopt -s nullglob
+	icu_dat=("$stage/usr/share/icu"/icudt*.dat)
+	shopt -u nullglob
+	(( ${#icu_dat[@]} )) || die "no icudt*.dat in $OS_DMG/usr/share/icu - nothing for libicucore to open"
+
+	if [[ -L $os/usr/share/zoneinfo ]]; then
+		say "DMG /usr/share/zoneinfo -> $(readlink "$os/usr/share/zoneinfo") (data volume), bytes in /usr/share/zoneinfo.default"
+	fi
+	[[ -d $os/usr/share/zoneinfo.default ]] ||
+		die "no /usr/share/zoneinfo.default in $OS_DMG (the tz tree --share needs)"
+	share_tree "$os/usr/share/zoneinfo.default" usr/share/zoneinfo
+
+	say "usr/share: $share_files files in $share_dirs dirs, $share_bytes B ($(numfmt --to=iec "$share_bytes")); icu $(basename "${icu_dat[0]}") $(stat -c %s "${icu_dat[0]}") B, zoneinfo $(find "$stage/usr/share/zoneinfo" -type f | wc -l) files"
+fi
+
+# ---------------------------------------------------------------------------
+# --programs FILE: the daemons the job table spawns but the boot table does
+# not name (logd, notifyd, configd, ...), plus the bundle files lane 1 lists.
+# One absolute path per line; blank lines and '#' comments are ignored. The
+# lookup is System volume first, then the SystemOS cryptex volume, and a path
+# neither has is fatal - a silently skipped Program is exactly the failure
+# mode this rung exists to remove. Mach-O gets 0755, anything else 0644, a
+# directory recurses with the same rule (bundles, .framework support dirs).
+# ---------------------------------------------------------------------------
+prog_check=()		# rel path : mode, re-checked against the image below
+declare -A prog_seen=()
+programs_n=0
+prog_kept=0
+programs_bytes=0
+if [[ -n $programs_file ]]; then
+	[[ -r $programs_file ]] || die "no --programs file: $programs_file"
+
+	is_macho() {	# magic of block 0, same list the mockfs probe uses
+		local m
+		m=$(xxd -l 4 -p -- "$1" 2>/dev/null) || return 1
+		case $m in
+			cffaedfe|cefaedfe|feedface|feedfacf) return 0 ;;	# MH_MAGIC(64) both ends
+			cafebabe|bebafeca|cafebabf|bfbafeca) return 0 ;;	# FAT_MAGIC(64) both ends
+		esac
+		return 1
+	}
+
+	stage_one() {	# stage_one SRC REL
+		local src=$1 rel=$2 m=0644
+		if is_macho "$src"; then m=0755; fi
+		if [[ -n ${prog_seen["$rel"]:-} ]]; then return 0; fi
+		prog_seen["$rel"]=1
+		if [[ -e $stage/$rel ]]; then
+			# Already in the minimal set (a boot-table Program, SystemVersion,
+			# ...): keep the mode that step gave it and only assert the bytes.
+			cmp -s "$src" "$stage/$rel" ||
+				die "/$rel is in the minimal set already but differs from its DMG source"
+			prog_kept=$((prog_kept + 1))
+			return 0
+		fi
+		install -d -m 0755 "$stage/$(dirname "$rel")"
+		install -m "$m" "$src" "$stage/$rel"
+		cmp -s "$src" "$stage/$rel" || die "/$rel differs from its DMG source"
+		add_bytes "$src"
+		prog_check+=("$rel:$m")
+		programs_n=$((programs_n + 1))
+		programs_bytes=$((programs_bytes + $(stat -c %s "$src")))
+	}
+
+	stage_tree() {	# stage_tree SRC REL - a whole directory from the list
+		local src=$1 rel=$2 f
+		install -d -m 0755 "$stage/$rel"
+		for f in "$src"/*; do
+			[[ -e $f || -L $f ]] || continue
+			if [[ -L $f ]]; then
+				ln -sfn "$(readlink "$f")" "$stage/$rel/$(basename "$f")"
+			elif [[ -d $f ]]; then
+				stage_tree "$f" "$rel/$(basename "$f")"
+			else
+				stage_one "$f" "$rel/$(basename "$f")"
+			fi
+		done
+	}
+
+	step "staging the --programs set from $programs_file"
+	while IFS= read -r p || [[ -n $p ]]; do
+		p=${p%%#*}					# trailing comment
+		p=${p#"${p%%[![:space:]]*}"}			# trim leading space
+		p=${p%"${p##*[![:space:]]}"}			# trim trailing space
+		[[ -z $p ]] && continue
+		[[ $p == /* ]] || die "--programs path is not absolute: $p"
+		rel=${p#/}
+		[[ -z $rel ]] && die "--programs names the root: $p"
+		if [[ -e $os/$rel ]]; then
+			src=$os/$rel
+		elif [[ -e $sysos/$rel ]]; then
+			src=$sysos/$rel
+		else
+			die "program missing in $OS_DMG and $SYS_DMG: $p"
+		fi
+		if [[ -d $src && ! -L $src ]]; then
+			stage_tree "$src" "$rel"
+		else
+			stage_one "$src" "$rel"
+		fi
+	done <"$programs_file"
+	(( programs_n + prog_kept > 0 )) || die "--programs $programs_file resolved to no files"
+	say "$programs_n staged ($programs_bytes B), $prog_kept already in the minimal set, $(printf '%s\n' "${prog_check[@]}" | grep -c ':0755$' || true) of the new ones exec 0755"
+fi
+
 if (( do_cache )); then
 	step "hard-linking the dyld shared cache (43 files, .symbols left out)"
 	# The cache files are copied once into .rdcache and hard-linked out, so the
@@ -291,6 +496,40 @@ for d in System/Library/LaunchDaemons Library/LaunchDaemons; do
 done
 (( n >= 492 )) || die "only $n job plists in $OS_DMG (expected 491 + 1)"
 say "$n job plists"
+
+# Per-job environment (--jobenv). The plists are copies of the DMG's, so an
+# override has to go on the staged copy after the copy, before the image is
+# sized and built; the image check below then compares staging and image, which
+# catches a plist that did not make it in. plistlib keeps the rest of the dict.
+if (( ${#jobenvs[@]} )); then
+	step "job environment overrides"
+	for spec in "${jobenvs[@]}"; do
+		lbl=${spec%%:*}
+		kv=${spec#*:}
+		[[ $lbl != "$spec" && $kv == *=* ]] ||
+			die "--jobenv needs LABEL:VAR=VALUE, got: $spec"
+		jpf=""
+		for d in System/Library/LaunchDaemons Library/LaunchDaemons; do
+			[[ -f $stage/$d/$lbl.plist ]] && jpf=$stage/$d/$lbl.plist
+		done
+		[[ -n $jpf ]] || die "--jobenv: no staged plist for $lbl"
+		jbefore=$(stat -c %s "$jpf")
+		python3 -I - "$jpf" "${kv%%=*}" "${kv#*=}" <<'JOBENV'
+import plistlib, sys
+path, var, val = sys.argv[1:4]
+with open(path, "rb") as f:
+    p = plistlib.load(f)
+env = p.setdefault("EnvironmentVariables", {})
+env[var] = val
+with open(path, "wb") as f:
+    plistlib.dump(p, f, fmt=plistlib.FMT_XML, sort_keys=True)
+print("  %s: EnvironmentVariables[%s] = %s (%d keys)"
+      % (p.get("Label"), var, val, len(env)))
+JOBENV
+		jafter=$(stat -c %s "$jpf")
+		need=$((need - jbefore + jafter))
+	done
+fi
 
 # dyld4 looks for the cache under the cryptex roots (its own string table lists
 # /System/Cryptexes/OS, /private/preboot/Cryptexes/OS and
@@ -374,6 +613,13 @@ chown -h 272:272 "$work/img/private/var/db/diagnostics" "$work/img/private/var/d
 	"$work/img/private/var/db/diagnostics/.migrated" "$work/img/private/var/db/uuidtext/.migrated"
 chmod 0751 "$work/img/private/var/db/diagnostics"
 chmod 0755 "$work/img/private/var/db/uuidtext"
+if (( do_vardirs )); then
+	# mobile's own directories belong to mobile (uid 501, /var/mobile in
+	# /private/etc/passwd), not root; chown clears bits, so chmod after it.
+	chown -h 501:501 "$work/img/private/var/mobile" "$work/img/private/var/mobile/tmp"
+	chmod 0700 "$work/img/private/var/mobile"
+	chmod 1777 "$work/img/private/var/mobile/tmp"
+fi
 # Hard-linked files cannot be chown'ed through fstool (silent no-op, the link
 # attrs are synthetic); they are 0:0 from the fakeroot create above, which is
 # what the kernel's shared-region root_check requires. The probe asserts it.
@@ -383,12 +629,34 @@ probes=("sbin/launchd:0:0:755" "System/Library/xpc/launchd.plist:0:0:644" "priva
 if (( do_cache )); then
 	probes+=("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64:0:0:755")
 fi
+if (( do_vardirs )); then
+	probes+=("private/var/folders:0:0:755" "private/var/mobile:501:501:700" \
+		"private/var/mobile/tmp:501:501:1777" "private/var/root:0:0:700")
+fi
+if (( do_share )); then
+	# the exact nodes libicucore and CFTimeZone open, with the DMG's modes
+	probes+=("usr/share/icu:0:0:755" "usr/share/icu/icudt70l.dat:0:0:444" \
+		"usr/share/zoneinfo:0:0:755" "usr/share/zoneinfo/GMT:0:0:644")
+fi
 
 for probe in "${probes[@]}"; do
 	IFS=: read -r p u g m <<<"$probe"
 	got=$(stat -c '%u:%g:%a' "$work/img/$p")
 	[[ $got == "$u:$g:$m" ]] || die "/$p is $got, expected $u:$g:$m"
 done
+
+# The --programs set gets the same assertion, driven by its own list: every
+# entry present in the image, owner 0:0, the mode staging gave it (0755 only
+# because the file is Mach-O), and byte-equal to the staging copy.
+for e in "${prog_check[@]}"; do
+	p=${e%:*}; m=${e##*:}; m=${m#0}	# stat %a prints 755, not 0755
+	if ! got=$(stat -c '%u:%g:%a' "$work/img/$p" 2>/dev/null); then
+		die "program /$p staged but not in the image"
+	fi
+	[[ $got == "0:0:$m" ]] || die "/$p is $got in the image, expected 0:0:$m"
+	cmp -s "$work/img/$p" "$stage/$p" || die "/$p differs between staging and image"
+done
+(( ${#prog_check[@]} == 0 )) || say "${#prog_check[@]} program entries in the image: 0:0, modes as staged, bytes equal"
 
 # The checker runs on the staging tree: same relative set, same modes; the
 # image only adds the owners, which are asserted above. The image itself is
@@ -454,6 +722,9 @@ boot it with:
                    avicii/tools/mkpayload.py --ramdisk; the md driver makes md0
                    from it and rd=md0 roots on it (IOKitBSDInit.cpp:760-790)
   checker:         $CHECK $stage --min-files 0   (exit $rc)
+  programs:        ${#prog_check[@]} entries from ${programs_file:-<none, --programs not given>}
+  vardirs:         $(( do_vardirs ? 1 : 0 )) (private/var/{folders,mobile,mobile/tmp,root})
+  share:           $(( do_share ? 1 : 0 )) (usr/share/icu, usr/share/zoneinfo: $share_files files, $share_dirs dirs, $share_bytes B)
 EOF
 
 if (( rc != 0 )); then
