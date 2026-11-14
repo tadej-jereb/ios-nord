@@ -27,7 +27,7 @@
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
-@@ -256,6 +267,428 @@ touch_irq(void)
+@@ -256,6 +267,436 @@ touch_irq(void)
  	return st.irq_last;
  }
  
@@ -52,7 +52,9 @@
 + * the spacewar port (refs/anonbeat1-ios-sweet xnu 0089), which proved the same
 + * hypervisor refuses S2CR bypass and needs a stage-1 bank for both the GPI and
 + * the wrapper stream IDs. Everything is polled; DMA memory is one contiguous
-+ * region below 4 GiB, identity mapped (IOVA == PA), cleaned by PA around use.
++ * region, identity mapped (IOVA == PA), cleaned by PA around use. XNU's DRAM on
++ * avicii is the ADT window 0x180000000 + 0xfff00000 (docs/PHONE_TEST.md §3), all
++ * above 4 GiB, so every ring base, doorbell and DMA TRE carries the high word.
 + */
 +#define GSI_GPI_PA       0x00900000u
 +#define GSI_GPI_SIZE     0x60000u
@@ -104,7 +106,9 @@
 +}
 +
 +static inline vm_offset_t gsi_va(uint32_t off) { return st.dma + off; }
-+static inline uint32_t gsi_pa(uint32_t off) { return (uint32_t)(st.dma_pa + off); }
++static inline uint64_t gsi_pa(uint32_t off) { return st.dma_pa + off; }
++static inline uint32_t gsi_lo(uint64_t pa) { return (uint32_t)pa; }
++static inline uint32_t gsi_hi(uint64_t pa) { return (uint32_t)(pa >> 32); }
 +
 +static void
 +gsi_smmu_map_sid(unsigned sid, unsigned nsmr, int *free_from)
@@ -168,13 +172,13 @@
 +		return false;
 +	}
 +
-+	/* Identity map 0x80000000..0xffffffff (DRAM below 4 GiB, where the region
-+	 * lives): level-1 1 GiB blocks, Normal NC, AF, AP RW. */
++	/* Identity map XNU's DRAM 0x180000000..0x27fffffff: level-1 1 GiB blocks
++	 * 6..9, Normal NC, AF, AP RW (39-bit VA, 4K granule). */
 +	volatile uint64_t *l1 = (volatile uint64_t *)gsi_va(GSI_OFF_L1);
 +	for (unsigned i = 0; i < 512; i++) {
 +		l1[i] = 0;
 +	}
-+	for (unsigned i = 2; i < 4; i++) {
++	for (unsigned i = 6; i < 10; i++) {
 +		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
 +	}
 +	gsi_flush(GSI_OFF_L1, 4096);
@@ -188,7 +192,7 @@
 +	touch_wr(cb, 0x10, 7u << 15 | 2);                      /* TCR2 PA 40-bit */
 +	touch_wr(cb, 0x30, 25 | 1u << 23);                     /* TCR T0SZ 25, 4K, EPD1 */
 +	touch_wr(cb, 0x34, asid);                              /* CONTEXTIDR */
-+	gsi_wr64(cb, 0x20, (uint64_t)gsi_pa(GSI_OFF_L1) | (uint64_t)asid << 48);
++	gsi_wr64(cb, 0x20, gsi_pa(GSI_OFF_L1) | (uint64_t)asid << 48);
 +	gsi_wr64(cb, 0x28, 0);
 +	touch_wr(cb, 0x38, 0x44);                              /* MAIR0 Normal NC */
 +	touch_wr(cb, 0x618, 0);                                /* TLBIALL */
@@ -280,14 +284,14 @@
 +	}
 +	touch_wr(st.gpi, GSI_EV_CTX + 0x0, 16u << 24 | 1u << 16 | 2);
 +	touch_wr(st.gpi, GSI_EV_CTX + 0x4, GSI_NTRE * 16);
-+	touch_wr(st.gpi, GSI_EV_CTX + 0x8, gsi_pa(GSI_OFF_EV));
-+	touch_wr(st.gpi, GSI_EV_CTX + 0xc, 0);
-+	touch_wr(st.gpi, GSI_EV_DB + 0x4, 0);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x8, gsi_lo(gsi_pa(GSI_OFF_EV)));
++	touch_wr(st.gpi, GSI_EV_CTX + 0xc, gsi_hi(gsi_pa(GSI_OFF_EV)));
++	touch_wr(st.gpi, GSI_EV_DB + 0x4, gsi_hi(gsi_pa(GSI_OFF_EV)));
 +	touch_wr(st.gpi, GSI_EV_CTX + 0x20, 0), touch_wr(st.gpi, GSI_EV_CTX + 0x28, 0);
 +	touch_wr(st.gpi, GSI_EV_CTX + 0x2c, 0), touch_wr(st.gpi, GSI_EV_CTX + 0x30, 0);
 +	touch_wr(st.gpi, GSI_EV_CTX + 0x34, 0);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	touch_wr(st.gpi, GSI_EV_DB, gsi_pa(GSI_OFF_EV) + (GSI_NTRE - 1) * 16);
++	touch_wr(st.gpi, GSI_EV_DB, gsi_lo(gsi_pa(GSI_OFF_EV) + (GSI_NTRE - 1) * 16));
 +
 +	uint32_t roff[2] = {GSI_OFF_TX, GSI_OFF_RX};
 +	for (unsigned k = 0; k < 2; k++) {
@@ -297,9 +301,9 @@
 +		/* el 16, erindex 0, dir (tx out = 1), chtype GPI */
 +		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x0, 16u << 24 | (k ? 0u : 1u) << 3 | 2);
 +		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x4, GSI_NTRE * 16);
-+		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x8, gsi_pa(roff[k]));
-+		touch_wr(st.gpi, GSI_CH_CTX(k) + 0xc, 0);
-+		touch_wr(st.gpi, GSI_CH_DB(k) + 0x4, 0);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x8, gsi_lo(gsi_pa(roff[k])));
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0xc, gsi_hi(gsi_pa(roff[k])));
++		touch_wr(st.gpi, GSI_CH_DB(k) + 0x4, gsi_hi(gsi_pa(roff[k])));
 +		/* SCRATCH_0: pair channel, protocol, SE id */
 +		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x60, (k ? 0u : 1u) << 16 |
 +		    GSI_PROTO_I2C << 4 | GSI_SEID);
@@ -330,8 +334,7 @@
 +		printf("SWEET TOUCH: GPI/SMMU mapping failed\n");
 +		return false;
 +	}
-+	ppnum_t max_pnum = (ppnum_t)(atop_64(1ULL << 32) - 1);
-+	if (kmem_alloc_contig(kernel_map, &st.dma, GSI_REGION, PAGE_MASK, max_pnum,
++	if (kmem_alloc_contig(kernel_map, &st.dma, GSI_REGION, PAGE_MASK, 0,
 +	    0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("SWEET TOUCH: no contiguous DMA memory\n");
 +		return false;
@@ -343,7 +346,8 @@
 +	}
 +	st.dma_pa = ptoa_64(pn);
 +	printf("SWEET TOUCH: GSI region pa %#llx\n", st.dma_pa);
-+	if (st.dma_pa < 0x80000000ull || st.dma_pa + GSI_REGION > 0x100000000ull) {
++	if (st.dma_pa < 0x180000000ull || st.dma_pa + GSI_REGION > 0x280000000ull ||
++	    gsi_hi(st.dma_pa) != gsi_hi(st.dma_pa + GSI_REGION - 1)) {
 +		printf("SWEET TOUCH: DMA region outside the identity map\n");
 +		return false;
 +	}
@@ -366,7 +370,7 @@
 +	uint32_t bad = 0;
 +	gsi_flush(GSI_OFF_EV, GSI_NTRE * 16);
 +	uint32_t hw = touch_rd(st.gpi, GSI_EV_CTX + 0x10);
-+	while (gsi_pa(GSI_OFF_EV) + st.ev_rp * 16 != hw) {
++	while (gsi_lo(gsi_pa(GSI_OFF_EV) + st.ev_rp * 16) != hw) {
 +		volatile uint32_t *e = (volatile uint32_t *)(gsi_va(GSI_OFF_EV) + st.ev_rp * 16);
 +		uint32_t type = (e[3] >> 16) & 0xffu, code = (e[2] >> 24) & 0xffu;
 +		if (type == 0x22 && code == 16 && !bad) {      /* XFER_COMPLETE, UNEXP_ERR */
@@ -380,7 +384,8 @@
 +		}
 +		st.ev_rp = (st.ev_rp + 1) % GSI_NTRE;
 +	}
-+	touch_wr(st.gpi, GSI_EV_DB, gsi_pa(GSI_OFF_EV) + ((st.ev_rp + GSI_NTRE - 1) % GSI_NTRE) * 16);
++	touch_wr(st.gpi, GSI_EV_DB, gsi_lo(gsi_pa(GSI_OFF_EV) +
++	    ((st.ev_rp + GSI_NTRE - 1) % GSI_NTRE) * 16));
 +	touch_wr(st.gpi, GSI_IEOB_CLR, 1);
 +	return bad;
 +}
@@ -404,14 +409,17 @@
 +		gsi_put(GSI_OFF_TX, &st.tx_wp, 3u << 24 | 26u << 16 | 10u << 8 | 11u, 0, 7u,
 +		    TRE_CONFIG0 | TRE_CHAIN);
 +		gsi_put(GSI_OFF_TX, &st.tx_wp, go | 1u, 0, nt, TRE_GO | TRE_CHAIN);
-+		gsi_put(GSI_OFF_TX, &st.tx_wp, gsi_pa(GSI_OFF_DTX), 0, nt, TRE_DMA | TRE_IEOT);
++		gsi_put(GSI_OFF_TX, &st.tx_wp, gsi_lo(gsi_pa(GSI_OFF_DTX)),
++		    gsi_hi(gsi_pa(GSI_OFF_DTX)), nt, TRE_DMA | TRE_IEOT);
 +	} else {
 +		memset((void *)gsi_va(GSI_OFF_DRX), 0xa5, 128);
 +		gsi_flush(GSI_OFF_DRX, 128);
-+		gsi_put(GSI_OFF_RX, &st.rx_wp, gsi_pa(GSI_OFF_DRX), 0, nr, TRE_DMA | TRE_IEOT);
++		gsi_put(GSI_OFF_RX, &st.rx_wp, gsi_lo(gsi_pa(GSI_OFF_DRX)),
++		    gsi_hi(gsi_pa(GSI_OFF_DRX)), nr, TRE_DMA | TRE_IEOT);
 +		gsi_put(GSI_OFF_TX, &st.tx_wp, go | 2u, 0, nr, TRE_GO | TRE_LINK);
 +	}
-+	uint32_t txw = gsi_pa(GSI_OFF_TX) + st.tx_wp * 16, rxw = gsi_pa(GSI_OFF_RX) + st.rx_wp * 16;
++	uint32_t txw = gsi_lo(gsi_pa(GSI_OFF_TX) + st.tx_wp * 16);
++	uint32_t rxw = gsi_lo(gsi_pa(GSI_OFF_RX) + st.rx_wp * 16);
 +	if (nr) {
 +		touch_wr(st.gpi, GSI_CH_DB(1), rxw);
 +	}
@@ -456,7 +464,7 @@
  /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
  static int
  touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
-@@ -264,6 +697,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -264,6 +705,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
  		return EIO;
  	}
@@ -466,7 +474,7 @@
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
  		st.dead = true; /* no other SE7 owner is supported */
  		return EBUSY;
-@@ -556,6 +992,12 @@ touch_se_init(void)
+@@ -556,6 +1000,12 @@ touch_se_init(void)
  	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
  	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
  	    touch_rd(st.se, 0x908));
@@ -479,7 +487,7 @@
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
  	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
  	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-@@ -672,8 +1114,9 @@ touch_thread(void *arg, wait_result_t result)
+@@ -672,8 +1122,9 @@ touch_thread(void *arg, wait_result_t result)
  	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
  	    st.irq_status);
  	(void)touch_probe_info(0x8240, legacy);
