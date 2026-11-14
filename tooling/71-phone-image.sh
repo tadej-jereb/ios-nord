@@ -38,7 +38,7 @@ SHIM=${SHIM:-build/phone/shim-out-d0/Image.gz-dtb}   # DIAG_STAGE=0: jumps, does
 COMMON="debug=0xc cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetlog=1"
 declare -A PRESET=(
 	[gui]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=0 sweetkeys=1"
-	[touch]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweettouchdelay=45 sweetkeys=1"
+	[touch]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweettouchdelay=45 sweettouchrails=2 sweettouch1v8=1 sweetkeys=1"
 	[console]="$COMMON sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=1 launchd_log_serial=1 sweetexeclog=1 -v"
 	[noinput]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=0 sweetkeys=0"
 )

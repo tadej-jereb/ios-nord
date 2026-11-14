@@ -14,7 +14,44 @@
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
  extern kern_return_t thread_terminate(thread_t);
  extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
-@@ -110,6 +115,13 @@ void sweet_touch_init(void);
+@@ -64,14 +69,30 @@ void sweet_touch_init(void);
+  * config. Mirror in panel space; SweetHID then adds the 1125x2436 presentation
+  * offset (base patch 0061).
+  */
+-#define TOUCH_XFLIP      1
+-#define TOUCH_YFLIP      1
++/*
++ * The Goodix node (unlike st_fts@49) carries no flip property and its
++ * touchpanel,panel-coords equal its display-coords (1080x2400), so the GT9886
++ * reports panel coordinates as is. boot-arg sweettouchflip: bit 0 mirrors X,
++ * bit 1 mirrors Y, for a panel that turns out otherwise.
++ */
++static unsigned touch_flip;
++#define TOUCH_XFLIP      (touch_flip & 1u)
++#define TOUCH_YFLIP      (touch_flip & 2u)
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+-/* GT9886 shares the 0x5d Goodix protocol; no Yellowstone quirks. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
++/*
++ * GT9886 as OnePlus drives it on this phone (OnePlusOSS android_kernel_oneplus_
++ * sm7250, drivers/oneplus/input/touchscreen/Goodix/GT9886/goodix_drivers_gt9886.c):
++ * product version at 0x452C (72 bytes, "9886" at bytes 9..12, byte sum 0),
++ * touch frame at 0x4100: [0] event (0x80 touch, 0x40 request), [1] & 0x0f
++ * points, then 8 bytes per point (id & 0x0f, x LE16, y LE16, z, major, area)
++ * and a 2-byte tail; the 2 + 8n + 2 bytes sum to 0. Writing 0 to 0x4100 acks.
++ * The earlier 0x4022/0x4180 big-endian layout was the GT9896 one: on this IC
++ * 0x4022 reads 6f 38 0f 04 ... (2026-11-14).
++ */
++#define GOODIX_PID_REG   0x452cu
++#define GOODIX_EVENT_REG 0x4100u
++#define GOODIX_HEAD_LEN  2u
+ #define GOODIX_POINT_LEN 8u
+ 
+ #define SE_STATUS       0x040u
+@@ -110,6 +131,13 @@ void sweet_touch_init(void);
  static struct {
  	vm_offset_t se, gcc, gpio, gpio_s;
  	bool started, dead, probing;
@@ -28,7 +65,7 @@
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
-@@ -256,6 +268,594 @@ touch_irq(void)
+@@ -256,6 +284,594 @@ touch_irq(void)
  	return st.irq_last;
  }
  
@@ -623,7 +660,7 @@
  /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
  static int
  touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
-@@ -264,6 +864,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -264,6 +880,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
  		return EIO;
  	}
@@ -633,7 +670,90 @@
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
  		st.dead = true; /* no other SE7 owner is supported */
  		return EBUSY;
-@@ -556,6 +1159,12 @@ touch_se_init(void)
+@@ -368,6 +987,7 @@ static int
+ touch_goodix_ack(void)
+ {
+ 	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
++	/* goodix_clear_irq: one zero byte to the coordinate register */
+ 	return touch_msg(TOUCH_ADDR, ack, sizeof(ack), NULL, 0, false);
+ }
+ 
+@@ -399,7 +1019,7 @@ touch_be16(const uint8_t *p)
+ 	return ((unsigned)p[0] << 8) | p[1];
+ }
+ 
+-static bool
++static bool __unused
+ touch_checksum(const uint8_t *buf, unsigned len)
+ {
+ 	if (len < 2) {
+@@ -448,43 +1068,47 @@ touch_goodix(void)
+ 	uint8_t buf[90];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0;
+-	int err = touch_read(TOUCH_ADDR, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
++	/* event, count, one point, tail: what the vendor driver reads first */
++	int err = touch_read(TOUCH_ADDR, GOODIX_EVENT_REG, true, buf,
++	    GOODIX_HEAD_LEN + GOODIX_POINT_LEN + 2u);
+ 	if (err) {
+ 		return err;
+ 	}
+ 	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+ 		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
++			return ENOTSUP; /* config request: not serviced */
+ 		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
++		if (buf[0]) {
++			(void)touch_goodix_ack(); /* status-only frame */
++		}
++		return 0;
+ 	}
+-	unsigned n = buf[2] & 15u;
++	unsigned n = buf[1] & 15u;
+ 	if (n > TOUCH_MAX) {
+ 		(void)touch_goodix_ack();
+ 		return EIO;
+ 	}
+-	if (n) {
++	if (n > 1) {
+ 		err = touch_read(TOUCH_ADDR, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+ 		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+ 		if (err) {
+ 			return err;
+ 		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
++	}
++	uint8_t sum = 0;
++	for (unsigned i = 0; i < GOODIX_HEAD_LEN + n * GOODIX_POINT_LEN + 2u; ++i) {
++		sum += buf[i]; /* goodix_u32_trigger_reason: 8-bit sum of the frame is 0 */
++	}
++	if (sum) {
++		(void)touch_goodix_ack();
++		return EIO;
+ 	}
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px >= TOUCH_PANEL_W || py >= TOUCH_PANEL_H) {
++		unsigned id = p[0] & 15u;
++		unsigned px = p[1] | ((unsigned)p[2] << 8), py = p[3] | ((unsigned)p[4] << 8);
++		if (id >= TOUCH_MAX || (mask & (1u << id)) ||
++		    px >= TOUCH_PANEL_W || py >= TOUCH_PANEL_H) {
+ 			(void)touch_goodix_ack();
+ 			return EIO;
+ 		}
+@@ -556,6 +1180,12 @@ touch_se_init(void)
  	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
  	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
  	    touch_rd(st.se, 0x908));
@@ -646,7 +766,7 @@
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
  	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
  	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-@@ -644,22 +1253,48 @@ touch_thread(void *arg, wait_result_t result)
+@@ -644,22 +1274,48 @@ touch_thread(void *arg, wait_result_t result)
  	 * (lito.dtsi:3998-3999). "ldo13" is the live-tree resource spelling,
  	 * "ldoa13" the DT one: retry the second if the cmd-db lookup misses.
  	 */
@@ -701,9 +821,16 @@
  	/* Vendor GT9886 dev_confirm: reset low 2 ms, then high. */
  	touch_gpio(8, 0, 3, 3, true, false);
  	touch_wait(2);
-@@ -672,8 +1307,9 @@ touch_thread(void *arg, wait_result_t result)
- 	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
- 	    st.irq_status);
+@@ -668,17 +1324,18 @@ touch_thread(void *arg, wait_result_t result)
+ 	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+ 	st.probing = true;
+ 	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe %#x err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
+-	    st.irq_status);
++	printf("SWEET TOUCH: probe %#x err=%d product GT%c%c%c%c patch %02x%02x%02x%02x mask %02x%02x%02x sensor %02x\n",
++	    TOUCH_ADDR, ge, gid[9], gid[10], gid[11], gid[12], gid[17], gid[18], gid[19],
++	    gid[20], gid[6], gid[7], gid[8], gid[21]);
  	(void)touch_probe_info(0x8240, legacy);
 -	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
 -	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
@@ -713,3 +840,26 @@
  	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
  	    fe1, fe2, fid1, fid2, st.irq_status);
  	st.probing = false;
+ 	/* "9886" is expected; accept the GT98xx family and log what came back. */
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8';
++	bool goodix = !ge && gid[9] == '9' && gid[10] == '8';
+ 	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+ 	if (st.dead || goodix == fts) {
+ 		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+@@ -688,7 +1345,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+ 	printf("SWEET TOUCH: selected %s, %ux%u flip=%d/%d, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "Goodix GT9886" : "Focaltech 54:52", TOUCH_PANEL_W, TOUCH_PANEL_H,
+-	    TOUCH_XFLIP, TOUCH_YFLIP, st.irq_hint);
++	    (int)TOUCH_XFLIP, (int)TOUCH_YFLIP, st.irq_hint);
+ 	int probe_only = 0;
+ 	(void)PE_parse_boot_argn("sweettouchprobe", &probe_only, sizeof(probe_only));
+ 	if (probe_only) {
+@@ -731,6 +1388,7 @@ sweet_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweettouchflip", &touch_flip, sizeof(touch_flip));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
