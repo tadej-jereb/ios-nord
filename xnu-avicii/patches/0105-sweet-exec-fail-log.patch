@@ -1,0 +1,53 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2097,8 +2097,30 @@
+ 	{ exec_fat_imgact, "Fat Binary" },
+ 	{ exec_shell_imgact, "Interpreter Script" },
+ 	{ NULL, NULL}
+ };
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET EXEC: a failed exec is silent. exec_activate_image() hands its errno
++ * back to execve()/posix_spawn(), and the caller -- launchd for a job whose
++ * Program does not exist, xpcproxy for a service -- reports it only on its
++ * own stderr, which nothing in this userland delivers. Print the path and
++ * the errno once per failed image activation instead.
++ *
++ * sweetexeclog=1 enables it; default off, so a normal boot is unchanged.
++ */
++static TUNABLE(bool, sweet_execlog, "sweetexeclog", false);
++
++static void
++sweet_exec_fail_log(const char *path, int error)
++{
++	if (!sweet_execlog || error == 0) {
++		return;
++	}
++	printf("SWEET EXEC: %s failed errno %d\n", path != NULL ? path : "(no path)", error);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * exec_activate_image
+@@ -2131,7 +2153,7 @@
+ static int
+ exec_activate_image(struct image_params *imgp)
+ {
+ 	struct nameidata *ndp = NULL;
+-	const char *excpath;
++	const char *excpath = NULL;     /* stays unset if exec_save_path() fails */
+ 	int error;
+ 	int resid;
+@@ -2303,7 +2325,10 @@
+ bad:
+ 	proc_transend(p, 0);
+ 
+ bad_notrans:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_exec_fail_log(excpath, error);
++#endif
+ 	if (imgp->ip_strings) {
+ 		execargs_free(imgp);
+ 	}
