@@ -1,0 +1,367 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_smmu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.c
+@@ -0,0 +1,204 @@
++/*
++ * SWEET avicii: one shared apps_smmu stage-1 context bank for the DMA masters
++ * XNU drives itself (GPI touch: SIDs 0x36/0x23; USB DWC3: SID 0xE0).
++ *
++ * The Qualcomm hypervisor owns stage 2 and refuses a bypass S2CR (it reads
++ * back as fault), so each stream needs an SMR whose S2CR translates through a
++ * stage-1 bank. The bank identity-maps XNU's DRAM window 0x180000000 +
++ * 0xfff00000 (ADT dram-base/dram-size, docs/PHONE_TEST.md §3) with level-1
++ * 1 GiB blocks 6..9, Normal non-cacheable, so IOVA == PA for every kernel
++ * buffer. Method and register sequence: the spacewar port
++ * (refs/anonbeat1-ios-sweet xnu 0089/0091), proven on avicii by the touch
++ * bring-up of 2026-11-14 (cb 2, SMR 3 and 5 accepted, GPI DMA works).
++ *
++ * apps-smmu@15000000, reg 0x15000000/0x100000 (live FDT). Thread context only.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++int sweet_smmu_map_sid(unsigned sid);
++
++#define SMMU_PA          0x15000000u
++#define SMMU_SIZE        0x100000u
++#define DRAM_L1_FIRST    6u      /* 0x180000000 */
++#define DRAM_L1_END      10u     /* up to 0x27fffffff */
++
++static LCK_GRP_DECLARE(sweet_smmu_grp, "sweet_smmu");
++static LCK_MTX_DECLARE(sweet_smmu_lock, &sweet_smmu_grp);
++static vm_offset_t smmu, l1_va;
++static uint64_t l1_pa;
++static int bank = -1;
++static bool failed;
++static unsigned nsmr, pgshift;
++static vm_offset_t gr1, cbase;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint64_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static int
++bank_create(void)
++{
++	smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		return ENOMEM;
++	}
++	uint32_t id0 = rd(smmu, 0x20), id1 = rd(smmu, 0x24);
++	pgshift = (id1 >> 31) ? 16 : 12;
++	unsigned ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff;
++	nsmr = id0 & 0xff;
++	gr1 = smmu + (1u << pgshift);
++	cbase = smmu + ((vm_offset_t)(1u << (((id1 >> 28) & 7) + 1)) << pgshift);
++	printf("SWEET SMMU: cr0 %#x id0 %#x id1 %#x (cb %u s2cb %u smr %u)\n",
++	    rd(smmu, 0), id0, id1, ncb, ns2cb, nsmr);
++
++	uint32_t used[8] = {0};
++	for (unsigned i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = rd(smmu, 0x800 + 4 * i), s2cr = rd(smmu, 0xc00 + 4 * i);
++		if ((smr & (1u << 31)) && ((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
++		}
++	}
++	for (unsigned c = ns2cb; c < ncb && c < 256 && bank < 0; c++) {
++		if (!(used[c / 32] & (1u << (c % 32))) &&
++		    !(rd(cbase + ((vm_offset_t)c << pgshift), 0) & 1)) {
++			bank = (int)c;
++		}
++	}
++	if (bank < 0) {
++		printf("SWEET SMMU: no free context bank\n");
++		return ENOSPC;
++	}
++
++	if (kmem_alloc_contig(kernel_map, &l1_va, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		bank = -1;
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)l1_va);
++	if (!pn) {
++		bank = -1;
++		return ENOMEM;
++	}
++	l1_pa = ptoa_64(pn);
++	volatile uint64_t *l1 = (volatile uint64_t *)l1_va;
++	for (unsigned i = 0; i < 512; i++) {
++		l1[i] = 0;
++	}
++	for (unsigned i = DRAM_L1_FIRST; i < DRAM_L1_END; i++) {
++		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
++	}
++	flush_dcache64((addr64_t)l1_pa, PAGE_SIZE, TRUE);
++
++	vm_offset_t cb = cbase + ((vm_offset_t)bank << pgshift);
++	unsigned asid = (unsigned)bank;
++	wr(cb, 0x0, 0);                                 /* SCTLR off */
++	wr(cb, 0x58, 0xffffffffu);                      /* FSR clear */
++	wr(gr1, 0x800 + 4 * (unsigned)bank, 1);         /* CBA2R VA64 */
++	wr(gr1, 4 * (unsigned)bank, 1u << 16 | 0xfu << 12 | 3u << 8);
++	wr(cb, 0x10, 7u << 15 | 2);                     /* TCR2 PA 40-bit */
++	wr(cb, 0x30, 25 | 1u << 23);                    /* TCR T0SZ 25, 4K, EPD1 */
++	wr(cb, 0x34, asid);                             /* CONTEXTIDR */
++	wr64(cb, 0x20, l1_pa | (uint64_t)asid << 48);   /* TTBR0 */
++	wr64(cb, 0x28, 0);
++	wr(cb, 0x38, 0x44);                             /* MAIR0 Normal NC */
++	wr(cb, 0x618, 0);                               /* TLBIALL */
++	wr(cb, 0x7f0, 0);                               /* TLBSYNC */
++	for (int t = 0; t < 100000 && (rd(cb, 0x7f4) & 1); t++) {
++		delay(1);
++	}
++	wr(cb, 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1);
++	printf("SWEET SMMU: cb %d sctlr %#x cbar %#x ttbr0 %#llx (identity 0x180000000..0x27fffffff)\n",
++	    bank, rd(cb, 0x0), rd(gr1, 4 * (unsigned)bank), l1_pa);
++	return (rd(cb, 0x0) & 1) ? 0 : EIO;
++}
++
++/*
++ * Route one stream ID through the shared bank. An SMR that already matches
++ * exactly this SID (mask 0) is repointed (firmware left it for its own
++ * tables); one whose mask also covers other SIDs is left alone and the call
++ * fails, since repointing it would move streams this kernel does not drive.
++ */
++int
++sweet_smmu_map_sid(unsigned sid)
++{
++	int err = 0;
++	lck_mtx_lock(&sweet_smmu_lock);
++	if (failed) {
++		err = EIO;
++		goto out;
++	}
++	if (bank < 0 && (err = bank_create()) != 0) {
++		failed = true;
++		goto out;
++	}
++	int free_smr = -1;
++	for (unsigned i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = rd(smmu, 0x800 + 4 * i), s2cr = rd(smmu, 0xc00 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (free_smr < 0) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		uint32_t id = smr & 0xffffu, mask = (smr >> 16) & 0x7fffu;
++		if (((sid ^ id) & ~mask) != 0) {
++			continue;
++		}
++		if (mask == 0 && id == sid) {
++			if (s2cr == (uint32_t)bank) {
++				goto out;       /* already ours */
++			}
++			wr(smmu, 0xc00 + 4 * i, (uint32_t)bank);
++			printf("SWEET SMMU: sid %#x existing smr %u, s2cr %#x -> %#x\n", sid, i,
++			    s2cr, rd(smmu, 0xc00 + 4 * i));
++			goto out;
++		}
++		printf("SWEET SMMU: sid %#x inside smr %u %#x (s2cr %#x); not repointed\n",
++		    sid, i, smr, s2cr);
++		err = EBUSY;
++		goto out;
++	}
++	if (free_smr < 0) {
++		printf("SWEET SMMU: no free SMR for sid %#x\n", sid);
++		err = ENOSPC;
++		goto out;
++	}
++	wr(smmu, 0xc00 + 4 * (unsigned)free_smr, (uint32_t)bank);  /* S2CR translate */
++	wr(smmu, 0x800 + 4 * (unsigned)free_smr, (1u << 31) | sid); /* SMR valid */
++	printf("SWEET SMMU: sid %#x -> smr %d s2cr %#x smr %#x\n", sid, free_smr,
++	    rd(smmu, 0xc00 + 4 * (unsigned)free_smr), rd(smmu, 0x800 + 4 * (unsigned)free_smr));
++out:
++	lck_mtx_unlock(&sweet_smmu_lock);
++	return err;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -362,7 +362,7 @@ gsi_step(const char *what)
+ 	}
+ }
+ 
+-static void
++static void __unused
+ gsi_wr64(vm_offset_t base, uint32_t off, uint64_t val)
+ {
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -381,107 +381,14 @@ static inline uint64_t gsi_pa(uint32_t off) { return st.dma_pa + off; }
+ static inline uint32_t gsi_lo(uint64_t pa) { return (uint32_t)pa; }
+ static inline uint32_t gsi_hi(uint64_t pa) { return (uint32_t)(pa >> 32); }
+ 
+-static void
+-gsi_smmu_map_sid(unsigned sid, unsigned nsmr, int *free_from)
+-{
+-	for (unsigned i = (unsigned)*free_from; i < nsmr && i < 128; i++) {
+-		if (touch_rd(st.smmu, 0x800 + 4 * i) & (1u << 31)) {
+-			continue;
+-		}
+-		touch_wr(st.smmu, 0xc00 + 4 * i, (uint32_t)st.smmu_cb); /* S2CR translate */
+-		touch_wr(st.smmu, 0x800 + 4 * i, (1u << 31) | sid);     /* SMR valid, mask 0 */
+-		*free_from = (int)i + 1;
+-		printf("SWEET TOUCH: SMMU sid %#x -> smr %u s2cr %#x smr %#x\n", sid, i,
+-		    touch_rd(st.smmu, 0xc00 + 4 * i), touch_rd(st.smmu, 0x800 + 4 * i));
+-		return;
+-	}
+-	printf("SWEET TOUCH: SMMU no free SMR for sid %#x\n", sid);
+-}
++extern int sweet_smmu_map_sid(unsigned sid);  /* bsd/dev/sweet_smmu.c */
+ 
+ static bool
+ gsi_smmu_setup(void)
+ {
+-	uint32_t id0 = touch_rd(st.smmu, 0x20), id1 = touch_rd(st.smmu, 0x24);
+-	unsigned pgshift = (id1 >> 31) ? 16 : 12;
+-	unsigned ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff, nsmr = id0 & 0xff;
+-	vm_offset_t gr1 = st.smmu + (1u << pgshift);
+-	vm_offset_t cbase = st.smmu + ((vm_offset_t)(1u << (((id1 >> 28) & 7) + 1)) << pgshift);
+-	printf("SWEET TOUCH: SMMU cr0 %#x id0 %#x id1 %#x (cb %u s2cb %u smr %u)\n",
+-	    touch_rd(st.smmu, 0), id0, id1, ncb, ns2cb, nsmr);
+-
+-	/* A SID that already has a match group would be shadowed: refuse. */
+-	uint32_t used[8] = {0};
+-	int free_smr = -1;
+-	for (unsigned i = 0; i < nsmr && i < 128; i++) {
+-		uint32_t smr = touch_rd(st.smmu, 0x800 + 4 * i);
+-		uint32_t s2cr = touch_rd(st.smmu, 0xc00 + 4 * i);
+-		if (!(smr & (1u << 31))) {
+-			if (free_smr < 0) {
+-				free_smr = (int)i;
+-			}
+-			continue;
+-		}
+-		uint32_t id = smr & 0xffffu, mask = (smr >> 16) & 0x7fffu;
+-		if (((GSI_SID_GPI ^ id) & ~mask) == 0 || ((GSI_SID_QUP ^ id) & ~mask) == 0) {
+-			printf("SWEET TOUCH: SMMU smr %u %#x already matches our SIDs (s2cr %#x)\n",
+-			    i, smr, s2cr);
+-			return false;
+-		}
+-		if (((s2cr >> 16) & 3) == 0) {
+-			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
+-		}
+-	}
+-	st.smmu_cb = -1;
+-	for (unsigned c = ns2cb; c < ncb && c < 256 && st.smmu_cb < 0; c++) {
+-		if (!(used[c / 32] & (1u << (c % 32))) &&
+-		    !(touch_rd(cbase + ((vm_offset_t)c << pgshift), 0) & 1)) {
+-			st.smmu_cb = (int)c;
+-		}
+-	}
+-	if (st.smmu_cb < 0 || free_smr < 0) {
+-		printf("SWEET TOUCH: SMMU no free cb/smr (cb=%d smr=%d)\n", st.smmu_cb, free_smr);
+-		return false;
+-	}
+-
+-	/* Identity map XNU's DRAM 0x180000000..0x27fffffff: level-1 1 GiB blocks
+-	 * 6..9, Normal NC, AF, AP RW (39-bit VA, 4K granule). */
+-	volatile uint64_t *l1 = (volatile uint64_t *)gsi_va(GSI_OFF_L1);
+-	for (unsigned i = 0; i < 512; i++) {
+-		l1[i] = 0;
+-	}
+-	for (unsigned i = 6; i < 10; i++) {
+-		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
+-	}
+-	gsi_flush(GSI_OFF_L1, 4096);
+-
+-	vm_offset_t cb = cbase + ((vm_offset_t)st.smmu_cb << pgshift);
+-	unsigned asid = (unsigned)st.smmu_cb;
+-	printf("SWEET TOUCH: SMMU picked cb %d (sctlr %#x) free smr %d\n", st.smmu_cb,
+-	    touch_rd(cb, 0x0), free_smr);
+-	gsi_step("smmu cb program");
+-	touch_wr(cb, 0x0, 0);                                  /* SCTLR off */
+-	touch_wr(cb, 0x58, 0xffffffffu);                       /* FSR clear */
+-	touch_wr(gr1, 0x800 + 4 * (unsigned)st.smmu_cb, 1);    /* CBA2R VA64 */
+-	touch_wr(gr1, 4 * (unsigned)st.smmu_cb, 1u << 16 | 0xfu << 12 | 3u << 8);
+-	touch_wr(cb, 0x10, 7u << 15 | 2);                      /* TCR2 PA 40-bit */
+-	touch_wr(cb, 0x30, 25 | 1u << 23);                     /* TCR T0SZ 25, 4K, EPD1 */
+-	touch_wr(cb, 0x34, asid);                              /* CONTEXTIDR */
+-	gsi_wr64(cb, 0x20, gsi_pa(GSI_OFF_L1) | (uint64_t)asid << 48);
+-	gsi_wr64(cb, 0x28, 0);
+-	touch_wr(cb, 0x38, 0x44);                              /* MAIR0 Normal NC */
+-	touch_wr(cb, 0x618, 0);                                /* TLBIALL */
+-	touch_wr(cb, 0x7f0, 0);                                /* TLBSYNC */
+-	for (int t = 0; t < 100000 && (touch_rd(cb, 0x7f4) & 1); t++) {
+-		delay(1);
+-	}
+-	touch_wr(cb, 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1);
+-	gsi_step("smmu cb enabled, mapping sid 0x36");
+-	gsi_smmu_map_sid(GSI_SID_GPI, nsmr, &free_smr);
+-	gsi_step("smmu sid 0x36 mapped, mapping sid 0x23");
+-	gsi_smmu_map_sid(GSI_SID_QUP, nsmr, &free_smr);
+-	printf("SWEET TOUCH: SMMU cb %d sctlr %#x cbar %#x ttbr0 %#x\n", st.smmu_cb,
+-	    touch_rd(cb, 0x0), touch_rd(gr1, 4 * (unsigned)st.smmu_cb), touch_rd(cb, 0x20));
+-	return (touch_rd(cb, 0x0) & 1) != 0;
++	/* The shared bank (sweet_smmu.c) identity-maps XNU's DRAM. */
++	gsi_step("smmu map sid 0x36/0x23");
++	return sweet_smmu_map_sid(GSI_SID_GPI) == 0 && sweet_smmu_map_sid(GSI_SID_QUP) == 0;
+ }
+ 
+ static int
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,6 +41,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_smmu_map_sid(unsigned sid);  /* bsd/dev/sweet_smmu.c */
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -854,6 +855,15 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	/*
++	 * avicii: the DWC3 masters through apps_smmu SID 0xE0 (live FDT ssusb@a600000
++	 * iommus <&apps_smmu 0xe0 0>); without a translating SMR its first event
++	 * write would fault the stream. Route it through the shared identity bank.
++	 */
++	if (sweet_smmu_map_sid(0xe0) != 0) {
++		printf("SWEET USB: SMMU route for sid 0xe0 failed; gadget not started\n");
++		return;
++	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
