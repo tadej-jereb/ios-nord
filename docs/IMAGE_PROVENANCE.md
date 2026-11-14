@@ -499,3 +499,82 @@ Rotate 270 is the measured one, not a guess: on `photos/p6-panel.jpg` it is the 
 that returns `load_init_program`, `hfs: mounted iOSRoot` and `SWEET EARLY PANIC`; 0, 90 and 180
 return reversed word salad. If a future photo comes already rotated, drop the `python3` line and
 OCR the file directly.
+
+## Gate precondition met: the same root has booted in QEMU, 2026-11-14
+
+`build/ios16-root.img` itself (17 179 869 184 B, sha256 `8654ec2b52c442ac3f1df22f051be138b5717908051f9bc9cab7884f81b870a0`
+before and after the run) booted as `md0` in a 22 GiB guest: run `logs/qemu/20261114-fullroot-d2`,
+kernel `avicii/shim/out/kernel-0106/kernel.development.sweet` sha256
+`0ebd41b25b14e1ec3bc853420ba317151010d92e3bfaa7ce4a2e194f5c176d5e` (CI run `43609437971`, branch
+`kern-0106-memdev`; `0106` widens memdev's 32-bit `mdSize << 12`, without which a ramdisk of 4 GiB
+or more reads as size 0 — run `logs/qemu/20261114-fullroot-d1`, `hfs_mountfs: buf_meta_bread failed with 22`).
+Result: `hfs: mounted iOSRoot on device b(1, 0)`, `Early boot complete` at 32.03 s, 160 distinct
+Programs exec including `SpringBoard`, `backboardd`, `runningboardd`, `cfprefsd`, `lsd`; no panic in
+400 s; crash reports only for `CommCenter` (3) and `driverkitd` (1); `SWEET EXEC` failures only
+`launchd.development` and `HorizonSetup`, which no DMG carries.
+
+Phone boot image for the UFS root, built, not booted, nothing written to the phone:
+
+| file | bytes | sha256 |
+|---|---|---|
+| `build/phone/ufsroot.0106.img` | 100663296 | `adf8d023ded2ef05af1b6f012169b6d700e578c237d6176bfbc1e2d72d1b403b` |
+| `build/phone/payload-0106-ufs.bin` | 16613656 | `d66637b7cd63b493bfce2b25e1ba875afb65979da497042eb25d80609b801060` |
+
+    sweetsmp=1 cpus=8 sweettouch=0 sweetkeys=0 sweetfb_console=1 sweetecon=1 rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 launchd_log_serial=1 launchd_disable_all_timeouts=1 sweetexeclog=1 -v debug=0x144 keepsyms=1
+
+`mkbootimg_v1.sh --verify`: `PASS: header v1, stock avicii geometry, gzip+DTB kernel`. Shim
+`build/phone/shim-out-d0/Image.gz-dtb` (`DIAG_STAGE=0`, the one that jumped 4/4 on the handset).
+Phone state read before the write: `sda16` 108196737024 B, signature `48 58 00 05`, 0x40000 blocks
+of 4096 B — the 1 GiB `final-1g.img` volume. Rollback image `build/final-1g.img` sha256
+`d0bdf0fac3e2d66beb5950e96e157a10c916efbb7708bff984edf501a5aae1f7`, on disk.
+
+## Done: 16 GiB root written over userdata, 2026-11-14
+
+Owner approved ("1.", option: write the real root to `userdata`). `logs/phone/20261114-userdata-write/`.
+
+**The `adb exec-out … < image` line in the gate above does not work on adb 34.0.4**: exec-out gives
+the remote `dd` a pty as stdin and never reads the host file (host fd 0 `pos 0`, `dd: stdin: read
+error: I/O error`, `0 bytes copied` after 219 s). Nothing was written by it. The working transport is
+`shell -T` (no pty, binary-safe; a 256 MiB probe hashed identically on both ends, 6.5 s):
+
+    adb -s 64f70df8 shell -T 'dd of=/dev/block/sda16 bs=1M conv=fsync' < build/ios16-root.img
+    17179869184 bytes (16 G) copied, 392.648 s, 42 M/s          (115+82878 records, short reads from the pipe)
+    adb -s 64f70df8 shell 'dd if=/dev/block/sda16 bs=1 count=4 skip=1024 | od -An -tx1'
+    48 58 00 05
+    adb -s 64f70df8 shell 'echo 3 > /proc/sys/vm/drop_caches; dd if=/dev/block/sda16 bs=1M count=16384 | sha256sum'
+    8654ec2b52c442ac3f1df22f051be138b5717908051f9bc9cab7884f81b870a0
+
+Rollback uses the same transport: `adb shell -T 'dd of=/dev/block/sda16 bs=1M conv=fsync' < build/final-1g.img`.
+
+First boot on it: `tooling/70-phone-boot.sh --image build/phone/ufsroot.0106.img`
+(`adf8d023…403b`), 16:11:34 UTC, `Sending 'boot.img' (98304 KB) OKAY` / `Booting OKAY`; no adb and no
+fastboot after 140 s — the phone is in the kernel. Result: pending the panel and the ring pull
+(`logs/phone/20261114-ufsroot-0106/`).
+
+## Phone boots on the written root, 2026-11-14 (all `fastboot boot`, nothing flashed)
+
+| run | image | sha256 | result (panel photo) |
+|---|---|---|---|
+| `logs/phone/20261114-ufsroot-0106` | `build/phone/ufsroot.0106.img` | `adf8d023…403b` | `photos/1000055433.jpg`: launchd boot tasks run; `mount-phase-2` → `mount_hfs` on `/dev/ufsroot0` → `GetMasterBlock: Error 16`, `Resource busy`, `SWEET EARLY PANIC: mount[6] exited … exit status 1` |
+| — | userdata 2-byte patch | — | fstab `/dev/ufsroot0 /private/var …` → `#dev/ufsroot0 …` at sda16 offsets 8059224064 and 12530397184 (both copies; `logs/phone/20261114-fstab-patch/{before,after}.txt`). `build/ios16-root.img` on the host still carries the old line; `33`/`33b` now write a comment-only fstab |
+| `logs/phone/20261114-ufsroot-0106-b` | same | `adf8d023…403b` | `photos/1000055434.jpg`: past mount; `launchd_cache_loader: abort: Unable to find AMFI` → panic (same wall as the sweet port; fix is `launchd_unsecure_cache=1`) |
+| `logs/phone/20261114-ufsroot-0106-uc` | `build/phone/ufsroot.0106-uc.img` (+`launchd_unsecure_cache=1`) | `497db13e…1bcb` | `photos/20261114_173135.jpg`: **no panic after 7 min**; launchd runs the daemon set, `bluetoothd`/`fairplayd.H2` respawn every 10 s (no hardware), same as QEMU and the fajita port |
+| `logs/phone/20261114-ufsroot-0106-gui` | `build/phone/ufsroot.0106-gui.img` | `ef20c2ea…c52e` | fajita's home-screen boot-args adapted (`sweetfb_noconsole=1 sweetfb_hz=10 wdt=-1 ignition_level=1 -noprogress …`, touch/keys off); cmdline in `build/phone/ufsroot.0106-gui.cmdline`. Pending |
+| `logs/phone/20261114-ufsroot-0106-gui2` | `build/phone/ufsroot.0106-gui.img` | `ef20c2ea…c52e` | first-boot LaunchServices DB build: SpringBoard main thread in `_LSContextInitCommon` lock for ~15 min, then `UIApplication _run`; `backboardd` one swap only |
+| `logs/phone/20261114-ufsroot-0108-gui` | `build/phone/ufsroot.0108-gui.img` (kernel `kernel-0108` `37961b9a…6cb3`, CI `43619878134`, + `0107` empty IOAcceleratorES, `0108` SweetSurface client memory, both from the fajita port) | `cb1be8de…306c8` | SpringBoard idle in `UIApplication _run` after ~3 min; still console only — cause: `sweetfb_console=1` on the cmdline makes `AppleCLCD::present()` return before copying any GUI frame |
+| `logs/phone/20261114-ufsroot-0108-gui2` | `build/phone/ufsroot.0108-gui2.img` (same, cmdline without `sweetfb_console=1`, `build/phone/ufsroot.0108-gui2.cmdline`) | `24240dca…7c75` | **iOS GUI on the panel** (owner, 2026-11-14 ~17:31 UTC). Touch and keys off (`sweettouch=0 sweetkeys=0`) |
+| `logs/phone/20261114-ufsroot-0108-input` | `build/phone/ufsroot.0108-input.img` (`sweettouch=1 sweettouchdelay=45 sweetkeys=1`) | `1a0d44a6…e6d6` | power key works; volume: `dn-apid=65535`, wrong PPIDs (PM6150L-derived) and RT offsets one pin off; touch: `GCC branch 0x18008 halted (0x80000002)` (wrap1 s-ahb is HW-clock-gated, not a fault) |
+| `logs/phone/20261114-ufsroot-0109-input` | `build/phone/ufsroot.0109-input.img` (kernel `kernel-0109` `fff5b31d…ecf5`, CI `43622119960`, + `0109`: PPIDs 0x4c4/0x2c2 and RT 0xc410/0xc210 from the live FDT gpio_keys, hwcg-aware branch check) | `7d3e41a2…2015` | **power + volume up/down work** (owner). Touch: `se7 fw=0x303 proto=3 … tx=0x20102864 rx=0x20104800`, then `need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped` — proto, FIFO width and depth pass, so the failing test is `GENI_IF_DISABLE_RO` (0x64) bit 0: SE7's FIFO interface is disabled. The live FDT gives i2c@984000 `dmas`/`dma-names` on `qcom,gpi-dma@800000`, i.e. the bus is configured for GPI DMA only; the driver is FIFO-only |
+| `logs/phone/20261114-ufsroot-0110c-touch` | `build/phone/ufsroot.0110c-touch.img` (kernel `kernel-0110c` `a1dafc3f…4f00`, CI `43626408654`: GPI touch with 64-bit DMA addresses and a log flush per step) | `87979e03…f646d` | **SMMU and GPI DMA come up**: region pa `0x184818000`, apps_smmu cb 2 + SMR 3 (sid 0x36) and SMR 5 (sid 0x23) accepted (`s2cr 0x2`, `sctlr 0x67`), GPII 0 ch0/ch1 STARTED, ev ALLOCATED. The SoC resets at `step rails` — the first `sweet_rpmh_vreg_enable("smpa4", 1800)` on this board; nothing after it reached the ring |
+
+## Host root image: fstab line commented out, 2026-11-14
+
+The same 2-byte edit as on the phone (`/` → `#` at offsets 8059224064 and 12530397184, both copies of
+`/private/etc/fstab`), so re-flashing the host image no longer reproduces the `mount-phase-2` EBUSY
+panic. `build/ios16-root.img` 17 179 869 184 B, sha256 before `8654ec2b52c442ac3f1df22f051be138b5717908051f9bc9cab7884f81b870a0`,
+after **`a2e11e3edff9997b60a11c688f71df7fa54c97d49ba225ac21a061d3f3fcea0c`** (also in
+`build/ios16-root.img.sha256`). The phone's `userdata` differs from both from its first rw boot on
+(journal, `/private/var`); it is not expected to match either hash any more.
+
+Phone images are built with `tooling/71-phone-image.sh` from here on (presets `gui`, `touch`,
+`console`, `noinput`; it refuses `sweetfb_console=1` in a GUI preset).
