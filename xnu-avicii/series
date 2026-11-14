@@ -104,3 +104,4 @@ apply 0105-sweet-exec-fail-log.patch
 apply 0106-sweet-memdev-64bit-size.patch
 apply 0107-sweet-empty-ioacceleratores.patch
 apply 0108-sweet-sweetsurface-client-memory.patch
+apply 0109-avicii-keys-ppids-touch-branches.patch
