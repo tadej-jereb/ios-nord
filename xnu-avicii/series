@@ -100,3 +100,4 @@ apply 0101-sweet-ufs-write-power-mode.patch
 apply 0102-sweet-ufs-write-short-transfer.patch
 apply 0103-sweet-ufs-write-durability.patch
 apply 0104-sweet-ios-exec-platform.patch
+apply 0105-sweet-exec-fail-log.patch
