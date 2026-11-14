@@ -1,0 +1,29 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -324,12 +324,24 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	static uint32_t swaplog;
++	uint64_t ns = 0;
++
++	/* Count every frame backboardd presents; print every swaplog frames with
++	 * the uptime, so the log alone gives a frame rate (boot-arg
++	 * sweetfb_swaplog, default 60 -> one line per second at 60 Hz). */
++	if (swaplog == 0) {
++		uint32_t v = 60;
++		PE_parse_boot_argn("sweetfb_swaplog", &v, sizeof(v));
++		swaplog = (v == 0) ? 1000000 : v;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+-	if ((++sweet_fb_swap_count % 1000) == 0) {
+-		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++	if ((++sweet_fb_swap_count % swaplog) == 0) {
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		IOLog("SWEET FB: swaps %llu t %llu us\n", sweet_fb_swap_count, ns / 1000);
+ 	}
+ }
+ 
