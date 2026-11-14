@@ -65,7 +65,7 @@
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
-@@ -256,6 +284,594 @@ touch_irq(void)
+@@ -256,6 +284,599 @@ touch_irq(void)
  	return st.irq_last;
  }
  
@@ -134,12 +134,17 @@
 + * persistent log is flushed only every 10 s: write it out after every step
 + * (sweet_log_panic_flush only tries the UFS lock and works outside a panic).
 + */
++static unsigned touch_debug;
++
 +static void
 +gsi_step(const char *what)
 +{
-+	printf("SWEET TOUCH: step %s\n", what);
-+	sweet_log_panic_flush();
-+	delay(200000);
++	/* boot-arg sweettouchdebug=1: log, flush and pause after every bring-up step */
++	if (touch_debug) {
++		printf("SWEET TOUCH: step %s\n", what);
++		sweet_log_panic_flush();
++		delay(200000);
++	}
 +}
 +
 +static void
@@ -461,7 +466,7 @@
 +gsi_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 +{
 +	static unsigned logged;
-+	if (logged < 6) {
++	if (touch_debug && logged < 6) {
 +		logged++;
 +		printf("SWEET TOUCH: GSI msg %s addr=%#x len=%u\n", nr ? "read" : "write", addr,
 +		    nr ? nr : nt);
@@ -660,7 +665,7 @@
  /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
  static int
  touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
-@@ -264,6 +880,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -264,6 +885,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
  		return EIO;
  	}
@@ -670,7 +675,7 @@
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
  		st.dead = true; /* no other SE7 owner is supported */
  		return EBUSY;
-@@ -368,6 +987,7 @@ static int
+@@ -368,6 +992,7 @@ static int
  touch_goodix_ack(void)
  {
  	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
@@ -678,7 +683,7 @@
  	return touch_msg(TOUCH_ADDR, ack, sizeof(ack), NULL, 0, false);
  }
  
-@@ -399,7 +1019,7 @@ touch_be16(const uint8_t *p)
+@@ -399,7 +1024,7 @@ touch_be16(const uint8_t *p)
  	return ((unsigned)p[0] << 8) | p[1];
  }
  
@@ -687,7 +692,7 @@
  touch_checksum(const uint8_t *buf, unsigned len)
  {
  	if (len < 2) {
-@@ -448,43 +1068,47 @@ touch_goodix(void)
+@@ -448,43 +1073,47 @@ touch_goodix(void)
  	uint8_t buf[90];
  	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
  	uint32_t mask = 0;
@@ -753,7 +758,7 @@
  			(void)touch_goodix_ack();
  			return EIO;
  		}
-@@ -556,6 +1180,12 @@ touch_se_init(void)
+@@ -556,6 +1185,12 @@ touch_se_init(void)
  	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
  	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
  	    touch_rd(st.se, 0x908));
@@ -766,7 +771,16 @@
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
  	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
  	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-@@ -644,22 +1274,48 @@ touch_thread(void *arg, wait_result_t result)
+@@ -609,7 +1244,7 @@ touch_se_init(void)
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	unsigned delay_s = 45;
++	unsigned delay_s = 5;
+ 	(void)arg;
+ 	(void)result;
+ 	/*
+@@ -644,22 +1279,46 @@ touch_thread(void *arg, wait_result_t result)
  	 * (lito.dtsi:3998-3999). "ldo13" is the live-tree resource spelling,
  	 * "ldoa13" the DT one: retry the second if the cmd-db lookup misses.
  	 */
@@ -775,12 +789,10 @@
 -		power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
 +	/*
 +	 * boot-arg sweettouchrails: bit 0 votes S4 (1.8 V), bit 1 votes L13 (3.0 V).
-+	 * Default 0 since 2026-11-14: the first RPMh vote on avicii (smpa4) reset
-+	 * the SoC (logs/phone/20261114-ufsroot-0110c-touch). S4 is PM8150's main
-+	 * 1.8 V I/O rail and is on whenever the SoC runs; whether ABL leaves L13 on
-+	 * is what a probe without votes answers.
++	 * Default 2 (L13 only), measured 2026-11-14: without L13 the GT9886 does
++	 * not answer; S4 is PM8150's main 1.8 V rail and is on whenever the SoC runs.
 +	 */
-+	unsigned rails = 0;
++	unsigned rails = 2;
 +	(void)PE_parse_boot_argn("sweettouchrails", &rails, sizeof(rails));
 +	int power_error = 0;
 +	if (rails & 1u) {
@@ -803,7 +815,7 @@
  		goto out;
  	}
 -	touch_gpio(90, 0, 0, 0, true, true); /* SOUTH pin, UNVERIFIED on avicii */
-+	unsigned en18 = 0;
++	unsigned en18 = 1; /* measured: the IC is silent until PM8150L GPIO 1 is high */
 +	(void)PE_parse_boot_argn("sweettouch1v8", &en18, sizeof(en18));
 +	touch_enable_1v8(en18 != 0);
 +	gsi_step("1v8 done");
@@ -821,7 +833,7 @@
  	/* Vendor GT9886 dev_confirm: reset low 2 ms, then high. */
  	touch_gpio(8, 0, 3, 3, true, false);
  	touch_wait(2);
-@@ -668,17 +1324,18 @@ touch_thread(void *arg, wait_result_t result)
+@@ -668,17 +1327,18 @@ touch_thread(void *arg, wait_result_t result)
  	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
  	st.probing = true;
  	int ge = touch_probe_info(GOODIX_PID_REG, gid);
@@ -846,7 +858,7 @@
  	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
  	if (st.dead || goodix == fts) {
  		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
-@@ -688,7 +1345,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -688,7 +1348,7 @@ touch_thread(void *arg, wait_result_t result)
  	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
  	printf("SWEET TOUCH: selected %s, %ux%u flip=%d/%d, poll=10ms irq-hint=%d\n",
  	    goodix ? "Goodix GT9886" : "Focaltech 54:52", TOUCH_PANEL_W, TOUCH_PANEL_H,
@@ -855,11 +867,12 @@
  	int probe_only = 0;
  	(void)PE_parse_boot_argn("sweettouchprobe", &probe_only, sizeof(probe_only));
  	if (probe_only) {
-@@ -731,6 +1388,7 @@ sweet_touch_init(void)
+@@ -731,6 +1391,8 @@ sweet_touch_init(void)
  	st.started = true;
  	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
  	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
 +	(void)PE_parse_boot_argn("sweettouchflip", &touch_flip, sizeof(touch_flip));
++	(void)PE_parse_boot_argn("sweettouchdebug", &touch_debug, sizeof(touch_debug));
  	if (!enabled) {
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
