@@ -1,5 +1,27 @@
 # avicii: Goodix GT9886 touch — port dossier
 
+## 0. Result (2026-11-14): touch works — what was measured, and what below turned out wrong
+
+Working image: `tooling/71-phone-image.sh --preset touch` with kernel `avicii/shim/out/kernel-0110f`
+(patches `0110` + `0111`), log `logs/phone/20261114-194619-0110f-touch`. The sections after this one
+are the pre-boot dossier, kept for its reasoning; where they disagree with this section, this one
+is measured and wins.
+
+| item | dossier said | measured / source |
+|---|---|---|
+| SE7 transport | FIFO I2C | **FIFO interface disabled** by the firmware (`GENI_IF_DISABLE_RO` bit 0 = 1); only GPI DMA works. Live FDT `i2c@984000` `dmas` → `qcom,gpi-dma@900000`, SE index 1, protocol 3 |
+| DMA path | — | apps_smmu needs a stage-1 bank (S2CR bypass is not available): SMR for SID 0x36 (gpi_dma1) and 0x23 (qupv3_1). XNU's DRAM is above 4 GiB (0x180000000+), so ring bases, doorbells and DMA TREs carry the high word |
+| GCC branch check | wait on 0x18004..0x18010 | 0x18008 (wrap1 s-ahb) is hardware-clock-gated: skip the halt check in HW-control mode; 0x18010 is no lito branch |
+| 3.0 V (L13) | RPMh `ldo13` on sweet's RSC window | cmd-db name is **`ldoa13`** (addr 0x41100); vote on **DRV2 at 0x18220000** (live FDT `rsc@18200000` reg-names drv-0/1/2, `qcom,drv-id = 2`). Sweet's 0x18200000 is DRV0 and its first TCS access reset the SoC. cmd-db at 0x80860000 is the database itself, not a locator |
+| 1.8 V (S4 vote) | vote `smpa4` | not needed (S4 is on); the I/O supply is the **`enable1v8_gpio` = PM8150L@4 GPIO 1**, found as input; driven high over SPMI (MODE 0x40 = 1, DIG_OUT_SOURCE 0x44 = 0x80, EN 0x46 = 0x80). Without it the first GO stalls with the master active (bus unpowered) |
+| GPIO 90 | drive high | not in avicii's DT; no longer driven (`sweettouchgpio90=1` to opt in) |
+| ID register | 0x4022, ASCII pid in bytes 0-3 | **0x452C**, 72 bytes, "9886" at bytes 9-12 (OnePlusOSS `android_kernel_oneplus_sm7250`, `drivers/oneplus/input/touchscreen/Goodix/GT9886/goodix_drivers_gt9886.c`). 0x4022 reads `6f 38 0f 04 …` |
+| touch frame | 0x4180, BE16 coordinates, 16-bit sum | **0x4100**: [0] event (0x80 touch), [1] & 0x0f points, 8 bytes/point (id & 0x0f, x LE16, y LE16, …), 2-byte tail; 8-bit sum of 2+8n+2 bytes = 0; ack = write one 0 byte to 0x4100 |
+| flips | X and Y mirrored | none in the Goodix node (panel-coords = display-coords 1080x2400); `sweettouchflip` bit 0/1 if needed |
+
+Boot-args in force: `sweettouch=1 sweettouchdelay=45 sweettouchrails=2 sweettouch1v8=1`.
+
+
 Status: **adaptation note. Nothing built, nothing booted on avicii.** The base tree's touch
 driver already speaks this protocol (it was written for a GT9896 on sweet), and the live
 avicii series has already carried part of the port. This note fixes the rest and says

@@ -1,3 +1,54 @@
+# Status — 2026-11-14 (evening), iOS 16.7 runs on the OnePlus Nord: GUI, keys and touch
+
+The phone boots the real iOS 16.7.16 (20H392) root from `userdata` and shows the iOS GUI on its
+panel, with working touch, power and volume keys. Every boot is a `fastboot boot` from RAM;
+`boot_a`/`boot_b` were never written (LineageOS stays on `boot_b`). Image hashes, run dirs and
+panel photos for each step are in `docs/IMAGE_PROVENANCE.md` (the table from "Phone boots on
+the written root" on); the touch bring-up log is `logs/phone/20261114-194619-0110f-touch`.
+
+Rebuild the working image: `tooling/71-phone-image.sh --preset touch --kernel avicii/shim/out/kernel-0110f`
+(add `--boot` with the phone in recovery or fastboot).
+
+How it got here, in order — each step was a wall a log named:
+
+- **The real root boots in QEMU.** `build/ios16-root.img` as a 16 GiB `md0` did not mount
+  (`hfs_mountfs: buf_meta_bread failed with 22`): memdev kept the size as a 32-bit page count
+  shifted in 32 bits. **`0106`** widens it; run `logs/qemu/20261114-fullroot-d2`: mounts,
+  `Early boot complete`, 160 Programs exec, no panic. This satisfied the userdata gate.
+- **userdata written** (owner approved): `adb shell -T 'dd …' < build/ios16-root.img`, 42 MB/s,
+  read back sha256-identical. `adb exec-out … <` does **not** forward stdin on adb 34.0.4.
+- **fstab:** `/dev/ufsroot0 /private/var` made `mount-phase-2` re-mount the root → EBUSY →
+  panic. Commented out on the phone and in the host image (now sha256 `a2e11e3e…ea0c`);
+  `33`/`33b` write a comment-only fstab, `34` flags a second mount of the root.
+- **launchd_cache_loader** aborts `Unable to find AMFI`: boot-arg `launchd_unsecure_cache=1`
+  (same as the sweet port).
+- **First boot of a fresh root** spends ~15 min building the LaunchServices database
+  (SpringBoard blocked in `_LSContextInitCommon`); later boots reach SpringBoard in ~3 min.
+- **GUI frames:** **`0107`** (empty `IOAcceleratorES`) and **`0108`** (SweetSurface wraps client
+  memory), both from the fajita port; and `sweetfb_console=1` must never be on a GUI cmdline
+  (`AppleCLCD::present()` drops every frame — `71` now refuses it).
+- **Keys (`0109`):** volume PPIDs/offsets from the live FDT `gpio_keys` (PM8150L@4 gpio 5,
+  PM7250B@2 gpio 3).
+- **Touch (`0110`, `0111`):** SE7's I2C firmware has the FIFO interface disabled, so the GT9886
+  is reached through gpi_dma1 with a stage-1 apps_smmu bank for SIDs 0x36/0x23; the 3.0 V rail
+  (L13) is voted on HLOS's own RSC window (DRV2, 0x18220000 — sweet's 0x18200000 is DRV0 and
+  reset the SoC) with the in-place cmd-db; the 1.8 V enable (PM8150L GPIO 1) is driven over SPMI;
+  the chip protocol follows OnePlus's own GT9886 driver (ID 0x452C, frames 0x4100). Details in
+  `docs/GOODIX_GT9886.md` §0.
+
+Open, in rough order:
+
+- Touch defaults: the working settings are still boot-args (`sweettouchrails=2
+  sweettouch1v8=1`), touch starts 45 s after boot, and every bring-up step flushes the log with a
+  200 ms pause. Make them defaults and drop the debug pacing. Accuracy at edges/corners not yet
+  reported.
+- No serial and no USB link: every log is a reboot to recovery. USB ECM/SSH (patches `0072`–`0077`
+  exist, untested on avicii) would end that.
+- Clock is 1969 (no RTC read), battery is a fixed 100 %, no Wi-Fi/BT/modem/audio, no GPU
+  (CPU rendering at 10 Hz).
+- Not flashed: making it boot without a computer means writing `boot_a` (owner's decision).
+- `master` is ahead of the fork; kernel CI builds from `kern-0108-surface`.
+
 # Status — 2026-11-14, tier-1 job Programs staged, and a failed exec now names itself (QEMU)
 
 The silence after 34.87 s had two stacked causes: no daemon binaries in the root, and a failed
