@@ -271,3 +271,11 @@ The 16 GiB image, the 144 341-file payload, `--checksum` verification in one
 session, journal replay by XNU after a panic, xattrs, case collisions. The
 volume used here is the 1 GiB `final-1g.img`, single-filesystem, and every
 number above is from a machine whose page cache is warm and unloaded.
+
+## Route ruled out: the Rust `hfsplus` crate
+
+Tried 2026-11-13 on a copy of `build/final-1g.img`: twelve probe images from 0 B to 200 MB, and
+`fsck_hfs -f` rejected every image the crate's writer produced (`-y` could not repair them,
+exit 8). The write side synthesizes a whole volume in memory; it cannot edit an existing one. Do
+not retry it for population. The full write-up is in git history
+(`docs/POPULATE-ROUTE-RUST.md`, removed after `b89a2de`).

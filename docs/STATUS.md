@@ -1,6 +1,64 @@
+# Status — 2026-11-14, launchd spawns jobs after "Early boot complete" (QEMU)
+
+The jobs handoff is closed and removed. The 270 s of silence after `Early boot complete` was not a
+hang: the RAMDisk root had no job table and no job plists, so launchd had nothing to spawn.
+
+- Fix: `tooling/61-mkrd-root.sh` has a new step after the cache that stages
+  `/System/Library/xpc/launchd.plist`, the 491 `/System/Library/LaunchDaemons/*.plist`, the one
+  `/Library/LaunchDaemons/*.plist`, and the empty scan directories `NanoLaunchDaemons`,
+  `NanoLaunchDaemonsAltAccount`, `DeveloperModeLaunchDaemons` (`LaunchAgents` was already there).
+- Which table: the **tweaked** one. `61` replays the two edits of
+  `refs/ios-sweet/sweet-root-tweaks.py` on the DMG copy (7 `_PanicOnCrash` -> `_PanicOnCrasX`,
+  2 CommCenter jobs removed, 528 jobs left, 795 217 B), so it equals the table in
+  `build/ios16-root.img`. The stock table was not booted. The job plists are byte copies.
+- Build: `34-check-bootstrap.sh` absent 0 / mismatch 0, 612 files, `fsck_hfs` clean,
+  `build/rd-root.img` 3 090 153 472 B, sha256
+  `0e247ac47216a7c21167e00d66ad388351676163aeecc3c2489c190e8aec725a`.
+- Result, `logs/qemu/20261114-094151` (`msgbuf.txt`, 300 s, 45.7 KB against 14 KB before):
+  after `Early boot complete` at 31.70 s launchd opens its listeners (tcp 49152, 62078), spawns
+  **68 `xpcproxy`** (pids 3-70) between 32.18 s and 33.32 s, and two of them reach their job:
+  `exec keybagd` (34.516 s), `exec usermanagerd` (34.548 s), then
+  `SWEET AKS: keybagd sel 0 arg0 0 in 0/0 out 0/0 -> 0x0` at 34.87 s. **No panic.**
+- Next wall: nothing is logged from 34.87 s to 300 s. The other 66 `xpcproxy` have no Program to
+  exec - this root carries only the 21 boot-table binaries - and a failed exec in `xpcproxy`
+  prints nothing to the kernel log. That is silence *with* the plists staged, and its cause is
+  the minimal set, not launchd: the RAMDisk rung cannot go further without daemon binaries
+  (`logd`, `notifyd`, `configd`, ... each with its frameworks already in the cache). The phone
+  image has all of them.
+- Harness: the memory scope does not need sudo. `systemd-run --user --scope -p MemoryMax=12G -q --
+  /bin/sh -c '... ./tooling/60-qemu-boot.sh ...'` gives the same cap and leaves the run
+  artifacts owned by the user, so the `chown` step drops out.
+- Phone: untouched. No `dd`, `build/ios16-root.img` not opened.
+- Next: `HANDOFF-HERMES-DAEMONS.md` (five parallel lanes: job map, tier-1 daemons on the RAMDisk,
+  exec-failure log, run summary + parallel-safe harness, `userdata` gate options).
+
+# Status — 2026-11-14, launchd reaches "Early boot complete" (QEMU)
+
+The `/etc` handoff was closed in the same session it was written. launchd no longer exits with
+`unable to resolve 'mobile'`: the RAMDisk root was missing the BSD root links.
+
+- Cause: `build/rd-root.stage/` top level was only `dev private sbin System usr`, so `/etc/passwd`
+  did not exist even though `private/etc/passwd` lists `mobile:501`. libinfo's file module reads
+  through `/etc`, so `getpwnam("mobile")` failed and launchd exited `namespace 7 subcode 1`.
+- Fix: `tooling/61-mkrd-root.sh` now makes the three root links (`etc -> private/etc`,
+  `var -> private/var`, `tmp -> private/var/tmp`) beside the five cryptex roots. Rebuild is
+  unchanged: `./tooling/61-mkrd-root.sh`, `34-check-bootstrap.sh` still absent 0 / mismatch 0,
+  `fsck_hfs` clean, `build/rd-root.img` sha256
+  `c2021b9a442c2d3b283ef78eff32a33661b9d37ef8a9f7d24c1df72a465e80a9`.
+- Result, `logs/qemu/20261114-092612` (`msgbuf.txt`, 90 s) and `-092833` (300 s): all 43 cache
+  subcaches map, `SWEET Sandbox: launchd op 4`, `SWEET NET: launchd lo0 add address 127.0.0.1`,
+  the whole boot-task ladder runs, and launchd prints
+  `[Event: boot] Early boot complete. Continuing system boot.` at 31.05 s. **No panic.**
+- Next wall: silence after that line — 270 further seconds produce no kernel or launchd message
+  and no panic. Whatever launchd does after "continuing system boot" (job spawn, `/dev/console`,
+  the data-volume task) is the rung to instrument next; `msgbuf.txt` is the channel and
+  `logs/qemu/20261114-092833/` is the baseline to diff against.
+- Not yet reproduced on hardware: the phone still has the 16 GiB image written by nothing (no
+  `dd` yet) and `build/ios16-root.img` sha256 `8654ec2b…` unchanged.
+
 # Status — 2026-11-14, dyld shared cache maps (QEMU)
 
-Read `HANDOFF-HERMES-ETC.md`. The dyld wall (`Library not loaded: /usr/lib/libSystem.B.dylib
+The dyld wall (`Library not loaded: /usr/lib/libSystem.B.dylib
 … (no such file, no dyld cache)`) is closed in QEMU, run `logs/qemu/20261114-070727`.
 
 - Cause: the kernel refused the cache, it did not fail to find it. Without trust caches XNU
@@ -24,7 +82,7 @@ Read `HANDOFF-HERMES-ETC.md`. The dyld wall (`Library not loaded: /usr/lib/libSy
 
 # Status — 2026-11-13, first userland rung
 
-Read `HANDOFF-CLAUDE-USERLAND.md`. The loader blindness, the jump and the boot chain are
+The loader blindness, the jump and the boot chain are
 closed; `docs/IMAGE_PROVENANCE.md` is the boot log of record for p1-p6. The wall is the empty
 root volume: the kernel mounts it and panics on the missing `/sbin/launchd`. Populate the
 image (`tooling/33b`, no sudo) and validate it (`tooling/34-check-bootstrap.sh`) before the

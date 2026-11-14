@@ -7,7 +7,10 @@ Derived from `dipa-studio/ios-sweet` (Redmi Note 10 Pro, SM7150) — same ARMv8.
 4KB-16K-granule platform class. `docs/fajita-PORTING.md` is the completed OnePlus 6T
 (SDM845) port of the same tree and the reference for OnePlus bootloader behaviour.
 
-Status: **host preparation**. Bootloader unlock 2026-11-12, no device work before that.
+Status: **userland bring-up in QEMU**. The bootloader is unlocked (2026-11-12), the shim and the
+XNU payload boot on the phone, and under QEMU launchd runs its boot tasks and spawns jobs from
+the RAMDisk root. The populated 16 GiB root image is validated but not yet written to `userdata`.
+`docs/STATUS.md` has the current rung.
 
 Start at `AGENTS.md`, then `docs/STATUS.md`.
 

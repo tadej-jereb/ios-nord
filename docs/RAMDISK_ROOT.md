@@ -88,9 +88,11 @@ section 5, steps 1-9:
 | `/sbin/launchd` | 541 600 |
 | `/usr/lib/dyld` | 922 912 |
 | `/private/etc/{fstab,master.passwd,group,passwd,ttys,hosts}`, `SystemVersion.plist`, keybag placeholder, two `.migrated` markers | 10 302 |
-| 28 directories | 0 |
-| **set total, blocks counted once** | **2 742 653 326 B = 2.55 GiB** |
-| image (HFS+, 4 KiB blocks, 112 %) | 3 089 104 896 B = 2.88 GiB |
+| `/System/Library/xpc/launchd.plist`, tweaked like the phone image (7 `_PanicOnCrash` renamed, 2 CommCenter jobs removed, 528 jobs left) | 795 217 |
+| 491 `/System/Library/LaunchDaemons/*.plist` + 1 `/Library/LaunchDaemons/*.plist`, as-is | 668 559 |
+| 40 directories, 8 symlinks (5 cryptex roots, `etc`, `var`, `tmp`) | 0 |
+| **set total, blocks counted once** | **2 743 913 518 B = 2.56 GiB** |
+| image (HFS+, 4 KiB blocks, 112 %) | 3 090 153 472 B = 2.88 GiB |
 
 The `.rdcache` names are the same blocks as the cache directory, so `du` on the
 staging tree reports 2.74 GB twice over; only the once-counted figure is RAM.
@@ -207,7 +209,7 @@ Two host-side limits worth knowing:
 | fsck job | `/sbin/fsck` has a real journal to replay, `RequireRun` | unjournaled; `fsck -qy`/`-qL` run and can "repair" the RAM copy, but the next boot starts from the pristine image, so no repair ever survives |
 | APFS cryptex graft | `/System/Cryptexes/OS` symlink and `private/preboot/Cryptexes/{OS,App}` tree | no preboot tree, no `System/Cryptexes` symlink; the cache is at its root path instead of being a hard link into a cryptex. `mount -P 1` resolves an APFS boot container and will still complain about a missing data volume |
 | device nodes | devfs provides them | the same - devfs is kernel-side, the tree only carries the empty `/dev` |
-| job plists | 491 files in `/System/Library/LaunchDaemons` | **none**. launchd's `Boot` table is inline in `/sbin/launchd` `__TEXT,__config`, so the boot tasks run without a plist; every other daemon is absent and never scanned |
+| job plists | 491 files in `/System/Library/LaunchDaemons` | the same 491 + 1 plists and the tweaked `/System/Library/xpc/launchd.plist` (528 jobs), but **no job Programs** beyond the 21 boot-table binaries: launchd spawns `xpcproxy` for each load-time job and only `keybagd` and `usermanagerd` have a binary to exec (run `logs/qemu/20261114-094151`) |
 | dyld cache | 44 files incl. `.symbols`, hard links from the cryptex | 43 files, `.symbols` out, hard links from `private/var/db/.rdcache` |
 | cache owner | `root:wheel` | `1000:1000` 0755 (fstool limit, section 4) |
 | `/private/etc/fstab` | `/dev/ufsroot0 /private/var hfs rw 0 2` | `/dev/md0 /private/var hfs ro 0 2` - `/private/var` is already on this volume, `ro` matches the medium. Whether HFS accepts a second mount of the same device, and whether `hfs` passes `mount -P`'s `-t nonfs` allow list, are the two things only a boot settles |

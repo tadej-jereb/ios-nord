@@ -265,8 +265,9 @@ which is where adb lands; recovery adbd is root but has no `su`, so ring pulls t
 | `out-diag/l12` | `7d860cbe…` | only `0x700`: `ret=0` **and returns**, then dies during the 200 ms spin |
 | `out-diag/l13` | `51c3deb9…` | probe read moved ahead of the spin: still dies before the line lands |
 
-Open: which state the released core starts in. Handoff with hypotheses, discriminators and
-reproduction: `HANDOFF-RUNG4.md`.
+Open at this point: which state the released core starts in. Closed 2026-11-12 23:37 by `l16`/`l17`
+below (the entry was relocated twice); the handoff that carried the hypotheses is in git history
+(`HANDOFF-RUNG4.md`, removed after `b89a2de`).
 
 | `out-diag/l14` | `ce42870a…` | stub with guarded `vbar_el2`/`vbar_el1` install first: still dies at the same instant -> target code and vectors ruled out |
 | `out-diag/l15` | `0676f9b5…` | verify PASS, **not booted**: prints caller `MPIDR_EL1`, releases only its sibling (`caller ^ 0x100`) |

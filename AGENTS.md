@@ -4,7 +4,7 @@ Port of [`dipa-studio/ios-sweet`](https://github.com/dipa-studio/ios-sweet) (App
 iOS 16.7.16 userland, iPhone X 20H392) to the **OnePlus Nord** (`avicii`, SM7250/lito,
 ARMv8.2 Kryo 475: 2x A76 MPIDR 0x600/0x700 + 6x A55 0x000-0x500).
 
-Bootloader unlock: **2026-11-12** (planned). Nothing is flashed before that.
+Bootloader unlocked **2026-11-12**. Current rung and what is proven: `docs/STATUS.md`.
 
 ## Read first, in this order
 

@@ -18,7 +18,8 @@
 #   --qemu         hand the image to tooling/60-qemu-boot.sh if it exists
 #
 # The image carries the ordered minimal set of docs/LAUNCHD_BOOTSTRAP.md
-# section 5 (steps 1-9), and nothing else. Source files come from the DMGs
+# section 5 (steps 1-9) plus launchd's job table and the 492 job plists (no
+# job Programs beyond the boot table). Source files come from the DMGs
 # mounted read-only through tooling/opt/apfs-fuse, never from the phone.
 #
 # Needs: apfs-fuse (32-build-apfsfuse.sh), tooling/opt/fstool (the patched
@@ -128,6 +129,11 @@ dirs=(
 	"/System:0755:0:0" "/System/Library:0755:0:0"
 	"/System/Library/LaunchDaemons:0755:0:0"		# 7 - scan dir
 	"/System/Library/LaunchAgents:0755:0:0"
+	"/System/Library/NanoLaunchDaemons:0755:0:0"
+	"/System/Library/NanoLaunchDaemonsAltAccount:0755:0:0"
+	"/System/Library/DeveloperModeLaunchDaemons:0755:0:0"
+	"/System/Library/xpc:0755:0:0"			# launchd's job table
+	"/Library:0755:0:0" "/Library/LaunchDaemons:0755:0:0"
 	"/System/Library/CoreServices:0755:0:0"
 	"/System/Library/Caches:0755:0:0"
 	"/System/Library/Caches/com.apple.dyld:0755:0:0"	# 4 - dyld's first path
@@ -244,6 +250,48 @@ else
 	say "cache omitted (--no-cache): dyld will stop with 'Library not loaded'"
 fi
 
+# The job table and the job plists. Without them launchd finishes its compiled-in
+# boot-task ladder ("Early boot complete. Continuing system boot.") and then has
+# nothing to spawn: launchd_cache_loader hands it /System/Library/xpc/launchd.plist
+# and the scan reads the LaunchDaemons directories. The table is staged with the
+# same two edits refs/ios-sweet/sweet-root-tweaks.py makes on the phone image
+# (_PanicOnCrash -> _PanicOnCrasX, CommCenter jobs removed), so this root and
+# build/ios16-root.img carry an equal table and a job whose Program is not in
+# this minimal set fails its spawn instead of panicking the system. The job
+# plists are copied as-is; the Nano/DeveloperMode/LaunchAgents scan directories
+# stay empty.
+step "launchd job table and job plists"
+python3 -I - "$os/System/Library/xpc/launchd.plist" "$stage/System/Library/xpc/launchd.plist" <<'TWEAK'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    plist = plistlib.load(f)
+jobs = plist["LaunchDaemons"]
+renamed = 0
+for job in jobs.values():
+    if "_PanicOnCrash" in job:
+        job["_PanicOnCrasX"] = job.pop("_PanicOnCrash")
+        renamed += 1
+removed = [k for k, j in jobs.items() if j.get("Label") == "com.apple.CommCenter"]
+for k in removed:
+    del jobs[k]
+with open(sys.argv[2], "wb") as f:
+    plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
+print(f"launchd.plist (tweaked): {len(jobs)} jobs, {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed")
+TWEAK
+chmod 0644 "$stage/System/Library/xpc/launchd.plist"
+add_bytes "$stage/System/Library/xpc/launchd.plist"
+n=0
+for d in System/Library/LaunchDaemons Library/LaunchDaemons; do
+	for f in "$os/$d"/*.plist; do
+		[[ -f $f ]] || continue
+		install -m 0644 "$f" "$stage/$d/$(basename "$f")"
+		add_bytes "$f"
+		n=$((n + 1))
+	done
+done
+(( n >= 492 )) || die "only $n job plists in $OS_DMG (expected 491 + 1)"
+say "$n job plists"
+
 # dyld4 looks for the cache under the cryptex roots (its own string table lists
 # /System/Cryptexes/OS, /private/preboot/Cryptexes/OS and
 # /System/Volumes/Preboot/Cryptexes/OS) before the plain path. The cache here is
@@ -257,6 +305,16 @@ for l in System/Cryptexes/OS System/Cryptexes/App private/preboot/Cryptexes/OS \
 	ln -sfn / "$stage/$l"
 done
 say "5 cryptex roots -> /"
+
+# The BSD root contract every exec path assumes: /etc, /var and /tmp are links
+# into /private. launchd's getpwnam("mobile") reads /etc/master.passwd through
+# them, and without them the lookup fails with "unable to resolve 'mobile'"
+# (namespace 7 subcode 1) even though private/etc/passwd lists mobile:501.
+step "the /etc /var /tmp root links"
+ln -sfn private/etc "$stage/etc"
+ln -sfn private/var "$stage/var"
+ln -sfn private/var/tmp "$stage/tmp"
+say "etc, var, tmp -> private/"
 
 # ---------------------------------------------------------------------------
 # Size. The image is RAM, so it is sized tight: 112 % of the payload plus
@@ -320,7 +378,7 @@ chmod 0755 "$work/img/private/var/db/uuidtext"
 # attrs are synthetic); they are 0:0 from the fakeroot create above, which is
 # what the kernel's shared-region root_check requires. The probe asserts it.
 
-probes=("sbin/launchd:0:0:755" "private/var/keybags/systembag.kb:0:0:600" \
+probes=("sbin/launchd:0:0:755" "System/Library/xpc/launchd.plist:0:0:644" "private/var/keybags/systembag.kb:0:0:600" \
 	"dev:0:0:555" "private/var/tmp:0:0:1777")
 if (( do_cache )); then
 	probes+=("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64:0:0:755")

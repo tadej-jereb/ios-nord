@@ -48,7 +48,7 @@ LOW_EXT = (0x80000000, 0x3bb00000)
 HIGH_EXT = (0x180000000, 0x100000000)
 LIMIT_4GIB = 0x100000000
 
-# The shipped payload.bin cmdline (HANDOFF-XNU.md:50) and the fajita A/B set.
+# The shipped payload.bin cmdline (p1/p2 in docs/IMAGE_PROVENANCE.md) and the fajita A/B set.
 STOCK_CMDLINE = ('sweetsmp=0 sweettouch=0 sweetkeys=0 sweetfb_console=1 '
                  'sweetecon=1 debug=0xc keepsyms=1')
 # pe_parse_boot_argn returns on the first token that matches, so the new flags
