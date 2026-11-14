@@ -108,3 +108,4 @@ apply 0109-avicii-keys-ppids-touch-branches.patch
 apply 0110-avicii-touch-gpi-dma.patch
 apply 0111-avicii-rpmh-drv2-cmddb.patch
 apply 0112-avicii-shared-smmu-usb-sid.patch
+apply 0113-avicii-usb-phy-rails.patch

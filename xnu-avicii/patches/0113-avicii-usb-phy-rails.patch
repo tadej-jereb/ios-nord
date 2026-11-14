@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -368,6 +368,18 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 			printf("SWEET RPMH: %s expects 2856..3304 mV\n", res);
+ 			return EINVAL;
+ 		}
++	} else if (!strcmp(res, "ldoa2") || !strcmp(res, "ldoa5") || !strcmp(res, "ldoa12")) {
++		/*
++		 * avicii USB HS PHY (live FDT hsphy@88e3000, qcom,usb-hsphy-snps-femto):
++		 * vdda33 = pm8150_l2 (2.7..3.3 V), vdd = pm8150_l5 (0.72..1.056 V,
++		 * qcom,vdd-voltage-level 880000), vdda18 = pm8150_l12 (1.71..1.89 V).
++		 */
++		unsigned lo = res[4] == '2' && res[5] == 0 ? 2700 : res[4] == '5' ? 720 : 1710;
++		unsigned hi = res[4] == '2' && res[5] == 0 ? 3300 : res[4] == '5' ? 1056 : 1890;
++		if (mv < lo || mv > hi) {
++			printf("SWEET RPMH: %s expects %u..%u mV\n", res, lo, hi);
++			return EINVAL;
++		}
+ 	} else if (!strcmp(res, "smpa4")) {
+ 		/* Fixed 1.8 V rail; the DT has no usable range below/above it. */
+ 		if (mv != 1800) {
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -42,6 +42,7 @@ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int sweet_smmu_map_sid(unsigned sid);  /* bsd/dev/sweet_smmu.c */
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);  /* bsd/dev/sweet_rpmh.c */
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -860,6 +861,32 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * iommus <&apps_smmu 0xe0 0>); without a translating SMR its first event
+ 	 * write would fault the stream. Route it through the shared identity bank.
+ 	 */
++	/*
++	 * avicii HS PHY supplies (live FDT hsphy@88e3000): L5 0.88 V (vdd), L12
++	 * 1.8 V (vdda18), L2 3.075 V (vdda33). ABL powers them for fastboot; after
++	 * `fastboot boot` the controller ran but no host saw a device (2026-11-14),
++	 * so vote them on before connecting. boot-arg sweetusbrails=0 skips this.
++	 * Voltages: the DT vdd level (880000 uV), 1.8 V and 3.075 V inside the
++	 * DT ranges of L12 and L2 (UNVERIFIED as the exact vendor set points).
++	 */
++	unsigned usbrails = 1;
++	PE_parse_boot_argn("sweetusbrails", &usbrails, sizeof(usbrails));
++	if (usbrails) {
++		int e5 = sweet_rpmh_vreg_enable("ldoa5", 880);
++		int e12 = sweet_rpmh_vreg_enable("ldoa12", 1800);
++		int e2 = sweet_rpmh_vreg_enable("ldoa2", 3075);
++		printf("SWEET USB: PHY rails L5 %d L12 %d L2 %d\n", e5, e12, e2);
++	}
++	vm_offset_t hsphy = ml_io_map(0x088e3000, 0x1000);
++	if (hsphy != 0) {
++		for (unsigned o = 0; o < 0x110; o += 0x40) {
++			printf("SWEET USB: hsphy +%#05x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", o,
++			    usb_rd(hsphy, o), usb_rd(hsphy, o + 4), usb_rd(hsphy, o + 8), usb_rd(hsphy, o + 12),
++			    usb_rd(hsphy, o + 16), usb_rd(hsphy, o + 20), usb_rd(hsphy, o + 24), usb_rd(hsphy, o + 28),
++			    usb_rd(hsphy, o + 32), usb_rd(hsphy, o + 36), usb_rd(hsphy, o + 40), usb_rd(hsphy, o + 44),
++			    usb_rd(hsphy, o + 48), usb_rd(hsphy, o + 52), usb_rd(hsphy, o + 56), usb_rd(hsphy, o + 60));
++		}
++	}
+ 	if (sweet_smmu_map_sid(0xe0) != 0) {
+ 		printf("SWEET USB: SMMU route for sid 0xe0 failed; gadget not started\n");
+ 		return;
