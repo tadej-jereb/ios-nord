@@ -519,15 +519,58 @@
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
  	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
  	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-@@ -644,6 +1126,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -644,22 +1126,44 @@ touch_thread(void *arg, wait_result_t result)
  	 * (lito.dtsi:3998-3999). "ldo13" is the live-tree resource spelling,
  	 * "ldoa13" the DT one: retry the second if the cmd-db lookup misses.
  	 */
-+	gsi_step("rails");
- 	int power_error = sweet_rpmh_vreg_enable("smpa4", 1800);
- 	if (!power_error) {
- 		power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
-@@ -672,8 +1155,9 @@ touch_thread(void *arg, wait_result_t result)
+-	int power_error = sweet_rpmh_vreg_enable("smpa4", 1800);
+-	if (!power_error) {
+-		power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
++	/*
++	 * boot-arg sweettouchrails: bit 0 votes S4 (1.8 V), bit 1 votes L13 (3.0 V).
++	 * Default 0 since 2026-11-14: the first RPMh vote on avicii (smpa4) reset
++	 * the SoC (logs/phone/20261114-ufsroot-0110c-touch). S4 is PM8150's main
++	 * 1.8 V I/O rail and is on whenever the SoC runs; whether ABL leaves L13 on
++	 * is what a probe without votes answers.
++	 */
++	unsigned rails = 0;
++	(void)PE_parse_boot_argn("sweettouchrails", &rails, sizeof(rails));
++	int power_error = 0;
++	if (rails & 1u) {
++		gsi_step("rail smpa4");
++		power_error = sweet_rpmh_vreg_enable("smpa4", 1800);
+ 	}
+-	if (power_error == ENODEV) {
+-		power_error = sweet_rpmh_vreg_enable("ldoa13", 3008);
++	if (!power_error && (rails & 2u)) {
++		gsi_step("rail ldo13");
++		power_error = sweet_rpmh_vreg_enable("ldo13", 3008);
++		if (power_error == ENODEV) {
++			power_error = sweet_rpmh_vreg_enable("ldoa13", 3008);
++		}
+ 	}
++	gsi_step(rails ? "rails voted" : "rails skipped (sweettouchrails=0)");
+ 	if (power_error) {
+ 		printf("SWEET TOUCH: touch rail RPMh enable failed %d; probes skipped\n",
+ 		    power_error);
+ 		goto out;
+ 	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* SOUTH pin, UNVERIFIED on avicii */
++	/* GPIO 90 "board enable" is inherited from sweet; avicii's DT has no such
++	 * property, so it is driven only on request (sweettouchgpio90=1). */
++	unsigned g90 = 0;
++	(void)PE_parse_boot_argn("sweettouchgpio90", &g90, sizeof(g90));
++	if (g90) {
++		touch_gpio(90, 0, 0, 0, true, true);
++	}
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+ 	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+ 	touch_gpio(7, 1, 0, 0, false, false);
++	gsi_step("pins muxed, reset pulse");
+ 	/* Vendor GT9886 dev_confirm: reset low 2 ms, then high. */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+ 	touch_wait(2);
+@@ -672,8 +1176,9 @@ touch_thread(void *arg, wait_result_t result)
  	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
  	    st.irq_status);
  	(void)touch_probe_info(0x8240, legacy);
