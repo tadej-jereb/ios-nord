@@ -418,10 +418,10 @@ chown 0:0 "$mnt/private/var/keybags"; chmod 0700 "$mnt/private/var/keybags"
 for f in master.passwd group ttys hosts passwd; do
 	[[ -f $mnt/private/etc/$f ]] || die "/private/etc/$f missing (DMG content; os stage incomplete?)"
 done
-if ! awk '($4 == "ro" || $4 == "rw" || $4 == "rq") && $0 !~ /noauto/ { found = 1 }
-	END { exit !found }' "$mnt/private/etc/fstab" 2>/dev/null; then
-	printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' > "$mnt/private/etc/fstab"
-fi
+# The file must exist (mount -P errx()es without it) but must not mount
+# /dev/ufsroot0 again on /private/var: on the phone that is EBUSY, mount exits 1,
+# and mount-phase-2 (RequireSuccess) panics the boot. See 33b for the record.
+printf '# /private/var is on the root volume (ufsroot0 is already /); no entries\n' > "$mnt/private/etc/fstab"
 chown 0:0 "$mnt/private/etc/fstab"; chmod 0644 "$mnt/private/etc/fstab"
 kb=$mnt/private/var/keybags/systembag.kb
 [[ -f $kb ]] || die "/private/var/keybags/systembag.kb missing (keybag stage recorded but file gone - rerun with the keybag stage removed from $state)"

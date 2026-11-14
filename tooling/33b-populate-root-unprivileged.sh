@@ -334,12 +334,15 @@ chown 0:0 "$mnt/dev"
 chmod 0755 "$mnt/dev"
 find "$mnt/dev" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
-# mount -P 1 (RequireSuccess) only reads /etc/fstab and errx()es without it; the
-# phase loop needs the 4th field ro/rw/rq and no "noauto". devfs is already
-# mounted before this runs, hence "late".
+# mount -P 1/-P 2 (RequireSuccess) read /etc/fstab and errx() without it, so the
+# file must exist. It must NOT list /private/var on ufsroot0: that is the device
+# already mounted as /, and on the phone (2026-11-14, photos/1000055433.jpg)
+# mount-phase-2 ran mount_hfs on it -> "GetMasterBlock: Error 16 opening
+# /dev/ufsroot0", "Resource busy", mount exit 1, SWEET EARLY PANIC. /private/var
+# is a directory on the root volume here, so the file carries no entries.
 step "first-phase /private/etc/fstab"
 mkdir -p "$mnt/private/etc"
-printf '/dev/ufsroot0 /private/var hfs rw 0 2\n' >"$mnt/private/etc/fstab"
+printf '# /private/var is on the root volume (ufsroot0 is already /); no entries\n' >"$mnt/private/etc/fstab"
 chown 0:0 "$mnt/private/etc/fstab"
 chmod 0644 "$mnt/private/etc/fstab"
 

@@ -450,13 +450,13 @@ done
 # no /filesystems/fstab node, so the file is the only source of the checklist.
 if [[ -f $root/private/etc/fstab ]]; then
 	# the phase loop only mounts entries whose 4th field is ro/rw/rq and that
-	# do not carry noauto
-	if awk '$4 == "ro" || $4 == "rw" || $4 == "rq" {
-		if ($0 !~ /noauto/) { found = 1 } } END { exit !found }' \
-		"$root/private/etc/fstab"; then
-		emit ok 6 "etc:fstab" "/private/etc/fstab present, wearable phase entry"
+	# do not carry noauto. An entry for the root device itself (ufsroot0/md0)
+	# is fatal: mount_hfs gets EBUSY and mount-phase-2 panics the boot.
+	if awk '$0 !~ /^[[:space:]]*#/ && $1 ~ /^\/dev\/(ufsroot0|md0)$/ { bad = 1 }
+		END { exit !bad }' "$root/private/etc/fstab"; then
+		emit mismatch 6 "etc:fstab" "lists the root device again: mount_hfs EBUSY, mount-phase-2 panics"
 	else
-		emit mismatch 6 "etc:fstab" "no ro/rw/rq entry without noauto: setfsent succeeds, nothing mounts"
+		emit ok 6 "etc:fstab" "/private/etc/fstab present, no second mount of the root device"
 	fi
 elif grep -qa fstab "${ADT:-/home/tadej/ios-nord/avicii/adt/avicii-live.adt}" 2>/dev/null; then
 	emit note 6 "etc:fstab" "absent, but the ADT carries /filesystems/fstab"
