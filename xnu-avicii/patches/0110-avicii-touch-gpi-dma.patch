@@ -1,0 +1,493 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -19,8 +19,12 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -110,6 +114,13 @@ void sweet_touch_init(void);
+ static struct {
+ 	vm_offset_t se, gcc, gpio, gpio_s;
+ 	bool started, dead, probing;
++	/* GSI (GPI DMA) transport, used when SE7's FIFO interface is disabled */
++	bool gsi;
++	vm_offset_t gpi, smmu, dma;
++	uint64_t dma_pa;
++	int smmu_cb;
++	unsigned gpii, tx_wp, rx_wp, ev_rp;
++	uint32_t gsi_err;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+@@ -256,6 +267,428 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
++
++/*
++ * ---- GSI transport: SE7 through gpi_dma1 and a translating apps_smmu bank ----
++ *
++ * avicii's ABL/TZ load SE7's I2C firmware with the FIFO interface disabled
++ * (GENI_IF_DISABLE_RO bit 0 reads 1), so the bus can only be driven through
++ * the GPI DMA engine, as Linux does when it sees that bit
++ * (i2c-qcom-geni.c geni_i2c_gpi_xfer). Live FDT (logs/dumps/run-20261112-
++ * 195027/10-fdt.dtb):
++ *   i2c@984000  dmas = <&gpi_dma1 0 1 3 64 0>, <&gpi_dma1 1 1 3 64 0>
++ *               (tx/rx channel, SE index 1 of wrapper 1, protocol 3 = I2C,
++ *               64 TREs, not a static GPII), qcom,wrapper-core = qupv3_1
++ *   qcom,gpi-dma@900000  reg 0x900000/0x60000, gpi-ee-offset 0x10000,
++ *               gpii-mask 0x3f, max-num-gpii 10, iommus <&apps_smmu 0x36 0>
++ *   qupv3_1_geni_se@9c0000  iommus <&apps_smmu 0x23 0>
++ *   apps-smmu@15000000  reg 0x15000000/0x100000, qcom,skip-init
++ * Register layout, TRE and event formats: mainline drivers/dma/qcom/gpi.c and
++ * include/linux/dma/qcom-gpi-dma.h (v6.6). The SMMU bank and GPI bring-up follow
++ * the spacewar port (refs/anonbeat1-ios-sweet xnu 0089), which proved the same
++ * hypervisor refuses S2CR bypass and needs a stage-1 bank for both the GPI and
++ * the wrapper stream IDs. Everything is polled; DMA memory is one contiguous
++ * region below 4 GiB, identity mapped (IOVA == PA), cleaned by PA around use.
++ */
++#define GSI_GPI_PA       0x00900000u
++#define GSI_GPI_SIZE     0x60000u
++#define GSI_SMMU_PA      0x15000000u
++#define GSI_SMMU_SIZE    0x100000u
++#define GSI_SID_GPI      0x36u
++#define GSI_SID_QUP      0x23u
++#define GSI_SEID         1u
++#define GSI_PROTO_I2C    3u
++#define GSI_GPII_MASK    0x3fu
++#define GSI_NTRE         64u
++/* gpi.c offsets are from ee_base = gpi-top - gpi-ee-offset */
++#define G(x)             ((x) - 0x10000u + 0x4000u * st.gpii)
++#define GSI_CH_CTX(k)    G(0x20000u + 0x80u * (k))
++#define GSI_EV_CTX       G(0x21000u)
++#define GSI_CH_DB(k)     G(0x22000u + 0x8u * (k))
++#define GSI_EV_DB        G(0x22100u)
++#define GSI_CH_CMD       G(0x23008u)
++#define GSI_EV_CMD       G(0x23010u)
++#define GSI_IEOB_CLR     G(0x230c0u)
++/* DMA region layout */
++#define GSI_OFF_L1       0x0000u
++#define GSI_OFF_EV       0x1000u
++#define GSI_OFF_TX       0x1400u
++#define GSI_OFF_RX       0x1800u
++#define GSI_OFF_DTX      0x2000u
++#define GSI_OFF_DRX      0x2400u
++#define GSI_REGION       0x4000u
++/* TRE dword3 type field (bits 23:16) and flags */
++#define TRE_DMA          (0x10u << 16)
++#define TRE_GO           (0x20u << 16)
++#define TRE_CONFIG0      (0x22u << 16)
++#define TRE_CHAIN        (1u << 0)
++#define TRE_IEOT         (1u << 9)
++#define TRE_LINK         (1u << 11)
++
++static void
++gsi_wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint64_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++gsi_flush(uint32_t off, unsigned len)
++{
++	flush_dcache64((addr64_t)(st.dma_pa + off), len, TRUE);
++}
++
++static inline vm_offset_t gsi_va(uint32_t off) { return st.dma + off; }
++static inline uint32_t gsi_pa(uint32_t off) { return (uint32_t)(st.dma_pa + off); }
++
++static void
++gsi_smmu_map_sid(unsigned sid, unsigned nsmr, int *free_from)
++{
++	for (unsigned i = (unsigned)*free_from; i < nsmr && i < 128; i++) {
++		if (touch_rd(st.smmu, 0x800 + 4 * i) & (1u << 31)) {
++			continue;
++		}
++		touch_wr(st.smmu, 0xc00 + 4 * i, (uint32_t)st.smmu_cb); /* S2CR translate */
++		touch_wr(st.smmu, 0x800 + 4 * i, (1u << 31) | sid);     /* SMR valid, mask 0 */
++		*free_from = (int)i + 1;
++		printf("SWEET TOUCH: SMMU sid %#x -> smr %u s2cr %#x smr %#x\n", sid, i,
++		    touch_rd(st.smmu, 0xc00 + 4 * i), touch_rd(st.smmu, 0x800 + 4 * i));
++		return;
++	}
++	printf("SWEET TOUCH: SMMU no free SMR for sid %#x\n", sid);
++}
++
++static bool
++gsi_smmu_setup(void)
++{
++	uint32_t id0 = touch_rd(st.smmu, 0x20), id1 = touch_rd(st.smmu, 0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	unsigned ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff, nsmr = id0 & 0xff;
++	vm_offset_t gr1 = st.smmu + (1u << pgshift);
++	vm_offset_t cbase = st.smmu + ((vm_offset_t)(1u << (((id1 >> 28) & 7) + 1)) << pgshift);
++	printf("SWEET TOUCH: SMMU cr0 %#x id0 %#x id1 %#x (cb %u s2cb %u smr %u)\n",
++	    touch_rd(st.smmu, 0), id0, id1, ncb, ns2cb, nsmr);
++
++	/* A SID that already has a match group would be shadowed: refuse. */
++	uint32_t used[8] = {0};
++	int free_smr = -1;
++	for (unsigned i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = touch_rd(st.smmu, 0x800 + 4 * i);
++		uint32_t s2cr = touch_rd(st.smmu, 0xc00 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (free_smr < 0) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		uint32_t id = smr & 0xffffu, mask = (smr >> 16) & 0x7fffu;
++		if (((GSI_SID_GPI ^ id) & ~mask) == 0 || ((GSI_SID_QUP ^ id) & ~mask) == 0) {
++			printf("SWEET TOUCH: SMMU smr %u %#x already matches our SIDs (s2cr %#x)\n",
++			    i, smr, s2cr);
++			return false;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
++		}
++	}
++	st.smmu_cb = -1;
++	for (unsigned c = ns2cb; c < ncb && c < 256 && st.smmu_cb < 0; c++) {
++		if (!(used[c / 32] & (1u << (c % 32))) &&
++		    !(touch_rd(cbase + ((vm_offset_t)c << pgshift), 0) & 1)) {
++			st.smmu_cb = (int)c;
++		}
++	}
++	if (st.smmu_cb < 0 || free_smr < 0) {
++		printf("SWEET TOUCH: SMMU no free cb/smr (cb=%d smr=%d)\n", st.smmu_cb, free_smr);
++		return false;
++	}
++
++	/* Identity map 0x80000000..0xffffffff (DRAM below 4 GiB, where the region
++	 * lives): level-1 1 GiB blocks, Normal NC, AF, AP RW. */
++	volatile uint64_t *l1 = (volatile uint64_t *)gsi_va(GSI_OFF_L1);
++	for (unsigned i = 0; i < 512; i++) {
++		l1[i] = 0;
++	}
++	for (unsigned i = 2; i < 4; i++) {
++		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
++	}
++	gsi_flush(GSI_OFF_L1, 4096);
++
++	vm_offset_t cb = cbase + ((vm_offset_t)st.smmu_cb << pgshift);
++	unsigned asid = (unsigned)st.smmu_cb;
++	touch_wr(cb, 0x0, 0);                                  /* SCTLR off */
++	touch_wr(cb, 0x58, 0xffffffffu);                       /* FSR clear */
++	touch_wr(gr1, 0x800 + 4 * (unsigned)st.smmu_cb, 1);    /* CBA2R VA64 */
++	touch_wr(gr1, 4 * (unsigned)st.smmu_cb, 1u << 16 | 0xfu << 12 | 3u << 8);
++	touch_wr(cb, 0x10, 7u << 15 | 2);                      /* TCR2 PA 40-bit */
++	touch_wr(cb, 0x30, 25 | 1u << 23);                     /* TCR T0SZ 25, 4K, EPD1 */
++	touch_wr(cb, 0x34, asid);                              /* CONTEXTIDR */
++	gsi_wr64(cb, 0x20, (uint64_t)gsi_pa(GSI_OFF_L1) | (uint64_t)asid << 48);
++	gsi_wr64(cb, 0x28, 0);
++	touch_wr(cb, 0x38, 0x44);                              /* MAIR0 Normal NC */
++	touch_wr(cb, 0x618, 0);                                /* TLBIALL */
++	touch_wr(cb, 0x7f0, 0);                                /* TLBSYNC */
++	for (int t = 0; t < 100000 && (touch_rd(cb, 0x7f4) & 1); t++) {
++		delay(1);
++	}
++	touch_wr(cb, 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1);
++	gsi_smmu_map_sid(GSI_SID_GPI, nsmr, &free_smr);
++	gsi_smmu_map_sid(GSI_SID_QUP, nsmr, &free_smr);
++	printf("SWEET TOUCH: SMMU cb %d sctlr %#x cbar %#x ttbr0 %#x\n", st.smmu_cb,
++	    touch_rd(cb, 0x0), touch_rd(gr1, 4 * (unsigned)st.smmu_cb), touch_rd(cb, 0x20));
++	return (touch_rd(cb, 0x0) & 1) != 0;
++}
++
++static int
++gsi_cmd(uint32_t reg, uint32_t cmd, uint32_t ctx, uint32_t state, const char *what)
++{
++	touch_wr(st.gpi, reg, cmd);
++	for (int t = 0; t < 250000; t++) {
++		if (((touch_rd(st.gpi, ctx) >> 20) & 0xf) == state) {
++			touch_wr(st.gpi, G(0x230a0u), touch_rd(st.gpi, G(0x23090u)));
++			touch_wr(st.gpi, G(0x230a4u), touch_rd(st.gpi, G(0x23094u)));
++			return 0;
++		}
++		delay(1);
++	}
++	printf("SWEET TOUCH: GPI %s timeout ctx %#x glob %#x err %#x\n", what,
++	    touch_rd(st.gpi, ctx), touch_rd(st.gpi, G(0x23100u)), touch_rd(st.gpi, G(0x23200u)));
++	return EIO;
++}
++
++static bool
++gsi_gpi_setup(void)
++{
++	/* First GPII of the HLOS mask with all three contexts unallocated. */
++	unsigned n;
++	for (n = 0; n < 10; n++) {
++		if (!(GSI_GPII_MASK & (1u << n))) {
++			continue;
++		}
++		st.gpii = n;
++		uint32_t c0 = touch_rd(st.gpi, GSI_CH_CTX(0)), c1 = touch_rd(st.gpi, GSI_CH_CTX(1));
++		uint32_t ev = touch_rd(st.gpi, GSI_EV_CTX);
++		printf("SWEET TOUCH: GPII %u ch0 %#x ch1 %#x ev %#x\n", n, c0, c1, ev);
++		if (!((c0 | c1 | ev) & (0xfu << 20))) {
++			break;
++		}
++	}
++	if (n == 10) {
++		printf("SWEET TOUCH: no free GPII\n");
++		return false;
++	}
++
++	/* geni_se_select_gpi_mode (qcom-geni-se.c), after geni_se_irq_clear */
++	touch_wr(st.se, 0xe18, 0);
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, 0x648, 0xffffffffu);
++	touch_wr(st.se, 0xc44, 0xffffffffu);
++	touch_wr(st.se, 0xd44, 0xffffffffu);
++	touch_wr(st.se, 0xe1c, 0xffffffffu);
++	touch_wr(st.se, 0xe1c, 0);
++	touch_wr(st.se, SE_IRQ_EN, touch_rd(st.se, SE_IRQ_EN) &
++	    ~(SE_DONE | SE_TX_WM_IRQ | SE_RX_WM_IRQ | SE_RX_LAST));
++	touch_wr(st.se, SE_DMA, 1);
++	touch_wr(st.se, 0xe18, touch_rd(st.se, 0xe18) | 0xfu);
++	/* qcom_geni_i2c_conf: 100 kHz from 19.2 MHz (clk_div 7, 10/11/26) */
++	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);
++
++	/* gpi_config_interrupts DEFAULT_IRQ_SETTINGS, polled (no GIC wiring) */
++	touch_wr(st.gpi, G(0x23088u), 0x4f), touch_wr(st.gpi, G(0x230b8u), 1);
++	touch_wr(st.gpi, G(0x23098u), 3), touch_wr(st.gpi, G(0x2309cu), 1);
++	touch_wr(st.gpi, G(0x23108u), 1), touch_wr(st.gpi, G(0x23120u), 0xf);
++	touch_wr(st.gpi, G(0x23188u), 0), touch_wr(st.gpi, G(0x2318cu), 0);
++	touch_wr(st.gpi, G(0x23400u), 0), touch_wr(st.gpi, G(0x23404u), 0);
++	touch_wr(st.gpi, G(0x23180u), 1), touch_wr(st.gpi, G(0x23200u), 0);
++
++	memset((void *)gsi_va(GSI_OFF_EV), 0, GSI_NTRE * 16);
++	memset((void *)gsi_va(GSI_OFF_TX), 0, GSI_NTRE * 16);
++	memset((void *)gsi_va(GSI_OFF_RX), 0, GSI_NTRE * 16);
++	gsi_flush(GSI_OFF_EV, GSI_NTRE * 16);
++	gsi_flush(GSI_OFF_TX, GSI_NTRE * 16);
++	gsi_flush(GSI_OFF_RX, GSI_NTRE * 16);
++
++	if (gsi_cmd(GSI_EV_CMD, 0, GSI_EV_CTX, 1, "EV ALLOC")) {
++		return false;
++	}
++	touch_wr(st.gpi, GSI_EV_CTX + 0x0, 16u << 24 | 1u << 16 | 2);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x4, GSI_NTRE * 16);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x8, gsi_pa(GSI_OFF_EV));
++	touch_wr(st.gpi, GSI_EV_CTX + 0xc, 0);
++	touch_wr(st.gpi, GSI_EV_DB + 0x4, 0);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x20, 0), touch_wr(st.gpi, GSI_EV_CTX + 0x28, 0);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x2c, 0), touch_wr(st.gpi, GSI_EV_CTX + 0x30, 0);
++	touch_wr(st.gpi, GSI_EV_CTX + 0x34, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	touch_wr(st.gpi, GSI_EV_DB, gsi_pa(GSI_OFF_EV) + (GSI_NTRE - 1) * 16);
++
++	uint32_t roff[2] = {GSI_OFF_TX, GSI_OFF_RX};
++	for (unsigned k = 0; k < 2; k++) {
++		if (gsi_cmd(GSI_CH_CMD, k, GSI_CH_CTX(k), 1, k ? "CH1 ALLOC" : "CH0 ALLOC")) {
++			return false;
++		}
++		/* el 16, erindex 0, dir (tx out = 1), chtype GPI */
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x0, 16u << 24 | (k ? 0u : 1u) << 3 | 2);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x4, GSI_NTRE * 16);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x8, gsi_pa(roff[k]));
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0xc, 0);
++		touch_wr(st.gpi, GSI_CH_DB(k) + 0x4, 0);
++		/* SCRATCH_0: pair channel, protocol, SE id */
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x60, (k ? 0u : 1u) << 16 |
++		    GSI_PROTO_I2C << 4 | GSI_SEID);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x64, 0);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x68, 0);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x6c, 0);
++		touch_wr(st.gpi, GSI_CH_CTX(k) + 0x5c, 1);  /* QOS */
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned k = 0; k < 2; k++) {
++		if (gsi_cmd(GSI_CH_CMD, 1u << 24 | k, GSI_CH_CTX(k), 2,
++		    k ? "CH1 START" : "CH0 START")) {
++			return false;
++		}
++	}
++	printf("SWEET TOUCH: GPII %u up ch0 %#x ch1 %#x ev %#x\n", st.gpii,
++	    touch_rd(st.gpi, GSI_CH_CTX(0)), touch_rd(st.gpi, GSI_CH_CTX(1)),
++	    touch_rd(st.gpi, GSI_EV_CTX));
++	return true;
++}
++
++static bool
++gsi_init(void)
++{
++	st.gpi = ml_io_map(GSI_GPI_PA, GSI_GPI_SIZE);
++	st.smmu = ml_io_map(GSI_SMMU_PA, GSI_SMMU_SIZE);
++	if (!st.gpi || !st.smmu) {
++		printf("SWEET TOUCH: GPI/SMMU mapping failed\n");
++		return false;
++	}
++	ppnum_t max_pnum = (ppnum_t)(atop_64(1ULL << 32) - 1);
++	if (kmem_alloc_contig(kernel_map, &st.dma, GSI_REGION, PAGE_MASK, max_pnum,
++	    0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET TOUCH: no contiguous DMA memory\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)st.dma);
++	if (!pn) {
++		printf("SWEET TOUCH: DMA phys lookup failed\n");
++		return false;
++	}
++	st.dma_pa = ptoa_64(pn);
++	printf("SWEET TOUCH: GSI region pa %#llx\n", st.dma_pa);
++	if (st.dma_pa < 0x80000000ull || st.dma_pa + GSI_REGION > 0x100000000ull) {
++		printf("SWEET TOUCH: DMA region outside the identity map\n");
++		return false;
++	}
++	return gsi_smmu_setup() && gsi_gpi_setup();
++}
++
++static void
++gsi_put(uint32_t roff, unsigned *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(gsi_va(roff) + *wp * 16);
++	t[0] = d0, t[1] = d1, t[2] = d2, t[3] = d3;
++	gsi_flush(roff + *wp * 16, 16);
++	*wp = (*wp + 1) % GSI_NTRE;
++}
++
++/* Walk new events: return the first error code seen, recycle the ring. */
++static uint32_t
++gsi_events(void)
++{
++	uint32_t bad = 0;
++	gsi_flush(GSI_OFF_EV, GSI_NTRE * 16);
++	uint32_t hw = touch_rd(st.gpi, GSI_EV_CTX + 0x10);
++	while (gsi_pa(GSI_OFF_EV) + st.ev_rp * 16 != hw) {
++		volatile uint32_t *e = (volatile uint32_t *)(gsi_va(GSI_OFF_EV) + st.ev_rp * 16);
++		uint32_t type = (e[3] >> 16) & 0xffu, code = (e[2] >> 24) & 0xffu;
++		if (type == 0x22 && code == 16 && !bad) {      /* XFER_COMPLETE, UNEXP_ERR */
++			bad = e[3] & 0xffffu ? e[3] : 0x10000u;
++		} else if (type == 0x31) {                     /* QUP_NOTIF: SE m_irq status */
++			printf("SWEET TOUCH: GSI notif status %#x time %#x count %#x\n",
++			    e[0], e[1], e[2] & 0xffffffu);
++			if ((e[0] & SE_ERRORS) && !bad) {
++				bad = e[0];
++			}
++		}
++		st.ev_rp = (st.ev_rp + 1) % GSI_NTRE;
++	}
++	touch_wr(st.gpi, GSI_EV_DB, gsi_pa(GSI_OFF_EV) + ((st.ev_rp + GSI_NTRE - 1) % GSI_NTRE) * 16);
++	touch_wr(st.gpi, GSI_IEOB_CLR, 1);
++	return bad;
++}
++
++/*
++ * One I2C message, laid out as gpi_create_i2c_tre() for geni_i2c_gpi_xfer:
++ * a write carries CONFIG0 (chain) + GO(WRITE, chain) + DMA(ieot) on the TX
++ * ring; a read is a DMA(ieot) on the RX ring and GO(READ, rx_len, link) on TX.
++ */
++static int
++gsi_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	uint32_t go = ((uint32_t)addr << 8) | (stretch ? 1u << 26 : 0u);
++	if (nt) {
++		volatile uint8_t *d = (volatile uint8_t *)gsi_va(GSI_OFF_DTX);
++		for (unsigned i = 0; i < nt; i++) {
++			d[i] = tx[i];
++		}
++		gsi_flush(GSI_OFF_DTX, 64);
++		/* 100 kHz: tlow 11, thigh 10, tcycle 26, tx/rx pack; clk_div 7 */
++		gsi_put(GSI_OFF_TX, &st.tx_wp, 3u << 24 | 26u << 16 | 10u << 8 | 11u, 0, 7u,
++		    TRE_CONFIG0 | TRE_CHAIN);
++		gsi_put(GSI_OFF_TX, &st.tx_wp, go | 1u, 0, nt, TRE_GO | TRE_CHAIN);
++		gsi_put(GSI_OFF_TX, &st.tx_wp, gsi_pa(GSI_OFF_DTX), 0, nt, TRE_DMA | TRE_IEOT);
++	} else {
++		memset((void *)gsi_va(GSI_OFF_DRX), 0xa5, 128);
++		gsi_flush(GSI_OFF_DRX, 128);
++		gsi_put(GSI_OFF_RX, &st.rx_wp, gsi_pa(GSI_OFF_DRX), 0, nr, TRE_DMA | TRE_IEOT);
++		gsi_put(GSI_OFF_TX, &st.tx_wp, go | 2u, 0, nr, TRE_GO | TRE_LINK);
++	}
++	uint32_t txw = gsi_pa(GSI_OFF_TX) + st.tx_wp * 16, rxw = gsi_pa(GSI_OFF_RX) + st.rx_wp * 16;
++	if (nr) {
++		touch_wr(st.gpi, GSI_CH_DB(1), rxw);
++	}
++	touch_wr(st.gpi, GSI_CH_DB(0), txw);
++	int err = ETIMEDOUT;
++	for (unsigned t = 0; t < 100000; t++) {      /* 100 ms */
++		uint32_t bad = gsi_events();
++		if (bad) {
++			st.gsi_err = bad;
++			err = ENXIO;
++			break;
++		}
++		if (touch_rd(st.gpi, GSI_CH_CTX(0) + 0x10) == txw &&
++		    (!nr || touch_rd(st.gpi, GSI_CH_CTX(1) + 0x10) == rxw)) {
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	if (err) {
++		printf("SWEET TOUCH: GSI %s addr=%#x len=%u err=%d ev=%#x ch0 rp %#x/%#x ch1 rp %#x/%#x "
++		    "ctx %#x/%#x glob %#x geni %#x m_irq %#x\n", nr ? "read" : "write", addr,
++		    nr ? nr : nt, err, st.gsi_err, touch_rd(st.gpi, GSI_CH_CTX(0) + 0x10), txw,
++		    touch_rd(st.gpi, GSI_CH_CTX(1) + 0x10), rxw, touch_rd(st.gpi, GSI_CH_CTX(0)),
++		    touch_rd(st.gpi, GSI_CH_CTX(1)), touch_rd(st.gpi, G(0x23100u)),
++		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++		/* The channels are now out of step with our ring pointers. */
++		st.dead = true;
++		return err;
++	}
++	if (nr) {
++		gsi_flush(GSI_OFF_DRX, 128);
++		for (unsigned i = 0; i < nr; i++) {
++			rx[i] = ((volatile uint8_t *)gsi_va(GSI_OFF_DRX))[i];
++		}
++	}
++	st.sent = nt;
++	st.got = nr;
++	return 0;
++}
++
+ /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -264,6 +697,9 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
++	if (st.gsi) {
++		return gsi_msg(addr, tx, nt, rx, nr, stretch);
++	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+ 		st.dead = true; /* no other SE7 owner is supported */
+ 		return EBUSY;
+@@ -556,6 +992,12 @@ touch_se_init(void)
+ 	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
++	if (((fw >> 8) & 0xffu) == 3u && (touch_rd(st.se, 0x64) & 1u)) {
++		/* FIFO interface disabled by the firmware: GPI DMA only. */
++		printf("SWEET TOUCH: SE7 FIFO interface disabled; using GPI DMA\n");
++		st.gsi = true;
++		return gsi_init();
++	}
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+@@ -672,8 +1114,9 @@ touch_thread(void *arg, wait_result_t result)
+ 	    TOUCH_ADDR, ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11],
+ 	    st.irq_status);
+ 	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
++	/* GSI: a NACK stops the channels; the live FDT names only Goodix@5d. */
++	int fe1 = st.gsi ? ENXIO : touch_read(0x38, 0xa3, false, &fid1, 1);
++	int fe2 = st.gsi ? ENXIO : touch_read(0x38, 0x9f, false, &fid2, 1);
+ 	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+ 	    fe1, fe2, fid1, fid2, st.irq_status);
+ 	st.probing = false;
