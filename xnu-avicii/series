@@ -106,3 +106,4 @@ apply 0107-sweet-empty-ioacceleratores.patch
 apply 0108-sweet-sweetsurface-client-memory.patch
 apply 0109-avicii-keys-ppids-touch-branches.patch
 apply 0110-avicii-touch-gpi-dma.patch
+apply 0111-avicii-rpmh-drv2-cmddb.patch

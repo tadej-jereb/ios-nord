@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -13,11 +13,20 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ 
+-/* Live downstream DT has two positional reg entries, no reg-names. */
+-#define RH_RSC_PA       0x18200000u
+-#define RH_TCS_PA       0x18200d00u
++/*
++ * avicii live FDT (logs/dumps/run-20261112-195027/10-fdt.dtb):
++ *   rsc@18200000  reg = drv-0 0x18200000, drv-1 0x18210000, drv-2 0x18220000
++ *                 (0x10000 each), qcom,drv-id = 2, qcom,tcs-offset = 0xd00
++ *   reserved-memory@80860000  compatible "qcom,cmd-db", 0x20000, the database
++ *                 itself (not a locator as on sweet)
++ * The sweet values (one RSC window at 0x18200000) addressed DRV0, which HLOS
++ * does not own: the first TCS access reset the SoC (2026-11-14).
++ */
++#define RH_RSC_PA       0x18220000u
++#define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x80860000u /* live FDT qcom,cmd-db */
++#define RH_DICT_SIZE    0x20000u
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+@@ -128,6 +137,15 @@ rh_map(void)
+ 		printf("SWEET RPMH: unsupported RSC geometry/revision\n");
+ 		return ENODEV;
+ 	}
++	if (!rh_db && rh_read(rh_dict, 4) == RH_DB_MAGIC) {
++		/* The reserved region is the database itself (avicii). */
++		rh_db = ml_io_map(RH_DICT_PA, RH_DICT_SIZE);
++		if (!rh_db) {
++			return ENOMEM;
++		}
++		rh_db_size = RH_DICT_SIZE;
++		printf("SWEET RPMH: cmd-db in place at %#x size %#x\n", RH_DICT_PA, RH_DICT_SIZE);
++	}
+ 	if (!rh_db) {
+ 		uint32_t pa = rh_read(rh_dict, 0);
+ 		uint32_t size = rh_read(rh_dict, 4);
