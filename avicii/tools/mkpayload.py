@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--shared-cache IMAGE]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -26,7 +26,7 @@ ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
 """
-import argparse, os, struct, sys
+import argparse, mmap, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -128,6 +128,16 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
+def add_map_entry(adt_blob, name, phys, size):
+    """Append /chosen/memory-map <name> = <phys, size> (two uintptr_t)."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    mmap = next(c for c in chosen.children if c.name == 'memory-map')
+    assert mmap.prop(name) is None, 'ADT already has %s' % name
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
+    return adt.serialize(root)
+
+
 def add_ramdisk_to_adt(adt_blob, phys, size):
     """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
     root, _ = adt.parse(adt_blob)
@@ -146,7 +156,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_cache_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -163,7 +173,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
-    ramdisk = None
+    ramdisk, shared_cache = None, None
     if ramdisk_path:
         image = open(ramdisk_path, 'rb').read()
         rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
@@ -173,18 +183,41 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    if shared_cache_path:
+        # iBoot hands the kernel the dyld shared cache as a /chosen/memory-map
+        # region and the arm kernel maps it before initproc; without the region
+        # an iOS dyld reports 'no dylib cache' even when the files are on the root.
+        sc = open(shared_cache_path, 'rb').read()
+        sc_size = (len(sc) + PAGE - 1) & ~(PAGE - 1)
+        sc_va = kernel_end
+        kernel_end = sc_va + sc_size
+        sc_pa = sc_va - virt_base + PHYS_BASE
+        pieces.append((sc_va, sc_size, sc))
+        adt_blob = add_map_entry(adt_blob, 'dyld shared cache', sc_pa, sc_size)
+        shared_cache = (hex(sc_pa), hex(sc_size))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
-    out = bytearray(hdr_size)
+    # Written through an mmap: a RAMDisk root is gigabytes, and holding the whole
+    # payload as a bytearray costs as much again as the image itself (a 3 GiB root
+    # died at 4.2 GiB anon in a 4 GiB cgroup).
+    total = (hdr_size + sum(len(d) + (-len(d) & 0xf) for _, _, d in pieces)
+             + len(adt_blob) + (-len(adt_blob) & 0xf))
+    fd = open(out_path, 'w+b')
+    fd.truncate(total)
+    out = mmap.mmap(fd.fileno(), total)
     seg_table = []
+    off = hdr_size
+    CHUNK = 1 << 25
     for vmaddr, vmsize, data in pieces:
-        off = len(out)
-        out += data
-        out += b'\0' * (-len(out) & 0xf)
-        seg_table.append((vmaddr, vmsize, off, len(data)))
-    adt_off = len(out)
-    out += adt_blob
-    out += b'\0' * (-len(out) & 0xf)
+        for a in range(0, len(data), CHUNK):
+            n = min(len(data) - a, CHUNK)
+            out[off + a:off + a + n] = data[a:a + n]
+        off += len(data) + (-len(data) & 0xf)
+        seg_table.append((vmaddr, vmsize, off - len(data) - (-len(data) & 0xf), len(data)))
+    adt_off = off
+    out[adt_off:adt_off + len(adt_blob)] = adt_blob
+    off += len(adt_blob) + (-len(adt_blob) & 0xf)
+    assert off == total, f'written {off} != {total}'
 
     struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
@@ -199,9 +232,13 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk,
+                shared_cache=shared_cache, size=total,
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
-    return bytes(out), info
+    out.flush()
+    out.close()
+    fd.close()
+    return info
 
 
 if __name__ == '__main__':
@@ -209,9 +246,9 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--shared-cache', help='dyld shared cache to place as /chosen/memory-map "dyld shared cache"')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
-    open(a.out, 'wb').write(blob)
+    info = build(a.kernel, a.adt, a.out, a.cmdline, a.ramdisk, a.shared_cache)
     for k, v in info.items():
         if k != 'segs':
             print(f'{k}: {v}')

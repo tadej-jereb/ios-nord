@@ -234,7 +234,7 @@ def dram(extents, holes, source, phys_base=None, allow_high=False):
     return base, size, source
 
 
-def build(seed=None, qemu=False, fdt_json=None, phys_base=None, allow_high=False):
+def build(seed=None, qemu=False, fdt_json=None, phys_base=None, allow_high=False, mem_size=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
     phys_base: explicit dram base; must land inside a memory extent of fdt_json (or
@@ -249,9 +249,13 @@ def build(seed=None, qemu=False, fdt_json=None, phys_base=None, allow_high=False
     elif fdt_json:
         phys_base, mem_size, src = dram(*_extents_from_json(fdt_json), source=FDT_SRC)
     elif qemu:
+        # --mem-size exists for a RAMDisk root: the image is part of the payload and
+        # must sit inside the RAM the ADT reports, so 240 MiB is only enough for the
+        # skeleton. The harness passes the same number it gives QEMU's -m.
+        size = mem_size if mem_size is not None else FALLBACK_MEM_SIZE
         print(f'warning: regbase: {FALLBACK_SRC} - QEMU has no FDT to read; '
-              f'dram {PHYS_BASE_FALLBACK:#x}+{FALLBACK_MEM_SIZE:#x}', file=sys.stderr)
-        phys_base, mem_size, src = PHYS_BASE_FALLBACK, FALLBACK_MEM_SIZE, FALLBACK_SRC
+              f'dram {PHYS_BASE_FALLBACK:#x}+{size:#x}', file=sys.stderr)
+        phys_base, mem_size, src = PHYS_BASE_FALLBACK, size, FALLBACK_SRC
     else:
         raise SystemExit('error: --fdt-json FILE is required for the phone '
                          '(the live FDT is the only source of the memory map)')
@@ -417,7 +421,7 @@ def _arg(name):
 
 if __name__ == '__main__':
     outs = [a for a in sys.argv[1:] if not a.startswith('--')
-            and a not in (_arg('--fdt-json'), _arg('--phys-base'))]
+            and a not in (_arg('--fdt-json'), _arg('--phys-base'), _arg('--mem-size'))]
     if len(outs) != 1:
         raise SystemExit((__doc__ or '').strip().splitlines()[-1])
     fdt_json = _arg('--fdt-json')
@@ -425,8 +429,9 @@ if __name__ == '__main__':
     if phys_base is not None and fdt_json is None and '--qemu' not in sys.argv:
         print(f'note: regbase: no --fdt-json, --phys-base is checked against '
               f'{os.path.relpath(ADT_LIVE)} ({ADT_SRC})', file=sys.stderr)
+    mem_size = int(_arg('--mem-size'), 16) if '--mem-size' in sys.argv else None
     root = build(qemu='--qemu' in sys.argv, fdt_json=fdt_json, phys_base=phys_base,
-                 allow_high='--allow-high' in sys.argv)
+                 allow_high='--allow-high' in sys.argv, mem_size=mem_size)
     chosen = [c for c in root.children if c.name == 'chosen'][0]
     print(f'note: /chosen dram-base {struct.unpack("<Q", chosen.prop("dram-base"))[0]:#x} '
           f'dram-size {struct.unpack("<Q", chosen.prop("dram-size"))[0]:#x}', file=sys.stderr)

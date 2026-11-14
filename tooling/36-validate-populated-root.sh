@@ -250,9 +250,9 @@ run_volume_leg() {
 		say "  fsck skipped (--root given; 33 fsck's the image after unmount, --fsck overrides)"
 	fi
 	# If the image is mounted right now, the header's dirty bits are expected:
-	# pass --mounted so the gate notes them instead of failing on them.
-	if grep -q " $img " /proc/mounts 2>/dev/null ||
-	   awk -v i="$img" '$1 !~ /^#/ { print $1 }' /proc/mounts | grep -qx -- "$img"; then
+	# pass --mounted so the gate notes them instead of failing on them. The mount
+	# source is a loop device, not the image path, so ask losetup.
+	if losetup -j "$img" 2>/dev/null | grep -q . || grep -q " $img " /proc/mounts 2>/dev/null; then
 		a+=(--mounted)
 		say "  volume is mounted: dirty bits are notes, not failures"
 	fi

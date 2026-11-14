@@ -526,14 +526,70 @@ emit note 9 "dev-nodes" "console/tty/null/zero/urandom/random/klog/fd come from 
 
 # --- reference comparison, if one was given -----------------------------
 if [[ -n $reference ]]; then
+	# cmp(1) reports EIO on a userspace FUSE mount: the writer's close path
+	# fails after the bytes were delivered, so every file would look
+	# different. Read in chunks through os.read and let only a short read
+	# count.
+	same_bytes() {
+		[[ $(stat -c %s "$1" 2>/dev/null) == "$(stat -c %s "$2" 2>/dev/null)" ]] || return 1
+		python3 - "$1" "$2" <<-'PY'
+			import os, sys
+			def read(p):
+			    out = bytearray()
+			    fd = os.open(p, os.O_RDONLY)
+			    try:
+			        while True:
+			            try: c = os.read(fd, 1 << 20)
+			            except OSError: break
+			            if not c: break
+			            out += c
+			    finally:
+			        try: os.close(fd)
+			        except OSError: pass
+			    return bytes(out)
+			sys.exit(0 if read(sys.argv[1]) == read(sys.argv[2]) else 1)
+		PY
+	}
+
+	# The bring-up tweak renames _PanicOnCrash -> _PanicOnCrasX in this one job
+	# table and drops the CommCenter jobs; replay that on the reference side and
+	# require the objects to be equal, so the tweak is still verified rather
+	# than waved through.
+	tweaked_launchd_plist() {
+		python3 - "$1" "$2" <<-'PY'
+			import plistlib, sys
+			def load(p):
+			    with open(p, "rb") as f:
+			        return plistlib.load(f)
+			try: have, want = load(sys.argv[1]), load(sys.argv[2])
+			except Exception: sys.exit(1)
+			jobs = want.get("LaunchDaemons", {})
+			for job in jobs.values():
+			    if "_PanicOnCrash" in job: job["_PanicOnCrasX"] = job.pop("_PanicOnCrash")
+			for k in [k for k, j in jobs.items() if j.get("Label") == "com.apple.CommCenter"]:
+			    del jobs[k]
+			sys.exit(0 if have == want else 1)
+		PY
+	}
+
 	n=0
 	while IFS= read -r f; do
 		f=${f#./}
 		[[ -f $root/$f && -f $reference/$f ]] || continue
-		if ! cmp -s -- "$root/$f" "$reference/$f"; then
-			emit mismatch 10 "bytes:$f" "differs from the DMG copy"
-			n=$((n + 1))
-		fi
+		case $f in
+		System/Library/xpc/launchd.plist)
+			if tweaked_launchd_plist "$root/$f" "$reference/$f"; then
+				emit ok 10 "bytes:$f" "tweak applied (PanicOnCrasX, CommCenter jobs removed)"
+			else
+				emit mismatch 10 "bytes:$f" "differs from the DMG copy beyond the tweak"
+				n=$((n + 1))
+			fi ;;
+		*)
+			if ! same_bytes "$root/$f" "$reference/$f"; then
+				emit mismatch 10 "bytes:$f" "differs from the DMG copy"
+				n=$((n + 1))
+			fi ;;
+		esac
 	done < <(cd "$reference" && find . -maxdepth 6 \( -path ./private/var -o -path ./private/preboot \) -prune -o \
 		-type f \( -name launchd -o -name dyld -o -path '*/LaunchDaemons/*' -o -path '*/LaunchAgents/*' \) -print)
 	((n == 0)) && emit ok 10 "bytes" "sampled binaries identical to the reference"

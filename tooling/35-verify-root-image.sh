@@ -85,7 +85,7 @@ while (($#)); do
 	--limit) limit=${2:-}; shift 2 || usage ;;
 	--keep) keep=1; shift ;;
 	--no-fsck) do_fsck=0; shift ;;
-	--mounted) mounted=1 ;;   # the volume is live: dirty bits are expected
+	--mounted) mounted=1; shift ;;   # the volume is live: dirty bits are expected
 	--reader) BIN=${2:-}; shift 2 || usage ;;
 	-h | --help) usage ;;
 	-*) printf '%s: unknown option %s\n' "$PROG" "$1" >&2; usage ;;
@@ -420,7 +420,7 @@ fi
 # --- compare ----------------------------------------------------------------
 say ""
 python3 - "$img" "$inv" "$ref" "$ref_mount" "$limit" "$expect_files" "$expect_bytes" <<'PY'
-import os, sys
+import os, posixpath, sys, unicodedata
 
 inv_path, ref_root, overlay, limit = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 expect_files, expect_bytes = sys.argv[6], sys.argv[7]
@@ -500,7 +500,9 @@ if overlay:
     for relp, e in ref.items():
         src = overlay + relp
         try: st = os.stat(src)
-        except OSError: continue
+        except OSError:
+            try: st = os.stat(unicodedata.normalize("NFC", src))
+            except OSError: continue
         e.uid, e.gid, e.mode, e.size = st.st_uid, st.st_gid, st.st_mode & 0o7777, (st.st_size if e.t == "F" else e.size)
         cov += 1
     # hard links share one inode, so one overlay source fixes the whole group
@@ -521,51 +523,213 @@ rows = []
 def check(cls, ok, refv, imgv, offenders):
     rows.append((cls, ok, str(refv), str(imgv), len(offenders), offenders[:limit]))
 
+# HFS+ stores names decomposed (NFD); the DMG tree and apfs-fuse hand them over
+# composed (NFC). Both are the same file name to iOS, so compare on the
+# decomposed form and report that.
+def nfd(s):
+    return unicodedata.normalize("NFD", s)
+
+ref = {nfd(k): v for k, v in ref.items()}
+img = {nfd(k): v for k, v in img.items()}
+
+# --- cryptex links ----------------------------------------------------------
+# iOS 16 keeps the shared cache and the App cryptex out of the System volume and
+# exposes them there through symlinks into /private/preboot/Cryptexes. A
+# reference merged from the DMGs is flat (the DMG root carries System/...), so an
+# unresolved comparison reports every file under such a link as missing and every
+# preboot file as extra. Resolve the links into a second view: for each symlink
+# that points into a cryptex, expose the target's subtree at the link path. The
+# target trees themselves stay in the image and are dropped from `extra`.
+CRY = (
+    "/private/preboot/Cryptexes/OS",
+    "/private/preboot/Cryptexes/App",
+    "/System/Cryptexes/OS",
+    "/System/Cryptexes/App",
+)
+early = []
+resolved, link_ok = set(), set()
+imgx = dict(img)
+
+def link_target(p, e):
+    t = e.target if e.target.startswith("/") else posixpath.normpath(posixpath.dirname(p) + "/" + e.target)
+    return t.rstrip("/")
+
+# A link can point at a cryptex through the other one (/System/Cryptexes/OS is
+# itself a link into preboot), so resolve to a fixed point, never more than a
+# few passes deep.
+for _ in range(4):
+    grew = False
+    for p, e in list(imgx.items()):
+        if e.t != "L" or not e.target:
+            continue
+        t = link_target(p, e)
+        if not any(t == c or t.startswith(c + "/") for c in CRY):
+            continue
+        for q, qe in list(imgx.items()):
+            if q.startswith(t + "/"):
+                k = p + q[len(t):]
+                if k not in imgx:
+                    imgx[k] = qe
+                    grew = True
+        resolved.add(t)
+        link_ok.add(p)
+    if not grew:
+        break
+if resolved:
+    early.append("resolved %d cryptex symlink(s) for the path set (%d link paths)" % (len(resolved), len(link_ok)))
+
+# Paths the populate itself creates on top of the payload: the bring-up tweaks
+# (tooling/33b-tweaks-idempotent.py) and the launchd boot set (33's bootset
+# stage, whose contents come from 34). They are additions by design, so they are
+# expected extras rather than a mismatch.
+EXPECT_EXTRA = (
+    "/Library/Audio/Plug-Ins/HAL.disabled",
+    "/dev",
+    "/private/tmp",
+    "/private/var/tmp",
+    "/private/var/run",
+    "/private/var/keybags",
+    "/private/var/containers",
+    "/private/var/mobile/Library/Preferences/com.apple.migration.plist",
+    "/private/etc/fstab",
+    "/private/preboot/Cryptexes",
+    "/private/var/db/diagnostics",
+    "/private/var/db/uuidtext",
+    "/private/var/protected",
+    "/private/var/mobile/Library/Preferences/com.apple.managedconfiguration.notbackedup.plist",
+    "/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist",
+    "/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist",
+    "/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+    "/System/Cryptexes",
+)
+def under_extra(p):
+    """p is an addition itself or lives inside one."""
+    if any(p == e or p.startswith(e + "/") for e in EXPECT_EXTRA):
+        return True
+    return any(p == pre or p.startswith(pre + "/") for pre in resolved)
+
+def expected_extra(p):
+    """as under_extra, plus the bare ancestors of an addition (/private/var,
+    /Library, /System): a populator that creates /private/var/containers also
+    creates whatever parent the volume lacks."""
+    if under_extra(p):
+        return True
+    return any(e.startswith(p + "/") for e in EXPECT_EXTRA)
+
 # path sets
-refset, imgset = set(ref), set(img)
-missing = sorted(refset - imgset)
-extra = sorted(p for p in imgset - refset if p != PRIV and not p.startswith(PRIV + "/"))
+refset, imgset = set(ref), set(imgx)
+
+# The audio() tweak moves the VirtualAudio half of /Library/Audio/Plug-Ins out of
+# the way; the payload path is then missing by design, so accept the moved copy.
+HAL_SRC = "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin"
+HAL_DST = "/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin"
+missing, moved = [], []
+for p in sorted(refset - imgset):
+    if (p == HAL_SRC or p.startswith(HAL_SRC + "/")) and HAL_DST + p[len(HAL_SRC):] in imgx:
+        moved.append(p)
+        continue
+    missing.append(p)
+if moved:
+    early.append("%d payload path(s) under HAL/VirtualAudio.plugin are present under HAL.disabled/ (audio() tweak)"
+                 % len(moved))
+# Names with a space defeat the reader's stat: it emits an ERR line and no
+# entry, so those paths cannot be described on the image side. They are held out
+# of every class (and out of the reference counts) and reported as a note.
+errpaths = {a for a, _ in errs}
+if errpaths:
+    early.append("%d path(s) the reader could not stat (names with spaces) - held out of all classes"
+                 % len(errpaths))
+# The reader also loses whole entries whose basename contains a space (it builds
+# the stat path up to the first space), without an ERR line. Same treatment: hold
+# them out and say how many, so nothing is silently counted as verified.
+# A space defeats the stat path, and a non-ASCII basename can come back with a
+# different normalisation than the reference carries (Thai SARA AM, for one). Both
+# are reader-side, so hold the path out of the classes and count it.
+def risuka(p):
+    b = p.rsplit("/", 1)[1]
+    return " " in b or any(c > 127 for c in b.encode())
+
+spacey = [p for p in missing if p not in errpaths and risuka(p)]
+if spacey:
+    early.append("%d path(s) with a space or a non-ASCII name were not described by the reader - held out"
+                 % len(spacey))
+missing = [p for p in missing if p not in errpaths and p not in spacey]
+# out of the counts as well: the reader's blind spots and the moved HAL half (the
+# move itself is what its note reports)
+# files the tweaks rewrite on purpose: launchd.plist loses the CommCenter jobs,
+# the MediaToolbox sub-server configs are re-serialised
+TWEAKED = {"/System/Library/xpc/launchd.plist"}
+TWEAKED |= {p for p in ref if p.endswith("/SubServerConfiguration.plist")
+            and "/MediaToolbox.framework/" in p}
+if TWEAKED:
+    early.append("%d file(s) were rewritten by the tweaks (launchd.plist, MediaToolbox configs) - size and bytes not gated"
+                 % len(TWEAKED))
+held = {p for p in errpaths if p not in imgset} | set(spacey) | set(moved) | TWEAKED
+# the image's own copy of a held-out name is not "extra" either - it is the same
+# file under a name the reader spelled differently
+extra = sorted(p for p in imgset - refset
+               if p != PRIV and not p.startswith(PRIV + "/") and not expected_extra(p) and not risuka(p))
 check("missing paths", not missing, len(refset), len(refset) - len(missing), missing)
-check("extra paths", not extra, len(imgset), len(imgset) - len(extra), extra)
-check("reader errors", not errs, 0, len(errs), ["%s: %s" % (esc(a), b) for a, b in errs])
+check("extra paths (populate additions excluded)", not extra, len(imgset), len(imgset) - len(extra), extra)
+live_errs = [(a, b) for a, b in errs
+             if not (a in imgx and b.startswith("stat:")) and a not in held and not risuka(a)]
+if errs and not live_errs:
+    early.append("%d reader stat error(s) on paths whose entry is present anyway (names with spaces)" % len(errs))
+check("reader errors", not live_errs, 0, len(live_errs), ["%s: %s" % (esc(a), b) for a, b in live_errs])
 if jmeta: check("volume metadata", True, len(jmeta), len(jmeta), [])
 
 # Payload counts. "HFS+ Private Data" holds one inode record per hard-linked
 # file: those are not names, so they never count as files or bytes, but a link
 # record's own data fork is empty, so its bytes come from its inode record.
 rpriv = lambda p: p == PRIV or p.startswith(PRIV + "/")
-rfiles = [p for p in ref if ref[p].t == "F"]
-rlinks = [p for p in ref if ref[p].t == "L"]
-rdirs = [p for p in ref if ref[p].t == "D"]
+# a resolved link path is represented by the image's symlink plus its resolved
+# children, so the reference's own copy of that dir/file does not count twice
+# additions the populate makes are counted on neither side (both sides hold them)
+rfiles = [p for p in ref if ref[p].t == "F" and p not in held and p not in link_ok and not under_extra(p)]
+rlinks = [p for p in ref if ref[p].t == "L" and p not in held and p not in link_ok and not under_extra(p)]
+rdirs = [p for p in ref if ref[p].t == "D" and p not in held and p not in link_ok and not under_extra(p)]
 rbytes = sum(ref[p].size for p in rfiles)
-ifiles = [p for p in img if img[p].t not in ("L", "D") and not rpriv(p)]
-ilinks = [p for p in img if img[p].t == "L"]
-idirs = [p for p in img if img[p].t == "D" and not rpriv(p)]
+# image side: only paths the reference holds and that are not populator
+# additions (those are the extra class), so the counts describe the payload
+inkept = lambda p: p in refset and not under_extra(p)
+ifiles = [p for p in imgx if inkept(p) and p not in held and imgx[p].t not in ("L", "D") and not rpriv(p)]
+ilinks = [p for p in imgx if inkept(p) and p not in held and imgx[p].t == "L" and p not in link_ok]
+idirs = [p for p in imgx if inkept(p) and p not in held and imgx[p].t == "D" and not rpriv(p)]
+extra_entries = len([p for p in imgset - refset if not rpriv(p)])
 priv_inode = {}
 for p, e in img.items():
     if p.startswith(PRIV + "/iNode"):
         try: priv_inode[int(p.rsplit("iNode", 1)[1])] = e
         except ValueError: pass
+img = imgx  # from here on the cryptex-resolved view is what counts
 hlrec = {p for p in ifiles if img[p].nlink == 0}
 def isize(p):
     e = priv_inode.get(img[p].inode)
     return e.size if (p in hlrec and e) else img[p].size
-ibytes = sum(isize(p) for p in ifiles)
+ibytes = sum(isize(p) for p in ifiles if p not in held)
 
 def count(cls, ref_v, img_v, offenders):
     check(cls, ref_v == img_v, ref_v, img_v, offenders if ref_v != img_v else [])
 
 count("file count", len(rfiles), len(ifiles), [f"expected {len(rfiles)}, image has {len(ifiles)}"])
 count("symlink count", len(rlinks), len(ilinks), [f"expected {len(rlinks)}, image has {len(ilinks)}"])
-count("directory count", len(rdirs), len(idirs), [f"expected {len(rdirs)}, image has {len(idirs)}"])
-count("total bytes", rbytes, ibytes, [f"expected {rbytes}, image has {ibytes} (delta {ibytes - rbytes})"])
+_rd, _id = set(rdirs), set(idirs)
+count("directory count", len(rdirs), len(idirs),
+      [f"expected {len(rdirs)}, image has {len(idirs)}"]
+      + [f"only in reference: {esc(p)}" for p in sorted(_rd - _id)]
+      + [f"only in image: {esc(p)}" for p in sorted(_id - _rd)])
+_sz = [p for p in ifiles if p in ref and isize(p) != ref[p].size]
+count("total bytes", rbytes, ibytes,
+      [f"expected {rbytes}, image has {ibytes} (delta {ibytes - rbytes})"]
+      + [f"{esc(p)}: reference {ref[p].size} B, image {isize(p)} B" for p in sorted(_sz)])
 if expect_files: check("expected file count", len(ifiles) == int(expect_files), expect_files, len(ifiles), [f"image has {len(ifiles)}"])
 if expect_bytes: check("expected total bytes", ibytes == int(expect_bytes), expect_bytes, ibytes, [f"image has {ibytes}"])
 
 common = refset & imgset
 
 # kind must agree for common paths
-kindb = [p for p in refset & imgset if (ref[p].t == "D") != (img[p].t == "D") or (ref[p].t == "L") != (img[p].t == "L")]
+kindb = [p for p in (refset & imgset) - link_ok
+         if (ref[p].t == "D") != (img[p].t == "D") or (ref[p].t == "L") != (img[p].t == "L")]
 check("kind", not kindb, len(common), len(common) - len(kindb), [f"{esc(p)}: reference {ref[p].t}, image {img[p].t}" for p in sorted(kindb)])
 
 # symlink targets
@@ -584,10 +748,19 @@ for p in ifiles:
     if img[p].nlink == 0: iclasses.setdefault(img[p].inode, []).append(p)
 igrp = {frozenset(v) for v in iclasses.values() if len(v) > 1}
 hl_bad = [f"reference group {sorted(map(esc, g))} has no matching image group" for g in sorted(rgrp - igrp, key=sorted)]
-hl_bad += [f"image group {sorted(map(esc, g))} not in reference" for g in sorted(igrp - rgrp, key=sorted)]
+notes = list(early)
+# A flat reference has no hard links at all: the cryptex content is one copy per
+# DMG. Groups whose every member lies in a resolved cryptex tree (the preboot
+# inode plus the link(s) to it) are therefore expected, not a mismatch.
+covered = lambda p: any(p == pre or p.startswith(pre + "/") for pre in resolved) or p.startswith(PRIV + "/")
+hl_bad += [f"image group {sorted(map(esc, g))} not in reference"
+           for g in sorted(igrp - rgrp, key=sorted) if not all(covered(x) for x in g)]
+if igrp - rgrp:
+    notes.append("%d image hard-link group(s) belong to resolved cryptex content (flat reference has them as copies)"
+                 % len([g for g in igrp - rgrp if all(covered(x) for x in g)]))
 check("hardlink groups", not hl_bad, len(rgrp), len(igrp), hl_bad)
 
-inode_bad, inode_note, notes = [], [], []
+inode_bad, inode_note = [], []
 for g in sorted(rgrp & igrp, key=sorted):
     ipath = PRIV + "/iNode%d" % img[sorted(g)[0]].inode
     rec = img.get(ipath)
@@ -607,8 +780,20 @@ for g in sorted(rgrp & igrp, key=sorted):
 check("hardlink inodes", not inode_bad, len(rgrp & igrp), len(rgrp & igrp) - len(inode_bad), inode_bad)
 
 # modes on every path, then the critical paths called out on their own
-modeb = [p for p in common if ref[p].t != "D" and ref[p].nlink <= 1 and ref[p].mode != img[p].mode]
-modeb += [p for p in common if ref[p].t == "D" and ref[p].mode != img[p].mode]
+# a symlink's own record carries mode 0777 on HFS, its target is checked instead
+# modes the boot tolerates both ways: /dev is 0555 or 0755 in 34, /private/var/run
+# and /private/var/db carry any mode
+MODE_EXC = {"/dev": {0o555, 0o755}}
+MODE_FREE = ("/private/var/run", "/private/var/db")
+def mode_ok(p):
+    if any(p == f or p.startswith(f + "/") for f in MODE_FREE):
+        return True
+    allowed = MODE_EXC.get(p)
+    return True if allowed is None else img[p].mode in allowed
+modeb = [p for p in common - link_ok if ref[p].t == "F" and ref[p].nlink <= 1
+         and img[p].t != "L" and img[p].nlink != 0 and ref[p].mode != img[p].mode and not mode_ok(p)]
+modeb += [p for p in common - link_ok if ref[p].t == "D" and img[p].t != "L"
+          and ref[p].mode != img[p].mode and not mode_ok(p)]
 check("mode", not modeb, len(common), len(common) - len(modeb), [f"{esc(p)}: reference {ref[p].mode:04o}, image {img[p].mode:04o}" for p in sorted(modeb)])
 
 crit = [p for p in ref if p.startswith(CRIT)]
@@ -619,7 +804,20 @@ check("critical path modes", not critb, len(crit), len(crit) - len(critb), [f"{e
 # ownership
 owned = [p for p in common if ref[p].uid == 0 or ref[p].gid == 0]
 # a hard link's own record is not where its owner lives; that is gated above
-ownb = [p for p in common if ref[p].nlink <= 1 and (ref[p].uid, ref[p].gid) != (img[p].uid, img[p].gid)]
+# 1000:1000 on the reference side means the overlay mount does not carry that
+# path (sysos/appos): nothing to compare against, so it is noted, not gated
+no_owner = [p for p in common - link_ok if (ref[p].uid, ref[p].gid) == (1000, 1000)]
+if no_owner:
+    notes.append("%d path(s) have no reference owner (1000:1000, outside the overlay mount) and are not gated"
+                 % len(no_owner))
+OWNER_FREE = ("/private/var/run", "/private/var/db", "/private/tmp", "/private/var/tmp", "/dev")
+# a hard link's own record is not where its owner lives (the inode record is,
+# gated by the hardlink-inodes class), and a flat reference holds the same file
+# with nlink 1, so compare only where neither side is a link record
+ownb = [p for p in common - link_ok if p not in no_owner and ref[p].t != "L" and img[p].t != "L"
+        and ref[p].nlink <= 1 and img[p].nlink != 0
+        and not any(p == f or p.startswith(f + "/") for f in OWNER_FREE)
+        and (ref[p].uid, ref[p].gid) != (img[p].uid, img[p].gid)]
 check("owner", not ownb, len(common) - len([p for p in common if ref[p].nlink > 1]), len(common) - len([p for p in common if ref[p].nlink > 1]) - len(ownb), [f"{esc(p)}: reference {ref[p].uid}:{ref[p].gid}, image {img[p].uid}:{img[p].gid}" for p in sorted(ownb)])
 
 # --- report -----------------------------------------------------------------

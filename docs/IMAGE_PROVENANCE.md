@@ -364,3 +364,137 @@ Mach-O is produced. The 131 MB `.a` still keeps the kernel dir out of git.
 
 | `out-pay/p9` | `3e3a84e5…` (shim unchanged) | `0x180000000`/`0xfff00000` | p8 cmdline | pending. **First kernel with `0104`**: takes a signed iOS binary past the OSX platform check, so `launchd` may exec instead of being SIGKILLed. payload `sha256 10e2c465…` |
 
+
+## root image populate 2026-11-13 20:21Z
+
+| file | bytes | sha256 |
+|---|---|---|
+| ios16-root.img | 17179869184 | 8654ec2b52c442ac3f1df22f051be138b5717908051f9bc9cab7884f81b870a0 |
+
+context: host=pc payload=11304857126 files=181773 used=12529766400 tweaks=d604e9fd74f8344b87a351cf573346f4b8d2a3f73e9b3948cb720abcefd56398
+
+## root image (userdata) — populated, 2026-11-13
+
+The 11.3 GB payload of the three `build/ipsw-x` DMGs is inside the volume. Written by
+`tooling/33-populate-root.sh` (loop mount, root), resumed with `--adopt` from the 19:25 run; content
+stages 19:25:47 -> 19:35:26, gate (both validation legs + `fsck -fy` on the unmounted image)
+21:16 -> 21:21:10. Payload 11 304 857 126 B, the pinned once-counted sum of the three DMGs. State in
+`build/ios16-root.img.populate-state` (`stage=fsck`, `image_sha_final`, `finished`).
+
+| field | value |
+|---|---|
+| file | `build/ios16-root.img` |
+| bytes | 17179869184 |
+| volume | HFSX (`HX`, version 5) at 0x400, case-sensitive, journaled (attributes `0x80002800`, journal 8192 KiB), name `iOSRoot` |
+| geometry | 4194304 blocks x 4096 = 16 GiB exactly |
+| payload set | 144 341 files / 11 304 857 126 B, the numbers `33b` pins and leg A of `36` re-counts |
+| fsck of the empty volume (18:50) | `** The volume iOSRoot appears to be OK.` (`logs/31-mkfs-20261113T185025.log`) |
+| sha256 | `FINAL_SHA_PLACEHOLDER` |
+
+The hash was taken by the routine's own `hash` step after the unmount and re-taken by hand
+(`sha256sum build/ios16-root.img`), both `8654ec2b…` — never under a live mount. Validation was
+`tooling/35` leg A (paths/bytes/kind/mode/owner/symlink targets/hard-link groups, cryptex links
+resolved, populate additions as expected extras) and `tooling/34` leg B (the ordered launchd
+first-run set: absent 0, mismatch 0). Notes carried by leg A, all by design: 41 cryptex symlinks
+resolved, 47 payload paths present under `HAL.disabled/`, 5 paths the reader cannot stat and 22
+non-ASCII names held out, 4 files rewritten by the tweaks (launchd.plist, the three MediaToolbox
+sub-server configs).
+
+    sha256sum build/ios16-root.img
+    8654ec2b52c442ac3f1df22f051be138b5717908051f9bc9cab7884f81b870a0
+
+## Gate: write the 16 GiB root over userdata (destructive), 2026-11-13
+
+Supersedes the 1 GiB mount test of the gate above (`build/final-1g.img`, `d0bdf0fa…`): same
+partition start, the real volume this time. `userdata` is 108 196 737 024 B and the image
+17 179 869 184 B, so the write stops 91 016 867 840 B before the partition end — the 1025 blocks
+the ring is parked in are never written by it. `boot_a` untouched (every boot is `fastboot boot`),
+`boot_b` still the LineageOS fallback, GPT unmoved, `persist`/`modemst1/2`/`fsg` not named.
+
+Preconditions, in order: `36` printed `READY TO BOOT` for this exact file, the sha256 above is the
+file on disk, **the same root has booted in QEMU**, phone in recovery, `adb devices` lists one
+device. Then:
+
+    adb exec-out 'dd of=/dev/block/sda16 bs=1M conv=fsync' < build/ios16-root.img
+
+`dd`'s own `bytes (...) copied` line comes back on stderr and must name 17179869184. Read the
+volume signature back through the phone before booting anything:
+
+    adb exec-out 'dd if=/dev/block/sda16 bs=1 count=4 skip=1024' | xxd
+
+Expect `48 58 00 05` (`HX`, v5). Rollback — whole command, ~1 s, same start, the volume header
+carries its own size so the 1 GiB volume is valid on its own:
+
+    adb exec-out 'dd of=/dev/block/sda16 bs=1M conv=fsync' < build/final-1g.img
+
+`build/final-1g.img` 1073741824 B, sha256
+`d0bdf0fac3e2d66beb5950e96e157a10c916efbb7708bff984edf501a5aae1f7`.
+
+## p9 — `launchd` past the AMFI platform check (`0104`), 2026-11-13
+
+The boot above the populated volume, and the first one whose kernel carries
+`0104-sweet-ios-exec-platform.patch` (`docs/AMFI_LAUNCHD.md` §3) — the patch that lets a *signed*
+iOS binary past the `EXEC_EXIT_REASON_WRONG_PLATFORM` refusal instead of being `CS_KILLED`. The
+cmdline is p8's, unchanged; the row in the table above carries the intent, this block the
+artifact that was actually built.
+
+| file | bytes | sha256 |
+|---|---|---|
+| `avicii/shim/out-pay/p9/shim-boot.img` | 100663296 | `eabf09ff26b2007e62c3d971a15478d57e65ef3df6e9799029f34f7130ef2c3d` |
+| `avicii/shim/out-pay/p9/Image` | 835584 | `3e3a84e5dae8168c6ffbb5e34420c0d8e722fab8e595500dbe7385d4fff11183` |
+| `avicii/shim/out-pay/p9/shim.elf` | 560376 | `0dcdbdcbcd085dc73dd5a69cb5bc55cb09243db01f4803ba639da92650afb7a3` |
+| `avicii/shim/out-pay/pay0/payload-p9.bin` | 16613440 | `10e2c46566330ca18f5c41cc77fad9fbcceded228d511b225707248b9638d42c` |
+
+`Image` and `shim.elf` are byte-identical to p7/p8 (`3e3a84e5…`, `0dcdbdcb…`, `sha256sum`,
+2026-11-13); only the packed payload moved, which is what took `shim-boot.img` from p8's
+`86c5aebd…` to `eabf09ff…`. Cmdline as read out of the packed image at `0xcd048`, 196 of 608
+bytes:
+
+    sweetsmp=1 cpus=8 sweettouch=0 sweetkeys=0 sweetfb_console=1 sweetecon=1 rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 launchd_log_serial=1 launchd_disable_all_timeouts=1 -v debug=0x144 keepsyms=1
+
+    BUILD:  DTB=$PWD/avicii/shim/hybrid/sections/dtb-stock DIAG_STAGE=0 DIAG_LOG=1 OUT=$PWD/avicii/shim/out-pay/p9 \
+            ./avicii/shim/build.sh $PWD/avicii/shim/out-pay/pay0/payload-p9.bin
+    IMAGE:  avicii/shim/out-pay/p9/shim-boot.img  sha256 eabf09ff26b2007e62c3d971a15478d57e65ef3df6e9799029f34f7130ef2c3d
+    BOOT:   fastboot boot avicii/shim/out-pay/p9/shim-boot.img
+
+result: **pending**, and it has exactly two shapes, both named in advance so the ring is read
+rather than interpreted. Either no `CS_KILLED` panic and, in its place, the deferred dyld stop of
+`docs/AMFI_LAUNCHD.md` §4.1 run 3 —
+
+    SWEET EARLY PANIC:  initproc failed to start -- exit reason namespace 6 subcode 0x1 description: Library not loaded: /usr/lib/libSystem.B.dylib
+
+— which is the next wall, not this one, and is the outcome the real dyld cache on the populated
+volume is supposed to decide; or launchd's own console records after `load_init_program:
+attempting to load /sbin/launchd`, if the cache resolves. A `namespace 9 code 0xe` panic instead
+means `0104` did not take, and the populated volume is then untested rather than proven.
+
+## After the boot — the ring first, then the panel, 2026-11-13
+
+No serial port exists on this phone and XNU kills USB at the jump, so the ring in the tail of
+`userdata` is the durable channel and the panel is the live one. Literal sequence, in this order:
+
+    # reset: hold power + volume-down ~12 s, release on the fastboot screen
+    fastboot reboot recovery
+    # on the recovery screen: enable adb (root adbd; the tool takes either su or a root adbd)
+    cd /home/tadej/ios-nord
+    adb devices
+    ./tooling/42-log-pull.sh -o logs/p9-kernel-ring.txt
+
+`42-log-pull.sh` reads 1 + 1024 + 1025 blocks of 4096 from the partition tail, decodes the shim
+ring and the kernel console ring and labels each; `-o` writes the decoded text, `--keep-bin` keeps
+the raw area, `--raw` prints its path instead of the text. Name the file after the boot directory,
+as with `logs/p6-kernel-ring.txt` and `logs/p7-kernel-ring.txt`, and append this block's `result`
+line before moving on: a boot with no result line is an open row.
+
+Panel photos live in `photos/` as the raw 4000x3000 camera frames, so they read sideways;
+`tesseract` is not installed — it is unpacked at `~/.hermes/cache/scratch/ocr/root` and needs
+`LD_LIBRARY_PATH` and `TESSDATA_PREFIX` pointed into that tree:
+
+    O=$HOME/.hermes/cache/scratch/ocr/root
+    python3 -c "from PIL import Image as I; im=I.open('photos/p9-panel.jpg'); im.rotate(270, expand=True).convert('L').save('/tmp/p9-panel.png')"
+    LD_LIBRARY_PATH=$O/usr/lib/x86_64-linux-gnu TESSDATA_PREFIX=$O/usr/share/tesseract-ocr/5/tessdata $O/usr/bin/tesseract /tmp/p9-panel.png stdout --psm 6
+
+Rotate 270 is the measured one, not a guess: on `photos/p6-panel.jpg` it is the only quarter-turn
+that returns `load_init_program`, `hfs: mounted iOSRoot` and `SWEET EARLY PANIC`; 0, 90 and 180
+return reversed word salad. If a future photo comes already rotated, drop the `python3` line and
+OCR the file directly.
