@@ -11,7 +11,7 @@
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_smmu.c
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,205 @@
 +/*
 + * SWEET avicii: one shared apps_smmu stage-1 context bank for the DMA masters
 + * XNU drives itself (GPI touch: SIDs 0x36/0x23; USB DWC3: SID 0xE0).
@@ -32,6 +32,7 @@ new file mode 100644
 +#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <kern/locks.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <arm/caches_internal.h>
 +#include <vm/pmap.h>
