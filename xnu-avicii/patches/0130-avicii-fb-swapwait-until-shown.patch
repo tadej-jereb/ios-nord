@@ -1,0 +1,86 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <kern/clock.h>        /* clock_interval_to_deadline (0130) */
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -113,6 +114,8 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	uint32_t      fPendingID;     /* swap id (rec +0x50) of fPending */
++	uint32_t      fShownID;       /* swap id whose pixels are in the panel; SwapWait sleeps on it */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -294,6 +297,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
++		/* The frame's pixels are in the panel now: its surface is free again (0130). */
++		IOLockLock(fb->fLock);
++		fb->fShownID = get32(rec, 0x50);
++		IOLockWakeup(fb->fLock, &fb->fShownID, false);
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -394,6 +402,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	sweet_fb_bind_presenter();
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingID = get32(rec, 0x50);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % swaplog) == 0) {
+@@ -654,7 +663,45 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-	case kSweetFBSwapWait:
++	case kSweetFBSwapWait: {
++		/*
++		 * 0130: a swap only records the frame; the vsync timer copies it into the panel
++		 * later. Returning at once let the window server draw the next frame into a
++		 * surface still waiting to be copied, which the GPU renderer is fast enough to do
++		 * every frame (flicker while scrolling). Sleep until the vsync copy of this swap,
++		 * or a later one, is done; 50 ms at most, never for a swap not yet submitted.
++		 * sweetfb_swapwait=0: the old behaviour.
++		 */
++		static int waitOn = -1;
++		static uint32_t waitLogged;
++		if (waitOn < 0) {
++			waitOn = 1;
++			PE_parse_boot_argn("sweetfb_swapwait", &waitOn, sizeof(waitOn));
++		}
++		uint32_t id = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++		int slept = 0;
++		IOLockLock(fFB->fLock);
++		if (waitOn && id != 0 && (int32_t)(id - fFB->fPendingID) <= 0) {
++			uint64_t deadline;
++			clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++			while ((int32_t)(fFB->fShownID - id) < 0 && fFB->fDirty && !fFB->fPowerOff) {
++				if (IOLockSleepDeadline(fFB->fLock, &fFB->fShownID, deadline,
++				    THREAD_UNINT) == THREAD_TIMED_OUT) {
++					slept = -1;
++					break;
++				}
++				slept = 1;
++			}
++		}
++		uint32_t shown = fFB->fShownID, pending = fFB->fPendingID;
++		IOLockUnlock(fFB->fLock);
++		if (waitLogged < 12) {
++			waitLogged++;
++			IOLog("SWEET FB: swapwait id %u pending %u shown %u in %u %s\n", id, pending, shown,
++			    args->scalarInputCount, slept < 0 ? "timeout" : slept ? "slept" : "ready");
++		}
++		break;
++	}
+ 	default:
+ 		break;
+ 	}
