@@ -111,3 +111,4 @@ apply 0112-avicii-shared-smmu-usb-sid.patch
 apply 0113-avicii-usb-phy-rails.patch
 apply 0114-avicii-fb-swap-rate.patch
 apply 0115-avicii-cpufreq-max.patch
+apply 0116-avicii-cpu-placement-l3.patch

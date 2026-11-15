@@ -1,0 +1,606 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1,6 +1,6 @@
+ /*
+  * SWEET CPU frequency (avicii): request the top level of each OSM cpufreq-hw
+- * domain at boot.
++ * domain and of the L3 (CPU cluster cache) domain at boot, and report it.
+  *
+  * Nothing in this kernel programs the CPU frequency, so the cores stay at the
+  * level ABL left; the spacewar port measured its big cores there at ~3.5x below
+@@ -11,32 +11,75 @@
+  * 0x18323000 (A55 x6), 0x18325800 (A76 gold), 0x18327800 (A76 prime), 0x1000
+  * each (avicii/CONSTANTS.md). Layout from LineageOS android_kernel_oneplus_sm7250
+  * lineage-20 drivers/cpufreq/qcom-cpufreq-hw.c (cpufreq_qcom_std_offsets):
+- *   ENABLE 0x0 (bit 0), FREQ_LUT 0x110, PERF_STATE 0x920, LUT rows 32 bytes,
+- *   at most 40; row [31:30] source (0 = alternate clock), [7:0] L (MHz = L *
+- *   19.2), [18:16] cores the row allows. The table ends at a repeated row.
+- *   Rows allowing fewer cores than the domain's maximum are boost levels; the
+- *   top row requested here is the highest one allowing the maximum.
++ *   ENABLE 0x0 (bit 0), FREQ_LUT 0x110, PERF_STATE 0x920, CYCLE_CNTR 0x9c0,
++ *   LUT rows 32 bytes, at most 40; row [31:30] source (0 = alternate clock),
++ *   [7:0] L (MHz = L * 19.2), [18:16] cores the row allows. The table ends at a
++ *   repeated row. Rows allowing fewer cores than the domain's maximum are boost
++ *   levels; the top row requested here is the highest one allowing the maximum.
++ *   lito.dtsi:1766 sets qcom,no-accumulative-counter: one cycle counter per
++ *   domain at CYCLE_CNTR + 0.
++ * L3 is "qcom,devfreq-fw" (lito.dtsi:1778-1782): en-base 0x18321000,
++ * ftbl-base 0x18321110 (qcom,ftbl-row-size 32), perf-base 0x18321920,
++ * pstate-base 0x18321700, i.e. the same layout at 0x18321000; rows [31:30]
++ * source, [7:0] multiplier of 19.2 MHz (drivers/devfreq/devfreq_qcom_fw.c
++ * :22-28,147-162,182-196 same tree). All L3 voters share the one perf-base.
+  * Thermal limits stay in hardware (LMh clamps the domain on its own).
+  *
+- * Boot-args: sweetcpufreq=0 leaves ABL's levels; sweetcpulevel=N caps the row.
++ * Boot-args: sweetcpufreq=0 leaves ABL's CPU levels, sweetcpulevel=N caps the
++ *   CPU row; sweetl3=0 leaves L3, sweetl3level=N caps the L3 row.
++ * Sysctls:
++ *   kern.sweet_cpufreq      (string) every domain's table, request, measured
++ *                           clock, and a timed dependent-add loop on each CPU
++ *   kern.sweet_cpufreq_cap  (int, rw) CPU row cap; writing re-requests
++ *   kern.sweet_l3_cap       (int, rw) L3 row cap; writing re-requests
++ *   kern.sweet_bind         (string, rw) "PID" lists PID's threads in ps -M
++ *                           order; "PID IDX CPU" binds thread IDX to CPU
++ *                           (CPU -1 unbinds); reading returns the last result
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++extern task_t proc_task(proc_t);
++extern kern_return_t sweet_bind_self(int cpu);
++extern kern_return_t sweet_task_threads(task_t task, int idx, int cpu, char *out, size_t outlen);
+ void sweet_cpufreq_init(void);
+ 
+ #define OSM_ENABLE      0x000u
+ #define OSM_FREQ_LUT    0x110u
++#define OSM_PSTATE      0x700u          /* L3 only: pstate-base status */
+ #define OSM_PERF_STATE  0x920u
++#define OSM_CYCLE_CNTR  0x9c0u          /* CPU domains only */
+ #define OSM_LUT_ROW     32u
+ #define OSM_LUT_MAX     40u
+ #define OSM_DOM_SIZE    0x1000u
+ 
+-static const uint64_t osm_domain_pa[] = { 0x18323000ull, 0x18325800ull, 0x18327800ull };
+-static const char *const osm_domain_name[] = { "A55", "A76 gold", "A76 prime" };
++#define DOM_N           4
++#define DOM_L3          3
++
++static const uint64_t osm_domain_pa[DOM_N] = { 0x18323000ull, 0x18325800ull, 0x18327800ull, 0x18321000ull };
++static const char *const osm_domain_name[DOM_N] = { "A55", "A76 gold", "A76 prime", "L3" };
++
++static struct {
++	vm_offset_t base;
++	uint32_t rows[OSM_LUT_MAX];
++	unsigned n, top;
++	int enabled;
++} dom[DOM_N];
++
++static int cpu_cap = OSM_LUT_MAX, l3_cap = OSM_LUT_MAX;
++static int cpu_on = 1, l3_on = 1;
+ 
+ static uint32_t
+ osm_rd(vm_offset_t b, uint32_t off)
+@@ -58,64 +101,294 @@ osm_cores(uint32_t row)
+ 	return (row >> 16) & 0x7u;
+ }
+ 
++/* Map one domain and read its table; dom[d].top is the fastest row with the
++ * domain's full core count (L3 rows carry no core count, so all qualify). */
++static void
++osm_probe(unsigned d)
++{
++	vm_offset_t b = ml_io_map(osm_domain_pa[d], OSM_DOM_SIZE);
++	unsigned n = 0, maxc = 0, top = 0;
++
++	if (!b) {
++		printf("SWEET CPUFREQ: domain %u map failed\n", d);
++		return;
++	}
++	dom[d].base = b;
++	uint32_t en = osm_rd(b, OSM_ENABLE);
++	if (!(en & 1u)) {
++		printf("SWEET CPUFREQ: domain %u (%s) not enabled (0x%x), left alone\n",
++		    d, osm_domain_name[d], en);
++		return;
++	}
++	for (unsigned i = 0; i < OSM_LUT_MAX; i++) {
++		dom[d].rows[i] = osm_rd(b, OSM_FREQ_LUT + i * OSM_LUT_ROW);
++		n = i + 1;
++		if (osm_cores(dom[d].rows[i]) > maxc) {
++			maxc = osm_cores(dom[d].rows[i]);
++		}
++		if (i > 0 && osm_mhz(dom[d].rows[i]) == osm_mhz(dom[d].rows[i - 1]) &&
++		    osm_cores(dom[d].rows[i]) == osm_cores(dom[d].rows[i - 1])) {
++			n = i;  /* repeated row ends the table and is not a level */
++			break;
++		}
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (osm_cores(dom[d].rows[i]) == maxc && osm_mhz(dom[d].rows[i]) > osm_mhz(dom[d].rows[top])) {
++			top = i;
++		}
++	}
++	dom[d].n = n;
++	dom[d].top = top;
++	dom[d].enabled = 1;
++}
++
++static void
++osm_request(unsigned d, int cap)
++{
++	unsigned row = dom[d].top;
++
++	if (!dom[d].enabled) {
++		return;
++	}
++	if (cap >= 0 && (unsigned)cap < row) {
++		row = (unsigned)cap;
++	}
++	uint32_t was = osm_rd(dom[d].base, OSM_PERF_STATE);
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(dom[d].base + OSM_PERF_STATE) = row;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	printf("SWEET CPUFREQ: domain %u (%s) row %u (%u MHz) -> row %u (%u MHz), reads %u\n",
++	    d, osm_domain_name[d], was, was < dom[d].n ? osm_mhz(dom[d].rows[was]) : 0,
++	    row, osm_mhz(dom[d].rows[row]), osm_rd(dom[d].base, OSM_PERF_STATE));
++}
++
+ void
+ sweet_cpufreq_init(void)
+ {
+ 	static int done;
+-	uint32_t enabled = 1, cap = OSM_LUT_MAX;
+ 
+ 	if (done) {
+ 		return;
+ 	}
+ 	done = 1;
+-	(void)PE_parse_boot_argn("sweetcpufreq", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("sweetcpulevel", &cap, sizeof(cap));
+-	if (!enabled) {
+-		printf("SWEET CPUFREQ: disabled (sweetcpufreq=0), ABL levels kept\n");
+-		return;
++	(void)PE_parse_boot_argn("sweetcpufreq", &cpu_on, sizeof(cpu_on));
++	(void)PE_parse_boot_argn("sweetcpulevel", &cpu_cap, sizeof(cpu_cap));
++	(void)PE_parse_boot_argn("sweetl3", &l3_on, sizeof(l3_on));
++	(void)PE_parse_boot_argn("sweetl3level", &l3_cap, sizeof(l3_cap));
++	for (unsigned d = 0; d < DOM_N; d++) {
++		osm_probe(d);
+ 	}
+-	for (unsigned d = 0; d < sizeof(osm_domain_pa) / sizeof(osm_domain_pa[0]); d++) {
+-		vm_offset_t b = ml_io_map(osm_domain_pa[d], OSM_DOM_SIZE);
+-		if (!b) {
+-			printf("SWEET CPUFREQ: domain %u map failed\n", d);
+-			continue;
++	if (cpu_on) {
++		for (unsigned d = 0; d < DOM_L3; d++) {
++			osm_request(d, cpu_cap);
+ 		}
+-		uint32_t en = osm_rd(b, OSM_ENABLE);
+-		if (!(en & 1u)) {
+-			printf("SWEET CPUFREQ: domain %u (%s) not enabled (0x%x), left alone\n",
+-			    d, osm_domain_name[d], en);
++	} else {
++		printf("SWEET CPUFREQ: CPU domains left at ABL levels (sweetcpufreq=0)\n");
++	}
++	if (l3_on) {
++		osm_request(DOM_L3, l3_cap);
++	} else {
++		printf("SWEET CPUFREQ: L3 left at ABL level (sweetl3=0)\n");
++	}
++}
++
++/*
++ * Clock of the CPU this runs on, from a chain of dependent adds: each add needs
++ * the previous result, and an integer add has 1-cycle latency on both the A55
++ * and the A76, so 16 adds per iteration take 16 cycles whatever else the core
++ * can overlap. Interrupts are off for the few milliseconds it runs.
++ */
++static unsigned
++loop_mhz(void)
++{
++	const uint64_t iters = 200000;  /* 3.2 M cycles: ~1.3 ms at 2.4 GHz */
++	uint64_t x = 0, n = iters, t0, t1, ns;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	t0 = mach_absolute_time();
++	__asm__ volatile (
++                "1:\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "subs %1, %1, #1\n"
++                "b.ne 1b\n"
++                : "+r" (x), "+r" (n) :: "cc");
++	t1 = mach_absolute_time();
++	(void)ml_set_interrupts_enabled(istate);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	return ns ? (unsigned)(iters * 16 * 1000 / ns) : 0;
++}
++
++#define REPORT_LEN 4096
++
++static int
++sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *buf;
++	size_t o = 0;
++	int error;
++
++	buf = kalloc_data(REPORT_LEN, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	for (unsigned d = 0; d < DOM_N; d++) {
++		vm_offset_t b = dom[d].base;
++		if (!dom[d].enabled) {
++			o += scnprintf(buf + o, REPORT_LEN - o, "%u %s: not enabled\n", d, osm_domain_name[d]);
+ 			continue;
+ 		}
+-		uint32_t rows[OSM_LUT_MAX];
+-		unsigned n = 0, maxc = 0;
+-		for (unsigned i = 0; i < OSM_LUT_MAX; i++) {
+-			rows[i] = osm_rd(b, OSM_FREQ_LUT + i * OSM_LUT_ROW);
+-			n = i + 1;
+-			if (osm_cores(rows[i]) > maxc) {
+-				maxc = osm_cores(rows[i]);
+-			}
+-			if (i > 0 && rows[i] == rows[i - 1]) {
+-				break;
+-			}
++		uint32_t req = osm_rd(b, OSM_PERF_STATE);
++		o += scnprintf(buf + o, REPORT_LEN - o, "%u %s: req row %u = %u MHz (top %u = %u MHz)",
++		    d, osm_domain_name[d], req, req < dom[d].n ? osm_mhz(dom[d].rows[req]) : 0,
++		    dom[d].top, osm_mhz(dom[d].rows[dom[d].top]));
++		if (d == DOM_L3) {
++			o += scnprintf(buf + o, REPORT_LEN - o, " pstate 0x%x", osm_rd(b, OSM_PSTATE));
++		} else {
++			/* Domain cycle counter over 10 ms; counts only while the domain is clocked. */
++			uint32_t c0 = osm_rd(b, OSM_CYCLE_CNTR);
++			uint64_t t0 = mach_absolute_time(), ns;
++			delay(10000);
++			uint32_t c1 = osm_rd(b, OSM_CYCLE_CNTR);
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			o += scnprintf(buf + o, REPORT_LEN - o, " counter %llu MHz",
++			    ns ? (unsigned long long)(uint32_t)(c1 - c0) * 1000 / ns : 0);
++		}
++		o += scnprintf(buf + o, REPORT_LEN - o, "\n  lut");
++		for (unsigned i = 0; i < dom[d].n; i++) {
++			o += scnprintf(buf + o, REPORT_LEN - o, " %u%s", osm_mhz(dom[d].rows[i]),
++			    (d != DOM_L3 && osm_cores(dom[d].rows[i]) != osm_cores(dom[d].rows[dom[d].top])) ? "b" : "");
+ 		}
+-		unsigned top = 0;
+-		for (unsigned i = 0; i < n; i++) {
+-			if (osm_cores(rows[i]) == maxc && osm_mhz(rows[i]) > osm_mhz(rows[top])) {
+-				top = i;
++		o += scnprintf(buf + o, REPORT_LEN - o, "\n");
++	}
++	o += scnprintf(buf + o, REPORT_LEN - o, "loop MHz per cpu:");
++	for (int cpu = 0; cpu <= ml_get_max_cpu_number(); cpu++) {
++		unsigned mhz = 0;
++		if (sweet_bind_self(cpu) == KERN_SUCCESS) {
++			thread_block(THREAD_CONTINUE_NULL);
++			if (cpu_number() == cpu) {
++				mhz = loop_mhz();
+ 			}
+ 		}
+-		if (top > cap) {
+-			top = cap;
++		o += scnprintf(buf + o, REPORT_LEN - o, " %d:%u", cpu, mhz);
++	}
++	(void)sweet_bind_self(-1);
++	o += scnprintf(buf + o, REPORT_LEN - o, "\n");
++	error = SYSCTL_OUT(req, buf, o + 1);
++	kfree_data(buf, REPORT_LEN);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cpufreq, "A", "SWEET OSM cpufreq + L3 state");
++
++static int
++sysctl_sweet_cap SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg2)
++	int *cap = (int *)arg1;
++	int v = *cap, changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	*cap = v;
++	if (cap == &l3_cap) {
++		osm_request(DOM_L3, v);
++	} else {
++		for (unsigned d = 0; d < DOM_L3; d++) {
++			osm_request(d, v);
+ 		}
+-		uint32_t was = osm_rd(b, OSM_PERF_STATE);
+-		printf("SWEET CPUFREQ: domain %u (%s) LUT %u rows: row0 %u MHz, top valid row %u %u MHz (%u cores); was row %u (%u MHz)\n",
+-		    d, osm_domain_name[d], n, osm_mhz(rows[0]), top, osm_mhz(rows[top]), maxc,
+-		    was, was < n ? osm_mhz(rows[was]) : 0);
+-		__asm__ volatile ("dmb oshst" ::: "memory");
+-		*(volatile uint32_t *)(b + OSM_PERF_STATE) = top;
+-		__asm__ volatile ("dsb osh" ::: "memory");
+-		printf("SWEET CPUFREQ: domain %u -> row %u (perf_state reads %u)\n",
+-		    d, top, osm_rd(b, OSM_PERF_STATE));
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq_cap, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &cpu_cap, 0, sysctl_sweet_cap, "I", "SWEET CPU OSM row cap (writing re-requests)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_l3_cap, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &l3_cap, 0, sysctl_sweet_cap, "I", "SWEET L3 row cap (writing re-requests)");
++
++#define BIND_LEN 4096
++static char bind_result[BIND_LEN] = "write \"PID\" or \"PID IDX CPU\"\n";
++
++static int
++parse_int(const char **p, int *out)
++{
++	const char *s = *p;
++	int neg = 0, v = 0, any = 0;
++
++	while (*s == ' ' || *s == '\t' || *s == '\n') {
++		s++;
++	}
++	if (*s == '-') {
++		neg = 1;
++		s++;
++	}
++	while (*s >= '0' && *s <= '9') {
++		v = v * 10 + (*s++ - '0');
++		any = 1;
++	}
++	*p = s;
++	*out = neg ? -v : v;
++	return any;
++}
++
++static int
++sysctl_sweet_bind SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char in[64] = "";
++	const char *p = in;
++	int pid, idx = -1, cpu = -1, error;
++	kern_return_t kr = KERN_SUCCESS;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, bind_result, strlen(bind_result) + 1);
++	}
++	if (req->newlen >= sizeof(in)) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, in, req->newlen);
++	if (error) {
++		return error;
++	}
++	if (!parse_int(&p, &pid) || pid <= 0) {
++		return EINVAL;
++	}
++	if (parse_int(&p, &idx) && !parse_int(&p, &cpu)) {
++		return EINVAL;
++	}
++	proc_t proc = proc_find(pid);
++	if (proc == PROC_NULL) {
++		return ESRCH;
++	}
++	task_t task = proc_task(proc);
++	if (idx < 0) {
++		kr = sweet_task_threads(task, -1, -1, bind_result, BIND_LEN);
++	} else {
++		/* A thread on a run queue cannot be rebound; it leaves it within a quantum. */
++		for (int tries = 0; tries < 100; tries++) {
++			kr = sweet_task_threads(task, idx, cpu, bind_result, BIND_LEN);
++			if (kr != KERN_ABORTED) {
++				break;
++			}
++			delay(1000);
++		}
++	}
++	proc_rele(proc);
++	switch (kr) {
++	case KERN_SUCCESS:
++		return 0;
++	case KERN_ABORTED:
++		return EBUSY;
++	case KERN_NO_ACCESS:
++		return EPERM;
++	default:
++		return EINVAL;
+ 	}
+ }
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bind, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bind, "A", "SWEET thread list / bind: \"PID\" or \"PID IDX CPU\"");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -314,6 +314,47 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * avicii: the ADT declares all eight cores as one SMP cluster, so backboardd's
++ * render thread (one thread at ~95% of a core during a scroll, logs/phone/
++ * bbd-threads-20261115.txt) lands on the A55s as often as on the A76s. Bind the
++ * thread that presents frames to an A76 (boot-arg sweetbind=CPU, default 7 =
++ * the prime A76; -1 disables). At most four distinct threads are bound, so a
++ * presenter that hops between worker threads cannot pile them all onto one core.
++ */
++extern "C" kern_return_t sweet_bind_self(int cpu);
++extern "C" uint64_t thread_tid(thread_t);
++static int32_t sweet_fb_bind_cpu = -2;
++static thread_t sweet_fb_bound[4];
++
++static void
++sweet_fb_bind_presenter(void)
++{
++	thread_t self = current_thread();
++	unsigned i;
++
++	if (sweet_fb_bind_cpu == -2) {
++		int32_t v = 7;
++		PE_parse_boot_argn("sweetbind", &v, sizeof(v));
++		sweet_fb_bind_cpu = v;
++	}
++	if (sweet_fb_bind_cpu < 0) {
++		return;
++	}
++	for (i = 0; i < 4 && sweet_fb_bound[i] != THREAD_NULL; i++) {
++		if (sweet_fb_bound[i] == self) {
++			return;
++		}
++	}
++	if (i == 4) {
++		return;
++	}
++	kern_return_t kr = sweet_bind_self(sweet_fb_bind_cpu);
++	sweet_fb_bound[i] = self;       /* also on failure: try each thread once */
++	IOLog("SWEET FB: presenting thread %llu (#%u) bound to cpu %d: kr %d\n",
++	    thread_tid(self), i, sweet_fb_bind_cpu, kr);
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -335,6 +376,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		PE_parse_boot_argn("sweetfb_swaplog", &v, sizeof(v));
+ 		swaplog = (v == 0) ? 1000000 : v;
+ 	}
++	sweet_fb_bind_presenter();
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -8936,3 +8936,115 @@ sysctl_get_quantum_us(void)
+ }
+ 
+ #endif /* DEVELOPMENT || DEBUG */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET (avicii) thread placement. The ADT declares the 2x A76 + 6x A55 as one
++ * SMP cluster (hw.nperflevels 1), so the scheduler cannot tell the fast cores
++ * from the slow ones. These let the framebuffer bind backboardd's presenting
++ * thread to an A76 and let kern.sweet_bind (bsd/dev/sweet_cpufreq.c) list or
++ * bind any task's threads. Realtime threads are refused: thread_bind_internal
++ * asserts sched_pri < BASEPRI_RTQUEUES.
++ */
++kern_return_t sweet_bind_self(int cpu);
++kern_return_t sweet_task_threads(task_t task, int idx, int cpu, char *out, size_t outlen);
++
++static kern_return_t
++sweet_cpu_processor(int cpu, processor_t *out)
++{
++	*out = PROCESSOR_NULL;
++	if (cpu < 0) {
++		return KERN_SUCCESS;            /* unbind */
++	}
++	if (cpu > ml_get_max_cpu_number() || (*out = cpu_to_processor(cpu)) == PROCESSOR_NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	return KERN_SUCCESS;
++}
++
++kern_return_t
++sweet_bind_self(int cpu)
++{
++	thread_t self = current_thread();
++	processor_t p;
++	kern_return_t kr = sweet_cpu_processor(cpu, &p);
++	spl_t s;
++
++	if (kr != KERN_SUCCESS) {
++		return kr;
++	}
++	s = splsched();
++	thread_lock(self);
++	if (p != PROCESSOR_NULL &&
++	    (self->sched_pri >= BASEPRI_RTQUEUES || self->sched_mode == TH_MODE_REALTIME)) {
++		kr = KERN_NO_ACCESS;
++	} else {
++		(void)thread_bind_internal(self, p);
++	}
++	thread_unlock(self);
++	splx(s);
++	return kr;
++}
++
++/*
++ * idx < 0: list the task's threads (task->threads order, which is what
++ * task_threads() and so ps -M print). idx >= 0: bind that thread to cpu
++ * (cpu < 0 unbinds). KERN_ABORTED: the thread sits on a run queue right now,
++ * try again.
++ */
++kern_return_t
++sweet_task_threads(task_t task, int idx, int cpu, char *out, size_t outlen)
++{
++	processor_t p = PROCESSOR_NULL;
++	kern_return_t kr = KERN_SUCCESS;
++	thread_t th;
++	size_t o = 0;
++	int i = 0, found = 0;
++	spl_t s;
++
++	if (idx >= 0 && (kr = sweet_cpu_processor(cpu, &p)) != KERN_SUCCESS) {
++		return kr;
++	}
++	out[0] = '\0';
++	if (idx < 0) {
++		o += scnprintf(out + o, outlen - o, "idx tid pri base mode bound last\n");
++	}
++	task_lock(task);
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		if (idx >= 0 && i != idx) {
++			i++;
++			continue;
++		}
++		s = splsched();
++		thread_lock(th);
++		if (idx >= 0) {
++			found = 1;
++			if (p != PROCESSOR_NULL &&
++			    (th->sched_pri >= BASEPRI_RTQUEUES || th->sched_mode == TH_MODE_REALTIME)) {
++				kr = KERN_NO_ACCESS;
++			} else if (th->runq != PROCESSOR_NULL) {
++				kr = KERN_ABORTED;
++			} else {
++				(void)thread_bind_internal(th, p);
++			}
++		}
++		o += scnprintf(out + o, outlen - o, "%d %llu %d %d %d %d %d%s\n", i,
++		    (unsigned long long)th->thread_id, th->sched_pri, th->base_pri, th->sched_mode,
++		    th->bound_processor ? th->bound_processor->cpu_id : -1,
++		    th->last_processor ? th->last_processor->cpu_id : -1,
++		    idx >= 0 ? (kr == KERN_SUCCESS ? " bound" : kr == KERN_ABORTED ? " busy" : " refused") : "");
++		thread_unlock(th);
++		splx(s);
++		if (idx >= 0) {
++			break;
++		}
++		i++;
++	}
++	task_unlock(task);
++	if (idx >= 0 && !found) {
++		scnprintf(out, outlen, "no thread %d\n", idx);
++		return KERN_INVALID_ARGUMENT;
++	}
++	return kr;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
