@@ -1,0 +1,73 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1207,7 +1207,10 @@ gpu_gmu_boot(void)
+  *     RB 0x12, TPL1 0x2, SP 0x22 (uavflagprd_inv 2), UCHE_MODE 1 << 21
+  *   - hang detect 0x3ffff, bicubic weights, CP_APRIV_CNTL 0x6e (ADRENO_APRIV)
+  *   - zap: a620_zap.mdt (header + hash = .b00 + .b01), one load segment (.b02, 0x68c bytes at
+- *     paddr 0x5000, relocatable) into pil_gpu_region@8bc15400 (0x2000, live FDT)
++ *     paddr 0x5000, relocatable, p_align 0x100000). TrustZone refused PAS_MEM_SETUP at the live
++ *     FDT's pil_gpu_region@8bc15400 (not even 4K aligned) with 0xffcfffba; lito's qcom,kgsl-hyp
++ *     names no memory-region, so the vendor's PIL takes DMA memory aligned to the segment. Here:
++ *     64 KiB of physically contiguous kernel memory on a 1 MiB boundary (kmem_alloc_contig).
+  */
+ #define CORE_CONTEXT              0u
+ #define CORE_MATCH                0u
+@@ -1268,8 +1271,8 @@ gpu_gmu_boot(void)
+ #define PAS_INIT_IMAGE            0x42000201ull
+ #define PAS_MEM_SETUP             0x42000202ull
+ #define PAS_AUTH_AND_RESET        0x42000205ull
+-#define ZAP_MEMORY                0x8bc15400ull  /* live FDT pil_gpu_region@8bc15400, 0x2000 */
+-#define ZAP_MEMORY_SIZE           0x2000u
++#define ZAP_ALIGN                 0x100000u      /* the load segment's p_align */
++#define ZAP_MEMORY_SIZE           0x10000u
+ #define ZAP_SETUP_SIZE            0x1000u        /* ALIGN(0x5000 + 0x68c, 4K) - 0x5000 */
+ 
+ static uint64_t *g_core_l1;
+@@ -1368,9 +1371,9 @@ gpu_zap_load(void)
+ {
+ 	const uint8_t *mdt, *seg;
+ 	uint32_t mdt_len = 0, seg_len = 0;
+-	vm_offset_t header, zap_page;
++	vm_offset_t header, zap_va;
+ 	volatile uint8_t *zap;
+-	uint64_t header_pa, x0, x1 = ~0ull;
++	uint64_t header_pa, zap_pa, x0, x1 = ~0ull;
+ 
+ 	if (!(mdt = gpu_fw("a620_zap.mdt", &mdt_len)) || !(seg = gpu_fw("a620_zap.b02", &seg_len)) ||
+ 	    mdt_len > PAGE_SIZE || seg_len > ZAP_SETUP_SIZE || (seg_len & 3u)) {
+@@ -1389,16 +1392,20 @@ gpu_zap_load(void)
+ 		gpu_log("SWEET GPU: [ZAP] taken to mean TrustZone keeps a zap shader from before: used as it is\n");
+ 		return true;
+ 	}
+-	x0 = gpu_scm_pas(PAS_MEM_SETUP, 0x03u, QCOM_GPU_PAS_ID, ZAP_MEMORY, ZAP_SETUP_SIZE, &x1);
+-	gpu_log("SWEET GPU: [ZAP] PAS_MEM_SETUP(%#llx, %#x) -> %#llx %#llx\n", ZAP_MEMORY, ZAP_SETUP_SIZE, x0, x1);
+-	if (x0 != 0 || x1 != 0) {
++	if (kmem_alloc_contig(kernel_map, &zap_va, ZAP_MEMORY_SIZE, ZAP_ALIGN - 1u, 0, (ppnum_t)atop(ZAP_ALIGN - 1u),
++	    KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || !(zap_pa = gpu_kvtophys(zap_va)) ||
++	    (zap_pa & (ZAP_ALIGN - 1u))) {
++		gpu_log("SWEET GPU: [ZAP] no 1 MiB-aligned contiguous memory for the zap shader\n");
+ 		return false;
+ 	}
+-	/* the region is not page aligned: map the 16K pages around it */
+-	if (!(zap_page = gpu_map(ZAP_MEMORY & ~(uint64_t)PAGE_MASK, 2u * PAGE_SIZE))) {
++	x0 = gpu_scm_pas(PAS_MEM_SETUP, 0x03u, QCOM_GPU_PAS_ID, zap_pa, ZAP_SETUP_SIZE, &x1);
++	gpu_log("SWEET GPU: [ZAP] PAS_MEM_SETUP(%#llx, %#x) -> %#llx %#llx\n", (unsigned long long)zap_pa, ZAP_SETUP_SIZE,
++	    x0, x1);
++	if (x0 != 0 || x1 != 0) {
+ 		return false;
+ 	}
+-	zap = (volatile uint8_t *)(zap_page + (ZAP_MEMORY & PAGE_MASK));
++	/* the segment into it after MEM_SETUP (Linux qcom_mdt_load's order), out of the cache before AUTH */
++	zap = (volatile uint8_t *)zap_va;
+ 	for (uint32_t off = 0; off < ZAP_SETUP_SIZE; off += 4u) {
+ 		uint32_t w = 0;
+ 		if (off < seg_len) {
+@@ -1406,7 +1413,7 @@ gpu_zap_load(void)
+ 		}
+ 		*(volatile uint32_t *)(zap + off) = w;
+ 	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	gpu_to_memory(zap_va, ZAP_MEMORY_SIZE);
+ 	x0 = gpu_scm_pas(PAS_AUTH_AND_RESET, 0x01u, QCOM_GPU_PAS_ID, 0, 0, &x1);
+ 	gpu_log("SWEET GPU: [ZAP] PAS_AUTH_AND_RESET -> %#llx %#llx%s\n", x0, x1,
+ 	    x0 == 0 && x1 == 0 ? ": TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER" : "");
