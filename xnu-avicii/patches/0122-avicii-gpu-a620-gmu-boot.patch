@@ -38,7 +38,7 @@
  static char gpu_logbuf[GPU_LOG_LEN];
  static size_t gpu_logpos;
  
-@@ -292,6 +304,888 @@ gpu_gmu_step2(void)
+@@ -292,6 +304,887 @@ gpu_gmu_step2(void)
  	    gpu_rd(gpu_gmu, GMU_BOFF(GMU_CX_GMU_WFI_CONFIG)));
  }
  
@@ -833,8 +833,7 @@
 +		uint32_t a[3] = { 0, 0, 0 };
 +		int miss = cmddb_find("mx.lvl", &a[0], NULL, NULL) | cmddb_find("cx.lvl", &a[1], NULL, NULL) |
 +		    cmddb_find("gfx.lvl", &a[2], NULL, NULL);
-+		gpu_log("SWEET GMU: cmd-db %s: mx.lvl %#x cx.lvl %#x gfx.lvl %#x
-+", miss ? "INCOMPLETE" : "ok", a[0], a[1], a[2]);
++		gpu_log("SWEET GMU: cmd-db %s: mx.lvl %#x cx.lvl %#x gfx.lvl %#x\n", miss ? "INCOMPLETE" : "ok", a[0], a[1], a[2]);
 +	}
 +	if (gpu_level < 7) {
 +		return 0;
@@ -927,7 +926,7 @@
  static void
  gpu_probe(void)
  {
-@@ -329,6 +1223,9 @@ gpu_probe(void)
+@@ -329,6 +1222,9 @@ gpu_probe(void)
  	if (gpu_level >= 5) {
  		gpu_gmu_step2();
  	}
@@ -937,7 +936,7 @@
  }
  
  static void
-@@ -354,7 +1251,7 @@ sweet_gpu_init(void)
+@@ -354,7 +1250,7 @@ sweet_gpu_init(void)
  	gpu_started = true;
  	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
  	if (!enabled) {
@@ -946,7 +945,7 @@
  		return;
  	}
  	gpu_level = enabled;
-@@ -378,7 +1275,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LO
+@@ -378,7 +1274,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LO
   * kern.sweet_gpu_peek: write "PA [N]" (hex PA, N <= 64 words), read back the words. Only
   * inside windows this driver already brought up, because a read of a block whose clock or
   * power is off aborts: GCC (always clocked), GPUCC once gcc_gpu_cfg_ahb is on (stage >= 1),
@@ -956,7 +955,7 @@
   */
  static char gpu_peek_out[2048] = "write \"PA [N]\"\n";
  
-@@ -394,6 +1292,15 @@ gpu_peek_va(uint64_t pa)
+@@ -394,6 +1291,15 @@ gpu_peek_va(uint64_t pa)
  	if (gpu_gmu && pa >= A6XX_GMU_PA && pa < A6XX_GMU_PA + A6XX_GMU_SIZE) {
  		return gpu_gmu + (vm_offset_t)(pa - A6XX_GMU_PA);
  	}
