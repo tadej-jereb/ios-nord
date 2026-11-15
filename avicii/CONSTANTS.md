@@ -300,3 +300,21 @@ Re-pull the four missing includes before the next code change — `lito-pm.dtsi`
 supply table), `lito-gdsc.dtsi`, `msm-arm-smmu-lito.dtsi`. Until `lito-pm.dtsi`
 is on disk, every `pm8150*_gpios` number above is quoted from the consumer side
 only and the GPIO *controller* base is `UNVERIFIED`.
+
+## GPU — Adreno 620 (layer 1, patch 0119)
+
+Same inside layout as SM8150 (raphael-ios-gpu's A640), every block 0x1100000 higher.
+Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
+
+| Item | Value | Note | Citation |
+|---|---|---|---|
+| GPU core (kgsl-3d0) | `0x3d00000` size `0x40000`, IRQ SPI 300 | chipid `0x06020000`, highest-bank-bit 14, ubwc-mode 3 | `lito-gpu.dtsi:67-82` (sha256 `a699812d…1c9e`) |
+| GMU | `0x3d6a000` size `0x30000`; PDC cfg `0xb290000`, seq `0xb490000`; IRQ SPI 304 (hfi), 305 (gmu) | SMMU streams 0x4 (user), 0x5 (kernel), mask 0x400 | `lito-gpu.dtsi:403-451` |
+| GPU SMMU | `0x3da0000` size `0x10000` | `qcom,kgsl-smmu-v2` | `lito-gpu.dtsi:368-370` |
+| Zap shader | PAS id 13, firmware `a620_zap` | TZ loads it (`qcom,pil-tz-generic`) | `lito-gpu.dtsi:2-6` |
+| GPU clock levels | 625 / 500 / 400 / 275 MHz (bin 0), initial level 3 | speed-bin tables follow | `lito-gpu.dtsi:191-301` |
+| GPUCC | `0x3d90000` size `0x9000` | | `lito.dtsi:1708-1710` |
+| GPU GDSCs | CX `0x3d9106c`, GX `0x3d9100c`, cx_hw_ctrl `0x3d91540`, gx domain `0x3d91508`, gx sw_reset `0x3d91008` | | `lito-gdsc.dtsi:99-133` (sha256 `d3bbb3cb…ec13`) |
+| GPUCC branches | ahb `0x1078`, cx_gmu `0x1098`, cxo `0x109c`, gx_gmu `0x1064`, smmu vote `0x5000`; gmu_clk_src rcgr `0x1120` (src 6 = gpll0_main_div, 200 MHz at /1.5) | | `drivers/clk/qcom/gpucc-lito.c:48-55,105-278` (sha256 `7ca7d70e…eb25`) |
+| GCC GPU branches | cfg_ahb `0x71004`, memnoc_gfx `0x7100c`, snoc_dvm_gfx `0x71018`, ddrss_gpu_axi `0x71154`; gpll0 vote `0x52000` bit 15, div bit 16 | SM8150 votes at `0x52004` | `drivers/clk/qcom/gcc-lito.c:1125-1345` (sha256 `9ceaf56a…93ff`) |
+| Mesa support | `GPUId(620)`: A6xx gen1, 1 CCU, tile align 32×16 | Mesa 24.2.8 | `src/freedreno/common/freedreno_devices.py:507-531` |

@@ -1,0 +1,368 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,337 @@
++/*
++ * SWEET Adreno 620 (avicii / OnePlus Nord / SM7250 "lito") bring-up, layer 1: power and
++ * identify. Ported from raphael-ios-gpu 0105 (Adreno 640, SM8150; itself davinci-ios-gpu's
++ * Adreno 618 port), stage by stage. All work runs on one kernel thread started by sweet_ufs.c
++ * once the disk is there. Boot-arg sweetgpu=N (off by default):
++ *
++ *   1  GCC: the clock of the GPU clock controller's registers (gcc_gpu_cfg_ahb), then that
++ *      controller read as it is. A gated clock controller does not read 0xffffffff, it
++ *      aborts: the clock first (davinci's first boot panicked on exactly that).
++ *   2  + TrustZone: PAS_IS_SUPPORTED(13), the GPU zap shader's peripheral id. A query only.
++ *   4  + the CX half of the GPU block on (gpu_cx_gdsc) and the GMU's clocks: 200 MHz from
++ *      the 300 MHz tap of the global 600 MHz PLL (gcc_gpu_gpll0_div_clk_src, voted in GCC
++ *      0x52000 bit 16).
++ *   5  + the GMU's registers, read: its processor held in reset, no firmware yet.
++ *
++ * lito vs SM8150: every GPU block sits 0x1100000 higher with the same inside layout.
++ * Sources (LineageOS android_kernel_oneplus_sm7250 lineage-20):
++ *   arch/arm64/boot/dts/vendor/qcom/lito-gpu.dtsi (sha256 a699812d...1c9e):
++ *     kgsl-3d0 0x3d00000 (0x40000), chipid 0x06020000 (:67-77); gmu 0x3d6a000 (0x30000)
++ *     (:403-411); kgsl_smmu 0x3da0000 (:368-370); pil_gpu pas-id 13, "a620_zap" (:2-6)
++ *   lito-gdsc.dtsi (sha256 d3bbb3cb...ec13): gpu_cx_hw_ctrl 0x3d91540 (:99-101),
++ *     gpu_cx_gdsc 0x3d9106c (:104-106), gpu_gx_gdsc 0x3d9100c (:125-127)
++ *   lito.dtsi:1708-1710: gpucc 0x3d90000 (0x9000)
++ *   drivers/clk/qcom/gpucc-lito.c (sha256 7ca7d70e...eb25): gmu_clk_src cmd_rcgr 0x1120,
++ *     source 6 = gpll0_out_main_div, 200 MHz at divider 1.5 (:48-55,105-113); ahb 0x1078,
++ *     cx_gmu 0x1098, cxo 0x109c (:133-221)
++ *   drivers/clk/qcom/gcc-lito.c (sha256 9ceaf56a...93ff): ddrss_gpu_axi 0x71154,
++ *     gpu_cfg_ahb 0x71004, gpu_gpll0 vote 0x52000 bit 15 / div bit 16 (not SM8150's 0x52004),
++ *     gpu_memnoc_gfx 0x7100c, gpu_snoc_dvm_gfx 0x71018 (:1125-1345)
++ * GMU register indices are the A6xx ones (Linux a6xx_gmu.xml.h), as raphael and davinci.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern kern_return_t thread_terminate(thread_t);
++void sweet_gpu_init(void);
++
++/*
++ * Every mapping of this file goes into kernel_map, not io_submap (davinci filled the 8 MB
++ * io_submap and panicked): ml_io_map_unmappable() is the same uncached device mapping.
++ */
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO                0x7u   /* arm/memory_types.h: COHERENT | NOT_CACHEABLE | GUARDED */
++#endif
++#define gpu_map(pa, size)         ml_io_map_unmappable((vm_offset_t)(pa), (vm_size_t)(size), VM_WIMG_IO)
++
++/* GCC (clock-controller@100000). Branch enable = bit 0, bit 31 = off. */
++#define GPU_GCC_PA                0x00100000u
++#define GPU_GCC_SIZE              0x001f0000u
++#define GCC_GPU_PLL_VOTE          0x52000u       /* bit 15 gcc_gpu_gpll0_clk_src, bit 16 ..._div_ */
++#define GCC_GPU_PLL_VOTE_DIV      (1u << 16)
++#define GCC_GPU_CFG_AHB_CLK       0x71004u
++#define GCC_GPU_MEMNOC_GFX_CLK    0x7100cu
++#define GCC_GPU_SNOC_DVM_CLK      0x71018u
++#define GCC_DDRSS_GPU_AXI_CLK     0x71154u
++#define CBCR_ENABLE               (1u << 0)
++#define CBCR_OFF                  (1u << 31)
++
++/* GPUCC (qcom,gpucc@3d90000) */
++#define GPU_GPUCC_PA              0x03d90000u
++#define GPU_GPUCC_SIZE            0x9000u
++#define GPUCC_GX_GDSCR            0x100cu        /* gpu_gx_gdsc: the 3D core's switch, the GMU's to operate */
++#define GPUCC_CX_GDSCR            0x106cu        /* gpu_cx_gdsc */
++#define GPUCC_AHB_CLK             0x1078u
++#define GPUCC_CX_GMU_CLK          0x1098u
++#define GPUCC_CXO_CLK             0x109cu
++#define GPUCC_GMU_RCGR            0x1120u        /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
++#define GPUCC_CX_HW_CTRL          0x1540u        /* gpu_cx_hw_ctrl: bit 31 where the vendor sees CX on */
++#define GDSC_SW_COLLAPSE          (1u << 0)
++#define GDSC_HW_CONTROL           (1u << 1)
++#define GDSC_PWR_ON               (1u << 31)
++#define RCG_UPDATE                (1u << 0)
++#define RCG_SOURCE_MASK           0x371fu        /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
++#define RCG_GPLL0_DIV_X2(twice)   (6u << 8 | ((twice) - 1u))    /* source 6: the 300 MHz tap */
++
++#define GPU_DT_CHIPID             0x06020000u    /* a620 */
++
++/* Qualcomm SCM PAS: ARM_SMCCC_CALL_VAL(FAST, SMC64, SIP, svc 2 cmd 7) */
++#define QCOM_SCM_PAS_IS_SUPPORTED_FNID  0xC2000207ull
++#define QCOM_GPU_PAS_ID                 13u
++
++/* gmu@3d6a000 (0x30000). Registers are dword indices; the byte offset in this window is
++ * (index << 2) - 0x6a000, as on the A618/A640 (whose windows also start at +0x6a000). */
++#define A6XX_GMU_PA               0x03d6a000u
++#define A6XX_GMU_SIZE             0x30000u
++#define GMU_BOFF(idx)             ((uint32_t)(((idx) << 2) - 0x6a000u))
++#define GMU_CM3_SYSRESET          0x1F800u
++#define GMU_CX_GMU_WFI_CONFIG     0x1F802u
++#define GMU_CM3_FW_INIT_RESULT    0x1F81Cu
++#define GMU_HFI_CTRL_STATUS       0x1F980u
++#define GMU_GENERAL_0             0x1F9C5u
++
++static vm_offset_t gpu_gcc, gpu_gpucc, gpu_gmu;
++static bool gpu_started;
++static int gpu_level;
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/* Wait (up to ms) for (rd & mask) == want; true if it got there. */
++static bool
++gpu_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10u; i++) {
++		if ((gpu_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	return (gpu_rd(base, off) & mask) == want;
++}
++
++/* A clock on, and seen running where its status bit can be believed (`must`). */
++static bool
++gpu_clock_on(vm_offset_t base, const char *name, uint32_t cbcr, bool must)
++{
++	gpu_wr(base, cbcr, gpu_rd(base, cbcr) | CBCR_ENABLE);
++	if (gpu_wait(base, cbcr, CBCR_OFF, 0, 10)) {
++		return true;
++	}
++	printf("SWEET GPU: clock %s stays off (%#x)%s\n", name, gpu_rd(base, cbcr),
++	    must ? "" : "; its status bit is not one to rely on, going on");
++	return !must;
++}
++
++/* One SMC64 to the resident TZ (the same conduit as PSCI CPU_ON, patch 0065). */
++static void
++gpu_smc(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t out[4])
++{
++	register uint64_t x0 __asm__("x0") = a0;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	register uint64_t x4 __asm__("x4") = a4;
++	register uint64_t x5 __asm__("x5") = a5;
++	register uint64_t x6 __asm__("x6") = a6;
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++            : "r"(x4), "r"(x5), "r"(x6)
++            : "memory", "x7", "x8", "x9", "x10", "x11", "x12",
++              "x13", "x14", "x15", "x16", "x17");
++	out[0] = x0;
++	out[1] = x1;
++	out[2] = x2;
++	out[3] = x3;
++}
++
++static void
++gpu_tz_probe(void)
++{
++	uint64_t r[4] = {0, 0, 0, 0};
++	gpu_smc(QCOM_SCM_PAS_IS_SUPPORTED_FNID, 1u, QCOM_GPU_PAS_ID, 0, 0, 0, 0, r);
++	printf("SWEET GPU: PAS_IS_SUPPORTED(13) -> x0=%#llx x1=%#llx (%s)\n", r[0], r[1],
++	    r[0] == 0 && r[1] == 1 ? "the zap shader can be loaded" :
++	    r[0] == 0xffffffffull ? "no SIP PAS service" : "check the call");
++}
++
++static bool
++gpu_cx_is_on(void)
++{
++	return ((gpu_rd(gpu_gpucc, GPUCC_CX_GDSCR) | gpu_rd(gpu_gpucc, GPUCC_CX_HW_CTRL)) & GDSC_PWR_ON) != 0;
++}
++
++/*
++ * Stage 4: the CX half on, then the GMU's clocks. The switch hangs on cx.lvl, up as long as
++ * the SoC runs; clearing the collapse bit is all it takes (vendor gdsc-regulator.c, Linux
++ * gdsc.c). A 3D core that already has power was left so by an earlier kernel and is not to
++ * be touched (HackiOS raphael: switching it off from here hung the phone once).
++ */
++static bool
++gpu_gmu_step1(void)
++{
++	uint32_t gdscr = gpu_rd(gpu_gpucc, GPUCC_CX_GDSCR), src;
++
++	if (!gpu_cx_is_on()) {
++		if (gdscr & GDSC_HW_CONTROL) {
++			printf("SWEET GPU: CX switch under hardware control (%#x): not ours\n", gdscr);
++			return false;
++		}
++		gpu_wr(gpu_gpucc, GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++		for (unsigned i = 0; i < 500u && !gpu_cx_is_on(); i++) {
++			delay_for_interval(100, NSEC_PER_USEC);
++		}
++	}
++	printf("SWEET GPU: CX: gdscr %#x hw_ctrl %#x -> %s\n", gpu_rd(gpu_gpucc, GPUCC_CX_GDSCR),
++	    gpu_rd(gpu_gpucc, GPUCC_CX_HW_CTRL), gpu_cx_is_on() ? "on" : "OFF");
++	if (!gpu_cx_is_on()) {
++		return false;
++	}
++	if (gpu_rd(gpu_gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		printf("SWEET GPU: the 3D core has power already (gx_gdscr %#x): left on by an earlier kernel, not touched\n",
++		    gpu_rd(gpu_gpucc, GPUCC_GX_GDSCR));
++		return false;
++	}
++
++	/* GCC: the 300 MHz tap for the GPU, the GPU's bus and memory clocks */
++	gpu_wr(gpu_gcc, GCC_GPU_PLL_VOTE, gpu_rd(gpu_gcc, GCC_GPU_PLL_VOTE) | GCC_GPU_PLL_VOTE_DIV);
++	if (!gpu_clock_on(gpu_gcc, "gcc_gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CLK, false) ||
++	    !gpu_clock_on(gpu_gcc, "gcc_gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_CLK, true) ||
++	    !gpu_clock_on(gpu_gcc, "gcc_ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CLK, false)) {
++		return false;
++	}
++
++	/* gpu_cc_gmu_clk_src: 300 MHz / 1.5 = 200 MHz (ftbl_gpu_cc_gmu_clk_src) */
++	src = gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR + 4u);
++	if ((src & RCG_SOURCE_MASK) != RCG_GPLL0_DIV_X2(3u)) {
++		gpu_wr(gpu_gpucc, GPUCC_GMU_RCGR + 4u, (src & ~RCG_SOURCE_MASK) | RCG_GPLL0_DIV_X2(3u));
++		gpu_wr(gpu_gpucc, GPUCC_GMU_RCGR, gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR) | RCG_UPDATE);
++		if (!gpu_wait(gpu_gpucc, GPUCC_GMU_RCGR, RCG_UPDATE, 0, 10)) {
++			printf("SWEET GPU: gmu_clk_src does not take its new source (cmd %#x)\n",
++			    gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR));
++			return false;
++		}
++	}
++	printf("SWEET GPU: gmu_clk_src cfg %#x (was %#x; want %#x = 200 MHz)\n",
++	    gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR + 4u), src, RCG_GPLL0_DIV_X2(3u));
++
++	/* the GMU's clocks (gpu_cc_ahb's status bit read 0 before and after on raphael: not trusted) */
++	if (!gpu_clock_on(gpu_gpucc, "gpu_cc_cxo", GPUCC_CXO_CLK, true) ||
++	    !gpu_clock_on(gpu_gpucc, "gpu_cc_ahb", GPUCC_AHB_CLK, false) ||
++	    !gpu_clock_on(gpu_gpucc, "gpu_cc_cx_gmu", GPUCC_CX_GMU_CLK, true)) {
++		return false;
++	}
++	printf("SWEET GPU: GMU clocks: cx_gmu=%#x cxo=%#x ahb=%#x; gcc memnoc=%#x snoc=%#x axi=%#x vote=%#x\n",
++	    gpu_rd(gpu_gpucc, GPUCC_CX_GMU_CLK), gpu_rd(gpu_gpucc, GPUCC_CXO_CLK), gpu_rd(gpu_gpucc, GPUCC_AHB_CLK),
++	    gpu_rd(gpu_gcc, GCC_GPU_MEMNOC_GFX_CLK), gpu_rd(gpu_gcc, GCC_GPU_SNOC_DVM_CLK),
++	    gpu_rd(gpu_gcc, GCC_DDRSS_GPU_AXI_CLK), gpu_rd(gpu_gcc, GCC_GPU_PLL_VOTE));
++	return true;
++}
++
++/* Stage 5: the GMU's registers, read: CM3 held in reset, FW_INIT_RESULT not yet 0xBABEFACE. */
++static void
++gpu_gmu_step2(void)
++{
++	gpu_gmu = gpu_map(A6XX_GMU_PA, A6XX_GMU_SIZE);
++	if (!gpu_gmu) {
++		printf("SWEET GPU: GMU window map failed\n");
++		return;
++	}
++	printf("SWEET GPU: GMU window reachable: cm3_sysreset=%#x fw_init=%#x hfi_ctrl=%#x general0=%#x wfi_cfg=%#x\n",
++	    gpu_rd(gpu_gmu, GMU_BOFF(GMU_CM3_SYSRESET)), gpu_rd(gpu_gmu, GMU_BOFF(GMU_CM3_FW_INIT_RESULT)),
++	    gpu_rd(gpu_gmu, GMU_BOFF(GMU_HFI_CTRL_STATUS)), gpu_rd(gpu_gmu, GMU_BOFF(GMU_GENERAL_0)),
++	    gpu_rd(gpu_gmu, GMU_BOFF(GMU_CX_GMU_WFI_CONFIG)));
++}
++
++static void
++gpu_probe(void)
++{
++	gpu_gcc = gpu_map(GPU_GCC_PA, GPU_GCC_SIZE);
++	if (!gpu_gcc) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	printf("SWEET GPU: GCC gpu clk status (pre): ahb=%#x memnoc=%#x snoc=%#x axi=%#x vote=%#x\n",
++	    gpu_rd(gpu_gcc, GCC_GPU_CFG_AHB_CLK), gpu_rd(gpu_gcc, GCC_GPU_MEMNOC_GFX_CLK),
++	    gpu_rd(gpu_gcc, GCC_GPU_SNOC_DVM_CLK), gpu_rd(gpu_gcc, GCC_DDRSS_GPU_AXI_CLK),
++	    gpu_rd(gpu_gcc, GCC_GPU_PLL_VOTE));
++	/* the clock of the GPU clock controller's registers, before its first read */
++	if (!gpu_clock_on(gpu_gcc, "gcc_gpu_cfg_ahb", GCC_GPU_CFG_AHB_CLK, true)) {
++		printf("SWEET GPU: the GPU clock controller would not answer: stop\n");
++		return;
++	}
++	gpu_gpucc = gpu_map(GPU_GPUCC_PA, GPU_GPUCC_SIZE);
++	if (!gpu_gpucc) {
++		printf("SWEET GPU: GPUCC map failed\n");
++		return;
++	}
++	printf("SWEET GPU: avicii a620 (dt chipid %#x): gpucc[0]=%#x gx_gdsc=%#x cx_gdsc=%#x cx_hw_ctrl=%#x "
++	    "gmu_rcg=%#x/%#x cx_gmu=%#x cxo=%#x ahb=%#x\n", GPU_DT_CHIPID, gpu_rd(gpu_gpucc, 0),
++	    gpu_rd(gpu_gpucc, GPUCC_GX_GDSCR), gpu_rd(gpu_gpucc, GPUCC_CX_GDSCR), gpu_rd(gpu_gpucc, GPUCC_CX_HW_CTRL),
++	    gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR), gpu_rd(gpu_gpucc, GPUCC_GMU_RCGR + 4u),
++	    gpu_rd(gpu_gpucc, GPUCC_CX_GMU_CLK), gpu_rd(gpu_gpucc, GPUCC_CXO_CLK), gpu_rd(gpu_gpucc, GPUCC_AHB_CLK));
++
++	if (gpu_level >= 2) {
++		gpu_tz_probe();
++	}
++	if (gpu_level >= 4 && !gpu_gmu_step1()) {
++		return;
++	}
++	if (gpu_level >= 5) {
++		gpu_gmu_step2();
++	}
++}
++
++static void
++gpu_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	gpu_probe();
++	printf("SWEET GPU: bring-up (sweetgpu=%d) over\n", gpu_level);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++
++	if (gpu_started) {
++		return;
++	}
++	gpu_started = true;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET GPU: disabled (sweetgpu=1..5 for the bring-up stages)\n");
++		return;
++	}
++	gpu_level = enabled;
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -814,6 +815,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();         /* nothing unless boot-arg sweetgpu (bsd/dev/sweet_gpu.c) */
+ 	return 0;
+ }
+ 
