@@ -1,0 +1,31 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>  /* PE_parse_boot_argn (0131) */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -307,6 +308,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * 0131: the GPU (freedreno a6xx linear layout) needs rows on 64 bytes; the window server
++	 * asks for 16 ('w30r' 1125 px: 4512, glyph masks: 224). Like Apple's driver, round the
++	 * pitch of single-plane surfaces up to what the GPU can address; the caller reads it back
++	 * (IOSurfaceGetBytesPerRow) and the allocation grows with it. sweetsurf_pitch64=0: off.
++	 */
++	static int pitch64 = -1;
++	if (pitch64 < 0) {
++		pitch64 = 1;
++		PE_parse_boot_argn("sweetsurf_pitch64", &pitch64, sizeof(pitch64));
++	}
++	if (pitch64 && props->getObject("IOSurfacePlaneInfo") == NULL) {
++		s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_ROW_ALIGN - 1);
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));

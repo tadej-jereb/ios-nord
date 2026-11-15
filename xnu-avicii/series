@@ -126,3 +126,4 @@ apply 0127-avicii-gpu-bo-map-cacheable.patch
 apply 0128-avicii-rpmh-ddr-llcc-bcm-votes.patch
 apply 0129-avicii-gpu-gles-bundle-and-bind-accel.patch
 apply 0130-avicii-fb-swapwait-until-shown.patch
+apply 0131-avicii-surface-pitch-64.patch
