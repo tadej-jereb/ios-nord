@@ -1077,6 +1077,31 @@ if [ "$DO_TBD" = yes ]; then
 	say "$(find "$OUT" -name '*.tbd' -type f | wc -l) tbd files, $(find "$OUT" -name '*.tbd' | wc -l) names incl. symlinks"
 fi
 
+# ---- 3b. libc++ headers and the fixups the Mesa build needed -----------------
+# libc++ 18 headers from the repo's LLVM (Apache-2.0 WITH LLVM-exception) with the __config_site
+# libc++ __config hard-includes (lane-1d RECIPE §2/§6: HARDENING_MODE_NONE matches the shipped
+# libc++ 1500.65.0; the PSTL backend must be named). Then tooling/gpu/sysroot-fixups.sh: setjmp.h,
+# mach-o/dyld.h, mach/mach_vm.h, netinet, net_kev.h, host_statistics64, and the libSystem /
+# libc++ stub repairs (skipped without .tbd files). C++ users still need
+# -nostdinc++ -isystem <sysroot>/usr/include/c++/v1 -D_USE_EXTENDED_LOCALES_.
+step "libc++ headers and Mesa-build fixups"
+HERE=$(cd "$(dirname "$0")" && pwd)
+LLVMCXX=$HERE/../opt/llvm/include/c++/v1
+[ -d "$LLVMCXX" ] || die "no libc++ headers at $LLVMCXX"
+mkdir -p "$OUT/usr/include/c++/v1"
+cp -a "$LLVMCXX/." "$OUT/usr/include/c++/v1/"
+cat >"$OUT/usr/include/c++/v1/__config_site" <<'CSEOF'
+/* __config_site -- ios-nord cross sysroot (mksysroot.sh). */
+#ifndef _LIBCPP___CONFIG_SITE
+#define _LIBCPP___CONFIG_SITE
+#define _LIBCPP_ABI_VERSION 1
+#define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_HARDENING_MODE _LIBCPP_HARDENING_MODE_NONE
+#define _LIBCPP_PSTL_CPU_BACKEND_SERIAL 1
+#endif
+CSEOF
+"$HERE/sysroot-fixups.sh" "$OUT" "$SRC" || die "sysroot-fixups.sh failed"
+
 # ---- 4. MANIFEST.sha256 : every input, then every output ----------------------
 step "write MANIFEST.sha256"
 M=$OUT/MANIFEST.sha256

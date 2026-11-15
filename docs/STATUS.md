@@ -1,3 +1,52 @@
+# Status — 2026-11-15 (night), iOS UI composited on the GPU, booting from `boot_a`
+
+The Nord now boots iOS 16.7.16 **from flash** (`boot_a`, slot `a` active; LineageOS still on `boot_b`)
+and backboardd composites the UI on the **Adreno 620** through Mesa: **38–48 fps while scrolling**
+(CPU renderer: ~24), GPU time 3–5 ms per frame, no flicker. USB networking (SSH) is present on
+`fastboot boot` but did not come up on the first flash boot (open, below). Hashes and undo steps:
+`docs/IMAGE_PROVENANCE.md` ("boot_a flash — 2026-11-15" and the SweetGLES bundle blocks).
+
+Rebuild the flashed image: `tooling/71-phone-image.sh --preset usb --kernel avicii/shim/out/kernel-0131
+--extra "sweetgpu=11 sweetgles=1"` → `build/phone/ufsroot.usb-kernel-0131-gpu11-gles.img`.
+
+How it got here (2026-11-15), each step a wall a log named:
+
+- **GPU kernel, layers 1–5** (`0119`, `0122`–`0127`, `sweetgpu=1..11`): probe, GMU firmware + HFI,
+  command processor + zap (1 MiB-aligned memory for PAS), shader tests, then `/dev/dri/renderD128`
+  + `/dev/kgsl-3d0`. Cacheable buffer maps with kernel cache maintenance (`0127`; the write-combined
+  map froze the phone). `tooling/gpu/drmtest`: 161 µs per submit+wait from userland.
+- **Mesa for iOS without an SDK:** sysroot from our own dyld cache `.tbd` stubs + APSL headers
+  (`tooling/gpu/mksysroot.sh`, which now also stages libc++ headers and runs
+  `tooling/gpu/sysroot-fixups.sh`); Mesa 25.0.7 + `tooling/gpu/mesa-patches/0001–0008`
+  (`tooling/gpu/mesa-build.sh`). `osmesatest`: `GL_RENDERER FD620`, 2.0 ms/frame vs softpipe 5.5.
+- **EAGL shim** (`tooling/gpu/sweeteagl`): replaces `EAGLContext`'s methods (incl.
+  `+setCurrentContext:`, whose TLS key only Apple's init creates) and fills the 402-slot GL table
+  QuartzCore calls; OpenGL ES 3.2 context from OSMesa (Mesa `0007`).
+- **Into backboardd without DYLD_*:** `0129` (`sweetgles=1`) publishes `IOGLESBundleName =
+  SweetGLES`; libGFXShared dlopens `/System/Library/Extensions/SweetGLES.bundle`
+  (`tooling/gpu/sweetgles`), which pins SweetEAGL and fails `gldGetVersion` on purpose, so
+  QuartzCore's API-2 retry gets our context.
+- **Black screen → picture:** the render target was `'b3a8'` (CIF10). `CADeviceUseCIF10` =
+  MobileGestalt `Aixt/MEN2O2B7f+8m4TxUA` unless the pref **`CAEnableDeepFramebuffer = false`**
+  (set in `/var/mobile/Library/Preferences/com.apple.backboardd.plist`).
+- **Stale text/textures:** IOSurface seeds never change on CPU writes here → import every format
+  zero-copy (Mesa `0008`: BGRA, A8, L8, LA88, RGBA16F, w30r) and 64-byte pitches (`0131`).
+- **Flicker:** QuartzCore ends each frame with `glFlush` only and our panel copy has no GPU fence
+  → `glFlush` waits for the GPU in the shim. `0130` makes `SwapWait` wait for the panel copy.
+- **DDR:** the boot loader's RPMh vote on DRV2 keeps DDR fast (3850 MiB/s); releasing it gives
+  370 MiB/s. Our own vote (`0128`, IB only) is ~15 % slower — keep `sweetddr` off.
+
+Open, in rough order:
+
+- **USB/SSH on a flash boot:** no USB device enumerates after booting from `boot_a` (on
+  `fastboot boot` the boot loader has already brought USB up). Replug test pending.
+- **60 fps:** remaining ~20 ms/frame is QuartzCore CPU work plus the 11 MB CPU panel copy;
+  next is zero-copy scanout (raphael `0120`-style MDP-SMMU), then a fence instead of `glFinish`.
+- Leftover rejected surfaces: small `'b3a8'` (icons), A8 masks from a path `0131` does not cover.
+- GL for apps (`CAEAGLLayer`: `renderbufferStorage:fromDrawable:`, `presentRenderbuffer:`).
+- Power: GPU/display off path; never release the boot loader's DDR vote.
+- `master` (local) now holds all GPU work, not pushed; kernel CI builds from `kern-0131`.
+
 # Status — 2026-11-14 (evening), iOS 16.7 runs on the OnePlus Nord: GUI, keys and touch
 
 The phone boots the real iOS 16.7.16 (20H392) root from `userdata` and shows the iOS GUI on its

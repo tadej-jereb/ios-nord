@@ -1,5 +1,6 @@
 #!/bin/bash
-# sysroot-fixups.sh — gaps found by the Mesa build, applied on top of mksysroot.sh output.
+# sysroot-fixups.sh — gaps found by the Mesa build. mksysroot.sh runs it as its last step;
+# it can also be run alone on an existing sysroot.
 #   tooling/gpu/sysroot-fixups.sh SYSROOT OSS_SRC_DIR
 # OSS_SRC_DIR holds the unpacked apple-oss-distributions tarballs mksysroot.sh pins
 # (libplatform-375.120.2, dyld-1042.1). Idempotent. Nothing here is Apple binary code:
@@ -10,7 +11,7 @@ inc=$sr/usr/include
 
 # 1. libSystem.B.tbd: gen_tbd.py drops 20 plain libc names (_strlen, _memcmp, ...) and keeps
 #    their __platform_ twins, so no C++ dylib links. Add the partner of every __platform_ name.
-python3 -I - "$sr/usr/lib/libSystem.B.tbd" <<'EOF'
+[ -f "$sr/usr/lib/libSystem.B.tbd" ] && python3 -I - "$sr/usr/lib/libSystem.B.tbd" <<'EOF'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 m = re.search(r'symbols: \[(.*?)\]', s, re.S)
@@ -74,7 +75,7 @@ install -m 644 "$oss"/xnu-xnu-8796.141.3/bsd/net/net_kev.h "$inc/net/"
 
 # 8. libc++.1.dylib re-exports libc++abi.dylib (operator new, __cxa_*); the generated stub lost
 #    that, so a plain clang++ -shared link (implicit -lc++) left them undefined.
-grep -q reexported-libraries "$sr/usr/lib/libc++.1.tbd" ||
+[ ! -f "$sr/usr/lib/libc++.1.tbd" ] || grep -q reexported-libraries "$sr/usr/lib/libc++.1.tbd" ||
 	sed -i "s|^exports:|reexported-libraries:\n  - targets:         [ arm64-ios ]\n    libraries:       [ '/usr/lib/libc++abi.dylib' ]\n&|" "$sr/usr/lib/libc++.1.tbd"
 
 echo "sysroot fixups applied to $sr"
