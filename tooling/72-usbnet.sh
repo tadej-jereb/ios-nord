@@ -15,6 +15,9 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 mac=02:00:5e:77:ee:01
 log=${1:-$repo/logs/phone/live-$(date -u +%Y%m%d-%H%M%S).txt}
 mkdir -p "$(dirname "$log")"
+# Ask for the sudo password now, while there is a terminal: by the time the
+# phone's interface shows up the script may be running unattended.
+sudo -v
 echo "waiting for the phone's USB Ethernet ($mac)..." >&2
 until ip -o link | grep -qi "$mac"; do sleep 1; done
 ifname=$(ip -o link | grep -i "$mac" | awk -F': ' '{print $2}' | cut -d@ -f1)
