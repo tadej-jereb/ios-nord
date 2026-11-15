@@ -43,7 +43,7 @@ COMMON="debug=0xc cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=uf
 declare -A PRESET=(
 	[gui]="$COMMON sweetfb_hz=30 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweetkeys=1"
 	[touch]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweettouchdelay=45 sweettouchrails=2 sweettouch1v8=1 sweettouchdebug=1 sweetkeys=1"
-	[usb]="$COMMON sweetfb_hz=30 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweetkeys=1 sweetusb=2"
+	[usb]="$COMMON sweetfb_hz=60 sweetecon=1 sweetfb_noconsole=1 sweettouch=1 sweetkeys=1 sweetusb=2"
 	[console]="$COMMON sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=1 launchd_log_serial=1 sweetexeclog=1 -v"
 	[noinput]="$COMMON sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweettouch=0 sweetkeys=0"
 )
@@ -66,7 +66,10 @@ if [ -z "$kernel" ]; then
 	kernel=$(ls -td avicii/shim/out/kernel-*/kernel.development.sweet 2>/dev/null | head -1)
 	[ -n "$kernel" ] || { echo "error: no avicii/shim/out/kernel-*/ kernel; pass --kernel" >&2; exit 2; }
 fi
-[ -d "$kernel" ] && kernel=$kernel/kernel.development.sweet
+if [ -d "$kernel" ]; then
+	# DEVELOPMENT build, else a RELEASE one (kernel.sweet)
+	if [ -f "$kernel/kernel.development.sweet" ]; then kernel=$kernel/kernel.development.sweet; else kernel=$kernel/kernel.sweet; fi
+fi
 [ -f "$kernel" ] || { echo "error: no kernel at $kernel" >&2; exit 2; }
 for f in "$ADT" "$SHIM"; do
 	[ -f "$f" ] || { echo "error: missing $f" >&2; exit 2; }

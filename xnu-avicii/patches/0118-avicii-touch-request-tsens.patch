@@ -1,0 +1,112 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -223,6 +223,54 @@ loop_mhz(void)
+ 
+ #define REPORT_LEN 4096
+ 
++/*
++ * SoC temperatures: iOS has no thermal driver here and 0115/0116 run every
++ * domain at its top level, so the report shows them. lito tsens0/tsens1
++ * ("qcom,tsens26xx", lito.dtsi:1599-1625) have their TM blocks at 0xc263000 and
++ * 0xc265000. Per LineageOS android_kernel_oneplus_sm7250 lineage-20
++ * drivers/thermal/tsens.h:24 and tsens2xxx.c:29-55,73-83,296-302: sensor n's
++ * status is TM + 0xa0 + 4n, [11:0] signed temperature in 0.1 C, bit 21 valid.
++ * Read-only; LMh and the PMIC still clamp in hardware.
++ */
++#define TSENS_N         2
++#define TSENS_SENSORS   16u
++static const uint64_t tsens_tm_pa[TSENS_N] = { 0x0c263000ull, 0x0c265000ull };
++static vm_offset_t tsens_tm[TSENS_N];
++
++static size_t
++sweet_tsens_report(char *buf, size_t len)
++{
++	size_t o = 0;
++	int hottest = -1000;
++
++	o += scnprintf(buf + o, len - o, "temp C (0.1):");
++	for (unsigned c = 0; c < TSENS_N; c++) {
++		if (!tsens_tm[c]) {
++			tsens_tm[c] = ml_io_map(tsens_tm_pa[c], 0x1000);
++		}
++		if (!tsens_tm[c]) {
++			continue;
++		}
++		o += scnprintf(buf + o, len - o, " |%u", c);
++		for (unsigned n = 0; n < TSENS_SENSORS; n++) {
++			uint32_t v = osm_rd(tsens_tm[c], 0xa0u + 4u * n);
++			if (!(v & (1u << 21))) {
++				continue;
++			}
++			int t = (int)(v & 0xfffu);
++			if (t & 0x800) {
++				t -= 0x1000;
++			}
++			if (t > hottest) {
++				hottest = t;
++			}
++			o += scnprintf(buf + o, len - o, " %u:%d", n, t);
++		}
++	}
++	o += scnprintf(buf + o, len - o, "\nhottest %d.%d C\n", hottest / 10, hottest % 10 < 0 ? -(hottest % 10) : hottest % 10);
++	return o;
++}
++
+ static int
+ sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
+ {
+@@ -264,6 +312,7 @@ sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
+ 		}
+ 		o += scnprintf(buf + o, REPORT_LEN - o, "\n");
+ 	}
++	o += sweet_tsens_report(buf + o, REPORT_LEN - o);
+ 	o += scnprintf(buf + o, REPORT_LEN - o, "loop MHz per cpu:");
+ 	for (int cpu = 0; cpu <= ml_get_max_cpu_number(); cpu++) {
+ 		unsigned mhz = 0;
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -92,6 +92,7 @@ static unsigned touch_flip;
+  */
+ #define GOODIX_PID_REG   0x452cu
+ #define GOODIX_EVENT_REG 0x4100u
++#define GOODIX_RQST_REG  0x6f6du
+ #define GOODIX_HEAD_LEN  2u
+ #define GOODIX_POINT_LEN 8u
+ 
+@@ -986,10 +987,33 @@ touch_goodix(void)
+ 	if (err) {
+ 		return err;
+ 	}
+-	if (!(buf[0] & 0x80u)) {
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP; /* config request: not serviced */
++	if (buf[0] & 0x40u) {
++		/*
++		 * Firmware request (GOODIX_REQUEST_EVENT), checked before the touch bit
++		 * as the vendor's goodix_get_touch_points does (goodix_drivers_gt9886.c
++		 * :2194-2196). Left unanswered it stays pending and every poll fails
++		 * (2026-11-15: ~18 "report err=45" lines a second in the live log).
++		 * goodix_request_event_handler (:753-803): read the request type at
++		 * GTP_REG_RQST 0x6F6D (:930), service it, write GTP_RQST_RESPONDED 0x00
++		 * there, then goodix_clear_irq (0 to 0x4100; goodix_fw_handle
++		 * :2764-2770). Codes (goodix_drivers_gt9886.h:63-68): 1 config,
++		 * 2 baseline, 3 reset, 4 frequency, 0xff idle. Config and reset are
++		 * not serviced here (no config blob; a reset would drop the session),
++		 * only logged; the rest the vendor driver also only logs.
++		 */
++		static unsigned requests;
++		uint8_t rq = 0xee;
++		const uint8_t done[3] = {GOODIX_RQST_REG >> 8, GOODIX_RQST_REG & 0xffu, 0};
++		int rerr = touch_read(TOUCH_ADDR, GOODIX_RQST_REG, true, &rq, 1);
++		int werr = touch_msg(TOUCH_ADDR, done, sizeof(done), NULL, 0, false);
++		int aerr = touch_goodix_ack();
++		if (requests++ < 8 || (requests % 1000u) == 0) {
++			printf("SWEET TOUCH: request #%u type %#x (read %d, responded %d, ack %d)\n",
++			    requests, rq, rerr, werr, aerr);
+ 		}
++		return 0;
++	}
++	if (!(buf[0] & 0x80u)) {
+ 		if (buf[0]) {
+ 			(void)touch_goodix_ack(); /* status-only frame */
+ 		}

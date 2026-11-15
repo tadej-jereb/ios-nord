@@ -113,3 +113,4 @@ apply 0114-avicii-fb-swap-rate.patch
 apply 0115-avicii-cpufreq-max.patch
 apply 0116-avicii-cpu-placement-l3.patch
 apply 0117-avicii-cpufamily-bootarg.patch
+apply 0118-avicii-touch-request-tsens.patch
