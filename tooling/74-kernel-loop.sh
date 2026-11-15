@@ -38,7 +38,9 @@ done
 [ "$preset" = usb ] || echo "note: preset $preset has no USB Ethernet; stopping after the boot" >&2
 nm_profile=0
 nmcli -t -f NAME con show 2>/dev/null | grep -qx ios-nord && nm_profile=1
-[ "$nm_profile" = 1 ] || sudo -v
+# No terminal (run from an agent or cron): no sudo prompt; the address step
+# below then needs the NetworkManager profile or a host address set by hand.
+[ "$nm_profile" = 1 ] || [ ! -t 0 ] || sudo -v
 t0=$(date +%s)
 say() { printf '[%4ss] %s\n' $(( $(date +%s) - t0 )) "$*"; }
 
@@ -53,7 +55,7 @@ fi
 (cd "$dir" && sha256sum -c --quiet SHA256SUMS)
 say "kernel-$name verified"
 
-./tooling/71-phone-image.sh --preset "$preset" --kernel "$dir" --name "$preset-kernel-$name" ${extra:+--extra "$extra"} --boot | tail -4
+./tooling/71-phone-image.sh --preset "$preset" --kernel "$dir" --name "$preset-kernel-$name" ${extra:+--extra "$extra"} --boot | tail -4 || true   # 71 may lose the phone after a good boot
 [ "$preset" = usb ] || exit 0
 
 say "waiting for the phone's USB Ethernet"
