@@ -1,0 +1,33 @@
+# Main-agent undo transcript (NOT RUN)
+
+1. Host: inspect the installation and record its hashes before removal.
+
+```bash
+cd /home/tadej/ios-nord
+set -euo pipefail
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 ls -l /System/Library/Extensions/SweetGLES.bundle
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 shasum -a 256 /System/Library/Extensions/SweetGLES.bundle/SweetGLES /System/Library/Extensions/SweetGLES.bundle/SweetEAGL.dylib /System/Library/Extensions/SweetGLES.bundle/libOSMesa.8.dylib /System/Library/Extensions/SweetGLES.bundle/Info.plist
+```
+
+2. Gate: confirm these hashes and the undo context are recorded in
+   docs/IMAGE_PROVENANCE.md, then remove only the bundle.
+
+```bash
+read -r -p 'Type remove-SweetGLES after recording provenance: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = remove-SweetGLES
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 rm -rf /System/Library/Extensions/SweetGLES.bundle
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 test ! -e /System/Library/Extensions/SweetGLES.bundle
+```
+
+3. Restart a previously affected process only after removal, if needed.
+   Pinning/installed IMPs persist within the old process until it exits.
+
+```bash
+read -r -p 'Type restart-backboardd after removing the bundle: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = restart-backboardd
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 killall backboardd
+```
+
+Alternative: or boot without `sweetgles=1`, using the main agent’s existing boot
+workflow. This transcript does not supply or execute a boot/flash/remount command.
+Leave sweetgles.log, sweeteagl.log, the staging test, and provenance for diagnosis.

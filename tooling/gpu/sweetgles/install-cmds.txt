@@ -1,0 +1,176 @@
+# Main-agent install transcript (NOT RUN)
+
+1. Host: use one Bash session and stop on any failure.
+
+NOT RUN. Requires the main agent’s existing sweetgles=1 boot and SSH link. Inspect mount output: root must already be writable. No mount -uw command exists in pre-existing tracked tooling/docs; STOP if read-only. Reference: docs/gpu-research/G-gl-deploy.md:338–357. Existing bundle causes a stop so an unknown installation is not overwritten.
+
+```bash
+cd /home/tadej/ios-nord
+set -euo pipefail
+cat build/phone/SweetGLES.bundle.sha256
+sha256sum build/phone/sweetgles/bundletest
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 mount
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 df -k / /private/var
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 ls -ld /System/Library/Extensions
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 test -w /System/Library/Extensions
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 test ! -e /System/Library/Extensions/SweetGLES.bundle
+```
+
+2. Record provenance before phone writes.
+
+Add the experiment context to docs/IMAGE_PROVENANCE.md as the main agent before continuing; this command appends the exact four reviewed hashes.
+
+```bash
+read -r -p 'Type record-hashes to record provenance before phone writes.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = record-hashes
+cat build/phone/SweetGLES.bundle.sha256 >> docs/IMAGE_PROVENANCE.md
+```
+
+3. Create the phone staging and log directories.
+
+```bash
+read -r -p 'Type create-stage to create the phone staging and log directories.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = create-stage
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 mkdir -p /private/var/root/gpu/sweetgles-stage
+```
+
+4. Stage the four files and manifest.
+
+```bash
+read -r -p 'Type copy-stage to stage the four files and manifest.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = copy-stage
+scp -i ~/.ssh/ios_nord_ed25519 build/phone/SweetGLES.bundle/SweetGLES build/phone/SweetGLES.bundle/SweetEAGL.dylib build/phone/SweetGLES.bundle/libOSMesa.8.dylib build/phone/SweetGLES.bundle/Info.plist build/phone/SweetGLES.bundle.sha256 root@192.168.7.2:/private/var/root/gpu/sweetgles-stage/
+```
+
+5. Stage bundletest under the requested eagltest name.
+
+This is the new Apple-path-only test, not tooling/gpu/sweeteagl/eagltest.c. It never preloads SweetEAGL.
+
+```bash
+read -r -p 'Type copy-test to stage bundletest under the requested eagltest name.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = copy-test
+scp -i ~/.ssh/ios_nord_ed25519 build/phone/sweetgles/bundletest root@192.168.7.2:/private/var/root/gpu/sweetgles-stage/eagltest
+```
+
+6. Make the throwaway test executable.
+
+```bash
+read -r -p 'Type chmod-test to make the throwaway test executable.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = chmod-test
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 chmod 0755 /private/var/root/gpu/sweetgles-stage/eagltest
+```
+
+7. Connect to a root phone shell for installation.
+
+The remaining blocks through stage-1 run inside that root shell, not on the host. Stop on any failed gate or command.
+
+```bash
+ssh -t -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2
+set -eu
+cd /System/Library/Extensions
+```
+
+8. Create the bundle directory.
+
+```bash
+printf '%s' 'Type create-bundle to create the bundle directory.: '
+read -r SWEETGLES_GATE
+test "$SWEETGLES_GATE" = create-bundle
+mkdir /System/Library/Extensions/SweetGLES.bundle
+```
+
+9. Copy the four bundle files.
+
+```bash
+printf '%s' 'Type install-bundle to copy the four bundle files.: '
+read -r SWEETGLES_GATE
+test "$SWEETGLES_GATE" = install-bundle
+cp /private/var/root/gpu/sweetgles-stage/SweetGLES /private/var/root/gpu/sweetgles-stage/SweetEAGL.dylib /private/var/root/gpu/sweetgles-stage/libOSMesa.8.dylib /private/var/root/gpu/sweetgles-stage/Info.plist /System/Library/Extensions/SweetGLES.bundle/
+```
+
+10. Set bundle ownership.
+
+```bash
+printf '%s' 'Type chown-bundle to set bundle ownership.: '
+read -r SWEETGLES_GATE
+test "$SWEETGLES_GATE" = chown-bundle
+chown -R root:wheel /System/Library/Extensions/SweetGLES.bundle
+```
+
+11. Set bundle directory mode.
+
+```bash
+printf '%s' 'Type chmod-directory to set bundle directory mode.: '
+read -r SWEETGLES_GATE
+test "$SWEETGLES_GATE" = chmod-directory
+chmod 0755 /System/Library/Extensions/SweetGLES.bundle
+```
+
+12. Set all four file modes.
+
+```bash
+printf '%s' 'Type chmod-files to set all four file modes.: '
+read -r SWEETGLES_GATE
+test "$SWEETGLES_GATE" = chmod-files
+chmod 0644 /System/Library/Extensions/SweetGLES.bundle/SweetGLES /System/Library/Extensions/SweetGLES.bundle/SweetEAGL.dylib /System/Library/Extensions/SweetGLES.bundle/libOSMesa.8.dylib /System/Library/Extensions/SweetGLES.bundle/Info.plist
+```
+
+13. Verify ownership, modes, and every installed SHA256.
+
+The current directory must still be /System/Library/Extensions so the unchanged host manifest resolves correctly. Require all four OK results, root:wheel ownership, directory 0755, and four files 0644.
+
+```bash
+ls -ld /System/Library/Extensions/SweetGLES.bundle
+ls -l /System/Library/Extensions/SweetGLES.bundle
+shasum -a 256 -c /private/var/root/gpu/sweetgles-stage/SweetGLES.bundle.sha256
+```
+
+14. Run stage 1 in a fresh throwaway process.
+
+Require exit 0 and every test PASS, including initial API-3 nil, API-2 retry reporting API 3, API-3 retry, NOLOAD residency, and red bytes 00 00 ff ff. Any crash, hang, unexpected initial success, or FAIL stops the procedure before backboardd. These predictions remain UNVERIFIED until this succeeds.
+
+```bash
+/private/var/root/gpu/sweetgles-stage/eagltest --via-bundle
+tail -n 50 /private/var/root/gpu/sweetgles.log
+tail -n 80 /private/var/root/gpu/sweeteagl.log
+exit
+```
+
+15. Host: start kernel observation in a second terminal.
+
+Leave this terminal running. This existing repo helper configures USB networking and captures UDP console output; it may prompt for sudo. Watch exec backboardd, crashes/panic, and repeated respawn messages.
+
+```bash
+cd /home/tadej/ios-nord
+tooling/72-usbnet.sh logs/phone/sweetgles-live.txt
+```
+
+16. Host: verify stage 1 again in the restart terminal.
+
+This enforces the stage-1 exit status in the same fail-fast shell used for the restart. Inspect the PASS lines before the following gate.
+
+```bash
+set -euo pipefail
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 /private/var/root/gpu/sweetgles-stage/eagltest --via-bundle
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 pgrep -x backboardd
+```
+
+17. Restart backboardd only after stage 1 passes.
+
+Proceed only after every PASS and exit 0. Record the old and new PID. QuartzCore retry is a phone experiment; see README.md for address-cited expectations.
+
+```bash
+read -r -p 'Type stage1-passed to restart backboardd only after stage 1 passes.: ' SWEETGLES_GATE
+test "$SWEETGLES_GATE" = stage1-passed
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 killall backboardd
+```
+
+18. Host: inspect the restarted process and logs.
+
+Allow launchd to restart it before reading the PID. In sweetgles.log require that PID’s constructor, self-pin success, install success, GLD initializer, deliberate version rejection. In sweeteagl.log look for installation and context creation; correlate failures or missing creation with the kernel capture. The wrapper caps logging at 50 lines per process. Do not infer working compositor output solely from a successful loader log.
+
+```bash
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 pgrep -x backboardd
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/root/gpu/sweetgles.log
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/root/gpu/sweeteagl.log
+```
