@@ -174,7 +174,6 @@ jobs:
           bash build.sh 2>&1 | tee ../build.log || {
             cfg_lc=$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')
             k=build/xnu.obj/${KERNEL_CONFIG}_ARM64_SWEET/kernel${cfg_lc:+.$cfg_lc}.sweet
-            [ "$KERNEL_CONFIG" = RELEASE ] && k=build/xnu.obj/RELEASE_ARM64_SWEET/kernel.sweet
             if [ -f "$k" ] && file "$k" | grep -q 'Mach-O'; then
               echo "::warning::build.sh exited nonzero but the kernel is linked (lldbmacros install abort); continuing"
             else

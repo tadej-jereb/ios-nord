@@ -67,8 +67,8 @@ if [ -z "$kernel" ]; then
 	[ -n "$kernel" ] || { echo "error: no avicii/shim/out/kernel-*/ kernel; pass --kernel" >&2; exit 2; }
 fi
 if [ -d "$kernel" ]; then
-	# DEVELOPMENT build, else a RELEASE one (kernel.sweet)
-	if [ -f "$kernel/kernel.development.sweet" ]; then kernel=$kernel/kernel.development.sweet; else kernel=$kernel/kernel.sweet; fi
+	# DEVELOPMENT build, else a RELEASE one (kernel.release.sweet)
+	if [ -f "$kernel/kernel.development.sweet" ]; then kernel=$kernel/kernel.development.sweet; else kernel=$kernel/kernel.release.sweet; fi
 fi
 [ -f "$kernel" ] || { echo "error: no kernel at $kernel" >&2; exit 2; }
 for f in "$ADT" "$SHIM"; do
