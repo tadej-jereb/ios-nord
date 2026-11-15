@@ -1,0 +1,67 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -221,6 +221,21 @@ AppleCLCD::start(IOService *provider)
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		/*
++		 * OpenGL ES (layer 6). libGFXShared reads these off this service and dlopens
++		 * /System/Library/Extensions/<IOGLESBundleName>.bundle/<IOGLESBundleName>;
++		 * a bundle that is missing or fails to load is skipped (docs/gpu-research/G §3c, §4).
++		 * Published empty (0107) EAGLContext finds no renderer and QuartzCore draws on the
++		 * CPU, which sweetgles=0 (the default) keeps.
++		 */
++		uint32_t gles = 0;
++		(void)PE_parse_boot_argn("sweetgles", &gles, sizeof(gles));
++		if (gles != 0) {
++			accel->setProperty("IOGLESBundleName", "SweetGLES");
++			accel->setProperty("IOGLESMetalBundleName", "AppleMetalGLRenderer");
++			accel->setProperty("IOGLESDefaultUseMetal", kOSBooleanFalse);
++			IOLog("SWEET FB: IOAcceleratorES names IOGLESBundleName SweetGLES (sweetgles=%u)\n", gles);
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+ 			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -46,6 +46,7 @@ enum {
+ 	/* Surfaces made of the caller's own memory (CoreAnimation's GL renderer). */
+ 	kSweetSurfaceWrapClientImage    = 6,
+ 	kSweetSurfaceWrapClientMemory   = 7,
++	kSweetSurfaceBindAccel          = 12,   /* IOSurfaceClientBindAccel (gpu-research A §2) */
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -911,6 +912,32 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case kSweetSurfaceBindAccel: {
++		/*
++		 * Apple's GPU driver maps the surface into the GPU here. Ours does that when Mesa
++		 * imports the surface by ID (MSM_INFO_IOS_IMPORT, 0126), so binding is accepted and
++		 * only logged: the first 8 calls, with their arguments, to learn what callers pass.
++		 */
++		static uint32_t bindLogged;
++		if (bindLogged < 8) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			bindLogged++;
++			IOLog("SWEET SURF: %s bind-accel n=%u in=%u [%llx %llx %llx %llx] struct=%u\n", name,
++			    bindLogged, args->scalarInputCount, arg0,
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
++			    args->scalarInputCount > 3 ? args->scalarInput[3] : 0ULL,
++			    args->structureInputSize);
++		}
++		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++			args->scalarOutput[i] = 0;
++		}
++		if (args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++		}
++		return kIOReturnSuccess;
++	}
+ 	case kSweetSurfaceCreatePort: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		if (s == NULL || args->scalarOutputCount < 1) {
