@@ -118,3 +118,4 @@ apply 0119-avicii-gpu-a620-probe.patch
 apply 0120-avicii-gpu-log-peek-touch-order.patch
 apply 0121-avicii-usb-recover-bus-reset.patch
 apply 0122-avicii-gpu-a620-gmu-boot.patch
+apply 0123-avicii-gpu-a620-command-processor.patch

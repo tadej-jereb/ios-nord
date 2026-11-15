@@ -301,7 +301,7 @@ supply table), `lito-gdsc.dtsi`, `msm-arm-smmu-lito.dtsi`. Until `lito-pm.dtsi`
 is on disk, every `pm8150*_gpios` number above is quoted from the consumer side
 only and the GPIO *controller* base is `UNVERIFIED`.
 
-## GPU — Adreno 620 (layer 1, patch 0119)
+## GPU — Adreno 620 (layer 1, patch 0119; layer 2, patch 0122)
 
 Same inside layout as SM8150 (raphael-ios-gpu's A640), every block 0x1100000 higher.
 Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
@@ -319,3 +319,9 @@ Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
 | GCC GPU branches | cfg_ahb `0x71004`, memnoc_gfx `0x7100c`, snoc_dvm_gfx `0x71018`, ddrss_gpu_axi `0x71154`; gpll0 vote `0x52000` bit 15, div bit 16 | SM8150 votes at `0x52004` | `drivers/clk/qcom/gcc-lito.c:1125-1345` (sha256 `9ceaf56a…93ff`) |
 | Mesa support | `GPUId(620)`: A6xx gen1, 1 CCU, tile align 32×16 | Mesa 24.2.8 | `src/freedreno/common/freedreno_devices.py:507-531` |
 | GPU firmware (from LOS 21 `vendor`, `/firmware`) | `a620_zap.{mdt,b00,b01,b02,elf}`, `a650_gmu.bin` (41548 B), `a650_sqe.fw` (31632 B) | copies in `src/gpu-fw/` (not in git) with `SHA256SUMS`: sqe `b4c27420…0487`, gmu `df79fa84…b01c`, zap.mdt `fb7d0580…693f` | `src/lineage-21.0-20240619-nightly-avicii-signed.zip` → `payload.bin` → `vendor` (EROFS) |
+| RSCC (A650 family: own block) | `0x3de0000` size `0x1000`; sequencer program `0xeaaae5a0 0xe1a1ebab 0xa2e0a581 0xecac82e2 0x0020edad` | not GMU+0x23000 as on the A640 | live FDT `qcom,kgsl-3d0@3d00000` reg "rscc"; vendor `adreno_a6xx_gmu.c:71-113` (LineageOS `android_kernel_oneplus_sm8250` lineage-21) |
+| A620 GMU boot specifics | DTCM at GMU address `0x10004000`; firmware up = `FW_INIT_RESULT[8:0] == 0x100` (a650_gmu.bin core version `0x20010008` > `0x20010004`); `CX_FAL_INTF` (GMU word `0x1f8f0`) = 1; PDC programmed by the host (no `pdc_in_aop`), TCS3 cx vote 2 | | vendor `adreno-gpulist.h:1054-1080`, `adreno_a6xx_gmu.c:364-405,1041-1160`; a650_gmu.bin blocks parsed on the host |
+| a650_gmu.bin memory requests | `0x4000`+`0x8000`, `0x144000`+`0x13000`, `0x157000`+`0x9000`, `0x60000000`+`0x1000` (type 7); TCM: ITCM `0x0..0x4000`, DTCM `0x10004000..0x10008000` | | block headers of `src/gpu-fw/a650_gmu.bin` |
+| cmd-db | reserved-memory `0x80860000` size `0x20000`, `compatible = "qcom,cmd-db"`, magic `0x0c0330db` at +4 | below XNU's RAM (`0x180000000`) | live FDT `/reserved-memory/reserved-memory@80860000` |
+| GPU SMMU ACTLR | `0x32b` for every GFX context (`<0x0 0x3ff 0x32B>, <0x400 0x3ff 0x32B>`) | `qcom,skip-init`, 3-level tables | `msm-arm-smmu-lito.dtsi:4-49` |
+| GPU OPP RPMh levels (bin 0) | 275 MHz LOW_SVS (64), 400 SVS (128), 500 SVS_L1 (192), 625 NOM (256) | GMU's own: 200 MHz | `lito-gpu.dtsi:21-62,196-245` |
