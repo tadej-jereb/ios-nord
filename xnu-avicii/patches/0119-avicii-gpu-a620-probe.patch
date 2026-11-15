@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,338 @@
 +/*
 + * SWEET Adreno 620 (avicii / OnePlus Nord / SM7250 "lito") bring-up, layer 1: power and
 + * identify. Ported from raphael-ios-gpu 0105 (Adreno 640, SM8150; itself davinci-ios-gpu's
@@ -51,6 +51,7 @@
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 +extern kern_return_t thread_terminate(thread_t);
 +void sweet_gpu_init(void);
 +
