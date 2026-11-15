@@ -1,6 +1,14 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -3444,6 +3444,11 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+@@ -3403,6 +3403,7 @@ drm_do_get_param(uint32_t param, uint64_t *out)
+  *  - every BO it names given its fence: a BO given back before that fence is done keeps its
+  *    memory and addresses until it is (gpu_bo_release), and the display waits for a surface's
+  *    fence before it shows it (sweet_gpu_surface_wait). */
++static bool gpu_bo_wc(void);
+ static int
+ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ {
+@@ -3444,6 +3445,11 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
  			struct kgsl_bo_ent *b = kgsl_bo_find(chunk[j].handle);
  			uint32_t seed;
  			int64_t written;
@@ -12,7 +20,7 @@
  			if (b == NULL || b->surf == NULL) { continue; }
  			seed = sweet_surface_gpu_seed(b->surf);
  			if (seed == b->seed && began - b->pushed < again) { continue; }
-@@ -3551,6 +3556,24 @@ extern kern_return_t mach_vm_map_external(vm_map_t target_map,
+@@ -3551,6 +3557,24 @@ extern kern_return_t mach_vm_map_external(vm_map_t target_map,
                           vm_inherit_t inheritance);
  extern void          mach_memory_entry_port_release(ipc_port_t port);
  
@@ -37,7 +45,7 @@
  static int
  drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
  {
-@@ -3565,7 +3588,14 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
+@@ -3565,7 +3589,14 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
  	}
  	/* named entry over the BO's object-backed cacheable kernel range, forcing WC
  	 * (cache mode = bits[31:24] of permission; MAP_MEM_WCOMB<<24, outside the flag mask) */
@@ -53,7 +61,7 @@
  	kr = mach_make_memory_entry_64(kernel_map, &entry_size,
  	        (memory_object_offset_t)bo->cva, perm, &entry, IPC_PORT_NULL);
  	if (kr != KERN_SUCCESS || entry == IPC_PORT_NULL) {
-@@ -3584,7 +3614,7 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
+@@ -3584,7 +3615,7 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
  	{
  		static uint32_t told;
  		if (told++ < 16u) {
@@ -62,7 +70,7 @@
  			    bo->id, (unsigned long long)bo->gpuaddr, (unsigned long long)uaddr,
  			    (unsigned long)bo->mmapsize);
  		}
-@@ -3845,7 +3875,13 @@ drm_ioctl_locked(unsigned nr, caddr_t data)
+@@ -3845,7 +3876,13 @@ drm_ioctl_locked(unsigned nr, caddr_t data)
  		} else {
  			ms = drm_ms_until(&cp->timeout);
  		}
