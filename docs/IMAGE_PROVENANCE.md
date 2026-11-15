@@ -618,3 +618,16 @@ aa48fd0e8ee81192853b15fc2639662818b783723450b1a92da414c12959eab7  SweetGLES.bund
 3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
 ```
 update 2026-11-15T20:54:55Z: SweetEAGL.dylib 37fcce490046e1532314a8c7968d2170189f6557d87d0229144a5b8186b3a325 (active fps counter)
+
+## boot_a flash — 2026-11-15 (user OK: "go ahead with 1 and 2 and 3")
+
+First write of `boot_a` during iOS work. `boot_b` (LineageOS) untouched. Restore:
+`fastboot flash boot_a backup/64f70df8/boot_a.img` (stock OOS, md5 e7be3c9267685382386daa17a9e820b0)
+and `fastboot --set-active=b`.
+
+| image | what | sha256 |
+|---|---|---|
+| `build/phone/boot_a-0131-gles.img` (= `ufsroot.usb-kernel-0131-gpu11-gles.img`) | kernel 0131, preset usb + `sweetgpu=11 sweetgles=1`; booted and verified with `fastboot boot` 2026-11-15 21:04Z (GPU UI, 38-48 fps) | `788b246bd0887786af605439df996a08a45747d654712d4f5152d3ec7628a7c6` |
+
+Known risk (docs/SHIM_BOOT.md "Slot policy"): slot a has no Android system metadata; every kernel
+flashed there before landed in recovery/fastboot.
