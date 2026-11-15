@@ -123,3 +123,4 @@ apply 0124-avicii-gpu-zap-aligned-memory.patch
 apply 0125-avicii-gpu-a620-shader-tests.patch
 apply 0126-avicii-gpu-kgsl-drm-uapi.patch
 apply 0127-avicii-gpu-bo-map-cacheable.patch
+apply 0128-avicii-rpmh-ddr-llcc-bcm-votes.patch

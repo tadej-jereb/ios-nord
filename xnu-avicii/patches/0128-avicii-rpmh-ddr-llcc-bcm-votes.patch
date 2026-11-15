@@ -1,0 +1,295 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,9 +9,15 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <sys/sysctl.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_bcm_vote(const char *res, uint32_t ib);
++void sweet_rpmh_bcm_boot(void);
+ 
+ /*
+  * avicii live FDT (logs/dumps/run-20261112-195027/10-fdt.dtb):
+@@ -53,6 +59,11 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
++/* BCM vote word (vendor msm_bus_fabric_rpmh.c BCM_TCS_CMD): commit<<30 | valid<<29 | AB<<14 | IB */
++#define RH_BCM_COMMIT   (1u << 30)
++#define RH_BCM_VALID    (1u << 29)
++#define RH_BCM_MASK     0x3fffu
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -204,7 +215,13 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave == RH_BCM) {
++				/* BCM (bus clock manager): DDR, LLCC, interconnect; one 32-bit vote word each */
++				if ((addr >> 16) != RH_BCM || (addr & 3u) || !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
++					printf("SWEET RPMH: invalid BCM entry for %s\n", res);
++					return EINVAL;
++				}
++			} else if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+ 				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
+ 				return EINVAL;
+@@ -237,9 +254,14 @@ rh_free(unsigned t)
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send_cmds(const uint32_t *addrs, const uint32_t *values, unsigned n)
+ {
+ 	int chosen = -1;
++	uint32_t address = addrs[0] & ~15u;
++	uint32_t mask = (1u << n) - 1u;
++	if (n == 0 || n > rh_ncpt || n > 4u) {
++		return EINVAL;
++	}
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+@@ -284,30 +306,27 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is valid for a PMIC5 LDO and for an HF SMPS; enable last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %u command(s) at %#x: %#x irq-enable=%#x\n", t, n, addrs[0], values[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[4] = {0, 0, 0, 0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -338,11 +357,19 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: ACTIVE vote complete at %#x (rail voltage still unverified)\n",
+-	    address);
++	printf("SWEET RPMH: ACTIVE vote complete at %#x\n", address);
+ 	return 0;
+ }
+ 
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	/* HPM (raw 7) is valid for a PMIC5 LDO and for an HF SMPS; enable last. */
++	const uint32_t addrs[3] = {address, address + 8u, address + 4u};
++	const uint32_t values[3] = {mv, 7, 1};
++	return rh_send_cmds(addrs, values, 3);
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -413,4 +440,156 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * DDR / LLCC / ACV bandwidth votes (docs/perf-research/A-ddr-bandwidth.md). The vendor's devbw/bwmon/
++ * memlat governors vote these BCMs on the APPS RSC; nothing in this kernel did, so DDR and LLCC stayed
++ * at whatever the boot loader left. A vote is one ACTIVE-TCS command with commit and valid set and the
++ * peak (IB) in the BCM's unit -- the dts table integers: MC0 7980 = DDR 2092 MHz, SH0 16265 = LLCC
++ * 1066 MHz (lito.dtsi ddr_bw_opp_table / llcc_bw_opp_table), ACV 8 = the APPS active bit. 0 releases.
++ * Boot-args sweetddr=<MC0 IB> sweetllcc=<SH0 IB> sweetacv=0|1 (default: no vote). Runtime: write
++ * "NAME VALUE" to kern.sweet_bcm. kern.sweet_bwtest: write a count, read the memcpy MiB/s.
++ */
++static char rh_bcm_log[512];
++static size_t rh_bcm_logpos;
++
++int
++sweet_rpmh_bcm_vote(const char *res, uint32_t ib)
++{
++	if (!res || ib > RH_BCM_MASK) {
++		return EINVAL;
++	}
++	if (strcmp(res, "MC0") && strcmp(res, "SH0") && strcmp(res, "ACV") && strcmp(res, "CN0")) {
++		printf("SWEET RPMH: %s is not a BCM this kernel votes\n", res);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, value = ib ? (RH_BCM_COMMIT | RH_BCM_VALID | ib) : RH_BCM_COMMIT;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		error = rh_send_cmds(&address, &value, 1);
++	}
++out:
++	printf("SWEET RPMH: BCM %s vote %u (word %#x) at %#x -> %d\n", res, ib, value, address, error);
++	if (rh_bcm_logpos < sizeof(rh_bcm_log) - 64) {
++		rh_bcm_logpos += (size_t)scnprintf(rh_bcm_log + rh_bcm_logpos, sizeof(rh_bcm_log) - rh_bcm_logpos,
++		    "%s %u -> %d\n", res, ib, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++void
++sweet_rpmh_bcm_boot(void)
++{
++	uint32_t ddr = 0, llcc = 0, acv = 1;
++	bool any = PE_parse_boot_argn("sweetddr", &ddr, sizeof(ddr)) | PE_parse_boot_argn("sweetllcc", &llcc, sizeof(llcc));
++	(void)PE_parse_boot_argn("sweetacv", &acv, sizeof(acv));
++	if (!any || (ddr == 0 && llcc == 0)) {
++		return;
++	}
++	if (acv) {
++		(void)sweet_rpmh_bcm_vote("ACV", 8u);
++	}
++	if (llcc) {
++		(void)sweet_rpmh_bcm_vote("SH0", llcc);
++	}
++	if (ddr) {
++		(void)sweet_rpmh_bcm_vote("MC0", ddr);
++	}
++}
++
++static int
++sysctl_sweet_bcm SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char in[32] = "";
++	char name[8] = "";
++	uint32_t v = 0;
++	unsigned i = 0, k = 0;
++	int error;
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, rh_bcm_log, rh_bcm_logpos + 1);
++	}
++	if (req->newlen >= sizeof(in)) {
++		return EINVAL;
++	}
++	if ((error = SYSCTL_IN(req, in, req->newlen))) {
++		return error;
++	}
++	while (in[i] == ' ') {
++		i++;
++	}
++	while (in[i] && in[i] != ' ' && k < sizeof(name) - 1) {
++		name[k++] = in[i++];
++	}
++	while (in[i] == ' ') {
++		i++;
++	}
++	while (in[i] >= '0' && in[i] <= '9') {
++		v = v * 10u + (uint32_t)(in[i++] - '0');
++	}
++	return sweet_rpmh_bcm_vote(name, v);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bcm, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bcm, "A", "SWEET RPMh BCM vote: \"NAME IB\" (MC0, SH0, ACV, CN0)");
++
++/* memcpy bandwidth: two 8 MiB buffers, `count` copies, MiB/s of bytes read + written */
++static char rh_bw_out[128] = "write a count\n";
++static int
++sysctl_sweet_bwtest SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int count = 0, error;
++	char in[8] = "";
++	vm_offset_t a = 0, b = 0;
++	const vm_size_t size = 8u << 20;
++	uint64_t t0, t1, ns;
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, rh_bw_out, strlen(rh_bw_out) + 1);
++	}
++	if (req->newlen >= sizeof(in)) {
++		return EINVAL;
++	}
++	if ((error = SYSCTL_IN(req, in, req->newlen))) {
++		return error;
++	}
++	for (unsigned i = 0; in[i] >= '0' && in[i] <= '9'; i++) {
++		count = count * 10 + (in[i] - '0');
++	}
++	if (count < 1 || count > 64) {
++		return EINVAL;
++	}
++	if (kmem_alloc(kernel_map, &a, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	if (kmem_alloc(kernel_map, &b, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
++		kmem_free(kernel_map, a, size);
++		return ENOMEM;
++	}
++	bcopy((void *)a, (void *)b, size);      /* fault everything in first */
++	t0 = mach_absolute_time();
++	for (int i = 0; i < count; i++) {
++		bcopy((i & 1) ? (void *)b : (void *)a, (i & 1) ? (void *)a : (void *)b, size);
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	kmem_free(kernel_map, a, size);
++	kmem_free(kernel_map, b, size);
++	(void)scnprintf(rh_bw_out, sizeof(rh_bw_out), "%d x 8 MiB copies in %llu us: %llu MiB/s copied (x2 for read+write)\n",
++	    count, ns / 1000, ns ? (uint64_t)count * 8u * 1000000000ull / ns : 0);
++	printf("SWEET BW: %s", rh_bw_out);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bwtest, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bwtest, "A", "SWEET memcpy bandwidth test: write a count (1..64), read the result");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -728,6 +728,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ };
+ 
+ extern void sweet_cpufreq_init(void);
++extern void sweet_rpmh_bcm_boot(void);
+ 
+ static int
+ sweet_ufs_init(void)
+@@ -740,6 +741,7 @@ sweet_ufs_init(void)
+ 
+ 	/* avicii: cores left at ABL's cpufreq levels; first SWEET hook in BSD init. */
+ 	sweet_cpufreq_init();
++	sweet_rpmh_bcm_boot();        /* sweetddr= / sweetllcc= (docs/perf-research/A) */
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
