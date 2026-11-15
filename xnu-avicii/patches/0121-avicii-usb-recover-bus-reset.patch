@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -706,6 +706,45 @@ ud_if_create(void)
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * A bus reset or a disconnect (the host resetting the port, the cable out and in): the data
++ * endpoints and their transfers as on a fresh connection, so the host's next
++ * SET_CONFIGURATION sets them up again. Before, ud.configured stayed set, ud_configure() did
++ * nothing, ud_rx_arm() started a second transfer on a busy endpoint ("ep2/ep5 cmd 0x6
++ * status 1") and every frame after was garbage until the next boot (0118, 2026-11-15).
++ * As Linux dwc3_gadget_reset_interrupt / dwc3_stop_active_transfers, and raphael-ios-gpu
++ * 0127: EndTransfer with ForceRM on each data endpoint; the transfer resource index is
++ * what DEPCMD[22:16] holds after StartTransfer (dwc3 DEPCMD XferRscIdx).
++ */
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
++
++static void
++ud_data_reset(const char *why)
++{
++	static const unsigned eps[] = { EP_RX, EP_TX, EP_INT };
++
++	if (!ud.configured || ud.lock == NULL) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(eps) / sizeof(eps[0]); i++) {
++		uint32_t rsc = (dwc_rd(DEPCMD(eps[i])) >> 16) & 0x7fu;
++		(void)ud_epcmd(eps[i], DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | (rsc << 16), 0, 0, 0);
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	lck_mtx_lock(ud.lock);
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	ud.tx_busy = false;
++	ud.configured = false;
++	lck_mtx_unlock(ud.lock);
++	ud_link_event(false);
++	printf("SWEET USB: %s: data endpoints reset, waiting for the host to configure again\n", why);
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -714,6 +753,7 @@ ud_event(uint32_t ev)
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
++			ud_data_reset("bus reset");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -724,6 +764,7 @@ ud_event(uint32_t ev)
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			ud_data_reset("disconnect");
+ 		}
+ 		return;
+ 	}
