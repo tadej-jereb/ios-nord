@@ -61,11 +61,22 @@ contexts backed by our OSMesa.
 
 ### 1. `slots.h` / `slots.c`, generated
 
-Generate them with `gen_slots.py` (Python 3, stdlib only) from the two data files. The result is a
-table of `{offset, "glName"}` for **all 58 offsets** that have call sites, plus how each slot is
-filled:
-- `direct`: `OSMesaGetProcAddress(name)`, falling back to `dlsym`.
-- `wrap`: your own function.
+Generate them with `gen_slots.py` (Python 3, stdlib only) from the two data files.
+
+**Spec E's list of 58 is incomplete.** E §4 says the `GLESContext` ctor calls `glGetString` ×3,
+but `glGetString` is offset **0x03b0** in `eagl-offmap.txt` and is *not* in `eagl-slots.json`. So
+the extractor missed some call shapes. The table must therefore cover **every offset in
+`eagl-offmap.txt`**, not just the 58.
+
+Watch out for line `0x00d0` in `eagl-offmap.txt`: it is a malformed line holding the whole export
+list. Parse it defensively, report what it really is, and don't map 0x00d0 to anything from it.
+
+How each slot is filled:
+- `direct`: Mesa provides the function (`OSMesaGetProcAddress(name)`, falling back to `dlsym`).
+- `wrap`: your own function. Required for the 58 and for `glGetString`.
+- `stub`: anything else Mesa lacks. Logs the offset once and returns 0. Never NULL.
+
+Mark the 58 from `eagl-slots.json` as `called_by_qc` in the table.
 
 Commit the generator and its output.
 
@@ -91,7 +102,8 @@ constructor calls):
   buffer (QuartzCore always renders into FBOs).
 - Lay `_private` out as E §2 describes: `calloc(0x2088)`, table at `+0x20`, `table[0]` = an
   opaque per-context pointer that every slot receives as arg0.
-- Fill **every** one of the 58 slots. A NULL slot is a jump to address 0.
+- Fill **every** offset from `slots.c` (the whole offmap, see deliverable 1). A NULL slot is a
+  jump to address 0.
 - Set the `_private` ivar.
 - Leave `table[1]` NULL, or point it at a logging stub.
 
@@ -109,8 +121,7 @@ Special slots:
 - **`glGetString(GL_EXTENSIONS)`**: QuartzCore calls `glGetString` before anything else, so wrap
   it. Append the extension names from E §4 that Mesa doesn't report but that are safe to claim
   (`GL_APPLE_fence`, `GL_EXT_debug_label` …). Leave out the ones you cannot honour (PVRTC, YCbCr,
-  `texture_xr`), and comment the choice. Also check whether `glGetString` is one of the 58
-  offsets in the data files; the ctor's three calls (E §4) suggest it must be.
+  `texture_xr`), and comment the choice. `glGetString` is slot 0x03b0.
 
 `attachImage:` and `texImageIOSurface:` (E §5):
 - Act on the currently bound `GL_TEXTURE_2D`.
@@ -136,7 +147,8 @@ Implement E §9 exactly:
 3. `[[EAGLContext alloc] initWithAPI:3 properties:]` through `objc_msgSend`, then assert
    `API`==3.
 4. `setCurrentContext:`.
-5. `getMacroContextPrivate`; assert that all 58 slots are non-NULL.
+5. `getMacroContextPrivate`; assert that every offmap slot is non-NULL, the 58 and 0x03b0
+   included.
 6. Create a 64×64 BGRA IOSurface (CoreFoundation dict with `IOSurfaceWidth`/`Height`/
    `BytesPerElement`/`BytesPerRow`/`PixelFormat`), gen/bind a texture, `attachImage`, then an
    FBO with `glFramebufferTexture2D` — all **through the table slots**, as QuartzCore does.
@@ -162,7 +174,8 @@ forces the CPU-copy path, so both paths can be tested.
   `build/gpu/mesa-build/src/gallium/targets/osmesa/libOSMesa.8.dylib` (`llvm-nm -gU`), or is
   reachable through `OSMesaGetProcAddress`. If it's only reachable that way, say so in the README
   and keep a list.
-- Every one of the 58 offsets in `eagl-slots.json` appears in `slots.c` exactly once.
+- Every one of the 58 offsets in `eagl-slots.json`, and every well-formed offset in
+  `eagl-offmap.txt`, appears in `slots.c` exactly once. 0x03b0 is `wrap`.
 - Every undefined symbol in `SweetEAGL.dylib` (`llvm-nm -u`) is in one of the sysroot stubs or is
   `dyld_stub_binder`.
 
