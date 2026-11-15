@@ -1,0 +1,91 @@
+From: lane 3 <lane3@ios-nord>
+Subject: [PATCH] freedreno: RAM size, shader cache and the log's thread id without Linux
+
+
+  * <sys/sysinfo.h>/sysinfo() is Linux's: use Mesa's os_get_total_physical_memory().
+  * the shader disk cache is keyed by an ELF build-id note, which a Mach-O library has not:
+    no cache, rather than a wrong key.
+  * the debug log's thread id came from syscall(SYS_gettid): the Mach thread port is the
+    same information and needs no syscall.
+
+---
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -25,7 +25,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "drm-uapi/drm_fourcc.h"
++#ifndef __APPLE__
+ #include <sys/sysinfo.h>
++#endif
+ 
+ #include "freedreno_fence.h"
+ #include "freedreno_perfetto.h"
+@@ -1004,9 +1006,16 @@
+    screen->driconf.dual_color_blend_by_location =
+          driQueryOptionb(config->options, "dual_color_blend_by_location");
+ 
++#ifdef __APPLE__
++   /* no sysinfo() here: Mesa's own answer, and the field is 32 bits of kB-ish only as a hint */
++   uint64_t memory = 0;
++   if (os_get_total_physical_memory(&memory))
++      screen->ram_size = memory > UINT32_MAX ? UINT32_MAX : (uint32_t)memory;
++#else
+    struct sysinfo si;
+    sysinfo(&si);
+    screen->ram_size = si.totalram;
++#endif
+ 
+    DBG("Pipe Info:");
+    DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
+
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -33,6 +33,11 @@
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifdef __APPLE__
++   /* A Mach-O library has no ELF build-id note (build_id.h is empty here), and the pile would
++    * only be usable by one build of one library anyway: no disk cache. */
++   return;
++#else
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -46,6 +51,7 @@
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void
+
+--- a/src/gallium/drivers/freedreno/freedreno_util.h
++++ b/src/gallium/drivers/freedreno/freedreno_util.h
+@@ -95,12 +95,23 @@
+ 
+ #include <unistd.h>
+ #include <sys/types.h>
++#ifdef __APPLE__
++#include <pthread.h> /* pthread_mach_thread_np() */
++#else
+ #include <sys/syscall.h>
++#endif
++
++#ifdef __APPLE__
++/* no syscall(SYS_gettid) here: the Mach thread port is the same information */
++#define FD_THREAD_ID ((pid_t)pthread_mach_thread_np(pthread_self()))
++#else
++#define FD_THREAD_ID ((pid_t)syscall(SYS_gettid))
++#endif
+ 
+ #define DBG(fmt, ...)                                                          \
+    do {                                                                        \
+       if (FD_DBG(MSGS))                                                        \
+-         mesa_logi("%5d: %s:%d: " fmt, ((pid_t)syscall(SYS_gettid)),           \
++         mesa_logi("%5d: %s:%d: " fmt, FD_THREAD_ID,                           \
+                                         __func__, __LINE__,                    \
+                                         ##__VA_ARGS__);                        \
+    } while (0)

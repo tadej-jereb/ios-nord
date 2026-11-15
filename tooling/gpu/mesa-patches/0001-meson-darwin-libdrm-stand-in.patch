@@ -1,0 +1,72 @@
+From: lane 3 <lane3@ios-nord>
+Subject: [PATCH] build: a libdrm stand-in for Darwin, and the drm layer built with it
+
+
+system_has_kms_drm is false without a DRM stack, so dep_libdrm is null_dep, the -I for
+<xf86drm.h> is missing and src/freedreno/drm is not even entered. Replace the dependency on
+Darwin with the in-tree stand-in (src/freedreno/drm/darwin) and build its one source with the
+drm layer. IOSurface is the only framework linked: an IOSurface is handed to the driver by
+its ID where a buffer's descriptor would be.
+
+The drm library also links libvdrm unconditionally, which is not built without virtio.
+
+---
+--- a/meson.build
++++ b/meson.build
+@@ -1716,7 +1716,17 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if dep_libdrm.found()
++if host_machine.system() == 'darwin' and with_gallium_freedreno
++  # No DRM on this system. freedreno's requests go to the kernel's character device through a
++  # stand-in for libdrm that is part of the drm layer (src/freedreno/drm/darwin): freedreno's
++  # <xf86drm.h> comes from here, and the one source file is built with the drm layer itself.
++  # IOSurface is the only thing linked, for the memory someone else made (an IOSurface is
++  # handed in by its ID, where a buffer's descriptor would be).
++  dep_libdrm = declare_dependency(
++    include_directories : include_directories('src/freedreno/drm/darwin'),
++    link_args : ['-framework', 'IOSurface', '-framework', 'CoreFoundation'],
++  )
++elif dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+     with_gallium_drisw_kms = true
+
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,7 +22,7 @@
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+
+--- a/src/freedreno/drm/meson.build
++++ b/src/freedreno/drm/meson.build
+@@ -46,6 +46,12 @@
+ )
+ libfreedreno_drm_files += libfreedreno_drm_msm_files
+ 
++# No DRM here: the libdrm stand-in is built into this library (see the dependency in meson.build).
++if host_machine.system() == 'darwin'
++  libfreedreno_drm_files += files('darwin/drm_darwin.c', 'darwin/xf86drm.h')
++  libfreedreno_drm_includes += include_directories('darwin')
++endif
++
+ libfreedreno_drm_virtio_files = files(
+   'virtio/virtio_bo.c',
+   'virtio/virtio_device.c',
+@@ -72,8 +78,7 @@
+   c_args : [no_override_init_args, libfreedreno_drm_flags],
+   gnu_symbol_visibility : 'hidden',
+   dependencies : libfreedreno_drm_deps,
+-  # TODO
+-  link_with : [libvdrm],
++  link_with : freedreno_kmds.contains('virtio') ? [libvdrm] : [],
+   build_by_default : false,
+ )
+ 

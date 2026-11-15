@@ -1,0 +1,125 @@
+sysroot-test PROOF
+==================
+Captured (UTC): 2026-11-15T18:13:57Z
+Host: Linux 6.8.0-149-generic x86_64
+Sysroot under test: /home/tadej/.hermes/cache/scratch/sysroot-ios16
+Toolchain: /home/tadej/ios-nord/tooling/opt/llvm/bin  (clang 18.1.8)
+Compiler flags in every link/compile: -target arm64-apple-ios16.0 -isysroot <sysroot> -DXNU_PLATFORM_iPhoneOS -fuse-ld=lld
+Result: 3/3 PASS (step1 compile, step2 link+load-command check, negative control).
+
+==================================================================
+1. Full run of the harness (PASS/FAIL per test)
+==================================================================
+$ /home/tadej/ios-nord/tooling/gpu/sysroot-test/run.sh /home/tadej/.hermes/cache/scratch/sysroot-ios16
+sysroot: /home/tadej/.hermes/cache/scratch/sysroot-ios16
+cc     : /home/tadej/ios-nord/tooling/opt/llvm/bin/clang
+out    : /home/tadej/.hermes/cache/scratch/sysroot-test-out
+
+PASS  step1: C headers compile for arm64-apple-ios16.0
+PASS  step2: dylib links and names libSystem.B + libz.1, platform ios, minos 16.0
+PASS  control: link fails with libSystem.B.tbd renamed away
+
+ALL PASS
+
+harness exit code: 0
+==================================================================
+2. Mach-O load commands of the step-2 dylib (required evidence)
+==================================================================
+Full dump: /home/tadej/ios-nord/tooling/opt/llvm/bin/llvm-objdump --macho --private-headers /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib
+
+$ /home/tadej/ios-nord/tooling/opt/llvm/bin/llvm-objdump --macho --private-headers /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib | sed -n '1,3p'
+/home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib:
+Mach header
+      magic cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
+
+$ /home/tadej/ios-nord/tooling/opt/llvm/bin/llvm-objdump --macho --private-headers /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib | grep -A8 'cmd LC_BUILD_VERSION'
+       cmd LC_BUILD_VERSION
+   cmdsize 32
+  platform ios
+       sdk 16.0
+     minos 16.0
+    ntools 1
+      tool lld
+   version 18.1.8
+Load command 11
+
+$ /home/tadej/ios-nord/tooling/opt/llvm/bin/llvm-objdump --macho --private-headers /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib | grep -A6 'cmd LC_LOAD_DYLIB'
+          cmd LC_LOAD_DYLIB
+      cmdsize 48
+         name /usr/lib/libz.1.dylib (offset 24)
+   time stamp 0 Thu Jan  1 01:00:00 1970
+      current version 1.2.11
+compatibility version 1.0.0
+Load command 12
+          cmd LC_LOAD_DYLIB
+      cmdsize 56
+         name /usr/lib/libSystem.B.dylib (offset 24)
+   time stamp 0 Thu Jan  1 01:00:00 1970
+      current version 1319.100.3
+compatibility version 1.0.0
+Load command 13
+
+==================================================================
+3. same file, platform field decoded as an integer
+   (llvm-objdump prints the name 'ios'; LC_BUILD_VERSION.platform == 2 is ios)
+==================================================================
+$ python3 /tmp/dec.py /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib
+filetype=6 (6=DYLIB) magic=0xfeedfacf cputype=16777228 (16777228=ARM64) ncmds=15
+LC_ID_DYLIB: /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib
+LC_BUILD_VERSION platform=2 (=ios) minos=16.0.0 sdk=16.0.0
+LC_LOAD_DYLIB: /usr/lib/libz.1.dylib
+LC_LOAD_DYLIB: /usr/lib/libSystem.B.dylib
+
+$ /home/tadej/ios-nord/tooling/opt/llvm/bin/llvm-objdump --macho --private-headers /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2.dylib | sed -n '4,6p'
+MH_MAGIC_64   ARM64        ALL  0x00       DYLIB    15       1392   NOUNDEFS DYLDLINK TWOLEVEL NO_REEXPORTED_DYLIBS
+Load command 0
+      cmd LC_SEGMENT_64
+
+==================================================================
+4. Negative control: identical link, libSystem.B.tbd renamed away
+   (done on a copy so the shared sysroot is untouched)
+==================================================================
+$ mkdir -p /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual && cp -a /home/tadej/.hermes/cache/scratch/sysroot-ios16/. /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual/ && mv /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual/usr/lib/libSystem.B.tbd /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual/usr/lib/libSystem.B.tbd.gone && ls /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual/usr/lib
+libc++.1.tbd
+libc++abi.tbd
+libc++.tbd
+libSystem.B.tbd.gone
+libSystem.tbd
+libz.1.tbd
+libz.tbd
+
+$ /home/tadej/ios-nord/tooling/opt/llvm/bin/clang -target arm64-apple-ios16.0 -isysroot /home/tadej/.hermes/cache/scratch/sysroot-test-out/neg-manual -DXNU_PLATFORM_iPhoneOS -fuse-ld=lld -dynamiclib /home/tadej/ios-nord/tooling/gpu/sysroot-test/step2.c -lz -o /home/tadej/.hermes/cache/scratch/sysroot-test-out/libstep2-nosys.dylib
+ld64.lld: error: library not found for -lSystem
+ld64.lld: error: undefined symbol: printf
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol step2+0x70)
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol thr+0x24)
+
+ld64.lld: error: undefined symbol: getpid
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol step2+0x50)
+
+ld64.lld: error: undefined symbol: pthread_join
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol step2+0x44)
+
+ld64.lld: error: undefined symbol: pthread_create
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol step2+0x38)
+
+ld64.lld: error: undefined symbol: dlopen
+>>> referenced by /home/tadej/.hermes/cache/scratch/step2-5fd459.o:(symbol step2+0x18)
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+exit status: 1  (nonzero = FAIL, as required)
+artifact present? no
+
+Reading: ld64.lld cannot find -lSystem and every libc symbol (printf, getpid,
+pthread_create/join, dlopen) goes undefined -- so those symbols came from the
+'/home/tadej/.hermes/cache/scratch/sysroot-ios16/usr/lib/libSystem.B.tbd' stub and not from any host library.
+
+==================================================================
+5. Positive control: same link, tbd present -- no linker diagnostics
+==================================================================
+$ cat /home/tadej/.hermes/cache/scratch/sysroot-test-out/step2.log     # stderr+stdout of the successful step-2 link
+(nothing above = ld64.lld resolved every reference through the stubs;
+ the mach header carries the NOUNDEFS flag, so no symbol was left dangling.
+ llvm-nm --undefined-only on this dylib still prints _printf, _dlopen,
+ _pthread_create, _pthread_join, _getpid and dyld_stub_binder -- those are
+ its normal imports, and they are the ones the two LC_LOAD_DYLIB commands
+ above satisfy.)

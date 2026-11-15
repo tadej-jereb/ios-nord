@@ -207,3 +207,68 @@ fb-read barrier. Total **+726/−9 across 18 files (2 new)**, and all six apply 
 patch list `F:291-303`). Fourteen Linux-isms are enumerated at `F:160-194`. The patches are drafts:
 nothing in the tree applies them, and none has been built beyond a syntax/compile pass of the
 `drm/` layer.
+
+### Lane 1 — the sysroot exists, links, and Mesa configures (`D-ios-sysroot.md`)
+
+This lane's first agent hit its iteration cap with the report unwritten, so the round was finished by
+four agents on one file each. The result is real: a minimal iOS 16 arm64 sysroot that compiles C
+headers and links Mach-O against `.tbd` stubs generated from our own dyld cache — `platform ios`,
+`minos 16.0`, `LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib` + `/usr/lib/libz.1.dylib` with the cache's
+own `current version 1319.100.3` / `1.2.11`. The proof is re-runnable and includes the control that
+matters: rename `libSystem.B.tbd` away and the link fails, so the stubs are demonstrably the thing
+linking (`tooling/gpu/sysroot-test/PROOF.txt`, 3/3 PASS; independently reproduced here at 65 976 B).
+`tooling/gpu/mksysroot.sh` (46 KB) is the reproducible generator — nine upstream tarballs pinned by
+tag *and* sha256, a `MANIFEST.sha256` of inputs and outputs, staging into `$OUT/.work.$$` and merged
+without deleting, `.tbd` generation skipped under `--no-tbd` when no cache is mounted (`:53`, `:84`).
+
+Nothing here is Apple code: APSL-2.0 apple-oss-distributions, LLVM-18 libc++ under Apache-2.0 WITH
+LLVM-exception, zlib 1.2.11 under the zlib licence, plus four synthesized headers (listed as such in
+the report) and `.tbd` stubs from the device cache.
+
+**The Mesa build moved further than in any previous round, and that is the point of the lane.**
+`meson setup` now **passes** — the `ETIME` probe that stopped lane C returns `101`. `ninja` on all
+targets stops at 34/752 with **zero Mesa objects failed**; both `FAILED` are the libarchive
+subproject (`openssl/evp.h`, `CommonCrypto/CommonCryptor.h`). Targeted builds all exit 0 and the
+build dir holds 275 objects and 5 archives including `libfreedreno.a` (85 objects, C++ among them)
+and `libgallium.a` (151). Three traps worth the ink: `-DXNU_PLATFORM_iPhoneOS` is **mandatory** (without
+it `cdefs.h` leaves `__DARWIN_ONLY_UNIX_CONFORMANCE 0` and the link dies on `_pthread_join$UNIX2003`);
+lane C's option set is self-inconsistent (`-Dosmesa=true` without softpipe/llvmpipe aborts at
+`meson.build:2052`); and with `-Dplatforms=` there is no `src/gles/`, so `-Dgles2=enabled` builds no
+`libGLESv2` — a config decision, not a sysroot gap.
+
+One sysroot gap stays open and it is narrow — with two known fixes now. `<locale>` failed on
+`strtoll_l` (+4 `_l` forms) because Libc's `xlocale.h` gates those prototypes on `#ifdef
+_STDLIB_H_` and libc++ 18's `__locale` includes `<xlocale.h>` first: fixed by the compile flag
+`-D_USE_EXTENDED_LOCALES_`, no header edit. Behind it sits the real blocker: `libSystem.B.tbd`
+drops **20 plain libc aliases** (`_strlen`, `_memcmp`, `_memmove`, …) while keeping their
+`__platform_*` twins, because `gen_tbd.py` skips `REEXPORT` trie entries — so no C++ dylib links
+at all, and it has nothing to do with libc++. Patched in the copy (7894 → 7914 symbols), after
+which the C++ dylib links at 71 296 B with **no libc++ ABI delta** — every `std::__1` import
+resolves against the 1500.65.0 stub (`~/.hermes/cache/scratch/lane-1d/RECIPE.md:134`, `§6` delta).
+Two smaller corrections from the same lane: canonical's `__config_site` says `HARDENING_MODE_FAST`
+where `NONE` matches the shipped dylib, and `_LIBCPP_PSTL_CPU_BACKEND_SERIAL` is mandatory or the
+build reports `Invalid CPU backend choice`. No `crt1.o`/`dylib1.o` is needed for `-dylib` or even a
+dynamic executable — lld defaults `LC_MAIN` to `_main`, so nothing runs `__libc_init`; only
+`-static` demands `-lcrt0.o`, and no open-source tree here defines `start()`.
+
+## Round 3: what is still unsolved, and the next three steps
+
+Nothing in this round ran on the phone. Every lane is an artefact: a sysroot, a spec, patches, a plan.
+That is the correct order — but it means the seam is still unproven end to end, and the honest
+statement of state is "builds a driver, never driven it".
+
+1. **Apply the two known fixes, then push `ninja`.** Take `§6` of `lane-1d/RECIPE.md`: the
+   `gen_tbd.py` alias fixup (4 lines, so `REEXPORT` entries stop being skipped) and
+   `-D_USE_EXTENDED_LOCALES_` in the cross file, plus `HARDENING_MODE_NONE` and the mandatory PSTL
+   macro in `__config_site`. Verify by the C++ test-3 link exiting 0 and `ninja` moving past 34/752;
+   the walls already queued behind it are `usr/include/pwd.h`, `mach-o/dyld.h` and a
+   `host_statistics64` declaration (`D` §Status steps 2-4). Disable libarchive with `--wrap-mode` or
+   `-Dlibarchive=disabled` rather than porting OpenSSL into the sysroot.
+2. **Decide the front end before building it.** `-Dgles2=enabled` cannot produce `libGLESv2` on this
+   config, so take F's OSMesa-only path (`libOSMesa.8.dylib` + `@loader_path`) and record the
+   decision in `C`/`F`; verify with `nm -gU` that the shim's 58 slots (E §4) are satisfied by
+   OSMesa's exports, slot by slot, before a single byte goes to the phone.
+3. **The driver gate, still without the compositor.** Build and ad-hoc sign the two dylibs, scp the
+   `SweetGLES.bundle` and a test binary per G stage 0, and run OSMesa `clear` + readback over SSH.
+   That touches `GET_PARAM`, `GEM_NEW`, `SUBMIT`, `WAIT_FENCE` and `GEM_CLOSE` in one go. Only after
+   it passes does G stage 1 (`sweetgles=1`, a throwaway `EAGLContext` process) become worth a boot.

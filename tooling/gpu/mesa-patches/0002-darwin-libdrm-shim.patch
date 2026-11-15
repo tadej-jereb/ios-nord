@@ -1,0 +1,556 @@
+From: lane 3 <lane3@ios-nord>
+Subject: [PATCH] freedreno/drm: the libdrm subset freedreno uses, over the render node
+
+
+Only the calls freedreno and the loader make are here (see the function table in
+docs/gpu-research/F-libdrm-darwin.md); nothing modesets and there are no fence or buffer file
+descriptors. Requests go to /dev/dri/renderD128 with ioctl(2).
+
+Every request is re-encoded with XNU's ioccom direction bits: Linux's _IOW is XNU's IOC_OUT,
+and XNU's ioctl() zeroes the argument for IOC_OUT, so the pure-write requests (GEM_CLOSE,
+GEM_CPU_PREP, WAIT_FENCE, SUBMITQUEUE_CLOSE, SUBMITQUEUE_QUERY) travel as XNU _IOW, the ones
+that answer as _IOWR.
+
+A buffer is mapped by the kernel (MSM_INFO_IOS_MMAP) and an IOSurface is imported by its ID
+(MSM_INFO_IOS_IMPORT); the surface's own mapping serves the CPU's side and the surface is
+held for the buffer. The version is reported as 1.7: the kernel answers 1.10, but 8 and up
+would claim cached-coherent memory, which the kernel only carries as a flag.
+
+---
+--- a/src/freedreno/drm/darwin/xf86drm.h
++++ b/src/freedreno/drm/darwin/xf86drm.h
+@@ -0,0 +1,170 @@
++/*
++ * The part of libdrm that Mesa's freedreno takes, for a system whose DRM device is an XNU
++ * character device (/dev/dri/renderD128) rather than a Linux one. The functions are in
++ * drm_darwin.c; the request numbers and the structures are Linux's, from the drm-uapi headers in
++ * this tree, which are also the contract of the kernel's GPU driver
++ * (xnu-avicii/patches/0126-avicii-gpu-kgsl-drm-uapi.patch).
++ *
++ * DIRECTION, AND WHY THE MACROS HERE ARE XNU'S. Linux and XNU encode "which way the argument
++ * goes" in the two top bits of the request, and they encode it the other way round: Linux _IOW
++ * (into the kernel) is 0x40000000, which XNU <sys/ioccom.h> calls IOC_OUT; Linux _IOR is
++ * 0x80000000, XNU's IOC_IN. XNU's ioctl() copies the argument in only when IOC_IN is set, and
++ * *zeroes* it for IOC_OUT (bsd/kern/sys_generic.c:888-907), so a request sent with Linux's bits
++ * for a pure-write ioctl arrives zeroed: GEM_CLOSE would close handle 0, GEM_CPU_PREP would wait
++ * for a buffer that does not exist, WAIT_FENCE for the last submission only. Mesa's drm-uapi
++ * headers build the Linux codes, so every request freedreno uses is re-encoded here with the
++ * XNU macros: _IOW for the pure-write ones (GEM_CLOSE, GEM_CPU_PREP, WAIT_FENCE,
++ * SUBMITQUEUE_CLOSE, SUBMITQUEUE_QUERY), _IOWR for the ones that also answer (identical to
++ * Linux's). The kernel dispatches on the number alone, so only the direction and the length
++ * matter, and the length is the struct's.
++ *
++ * Buffers and fences are not file descriptors here. Memory that somebody else has made does
++ * come in, but an IOSurface comes in by its ID, where freedreno expects a descriptor.
++ *
++ * No Apple header is included: the few IOSurface and Mach symbols used are declared below.
++ */
++
++#ifndef IOS_DRM_H
++#define IOS_DRM_H
++
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/ioccom.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++
++#include "drm-uapi/drm.h"
++#include "drm-uapi/msm_drm.h"
++
++#define DRM_DEVICE_RENDER_NODE "/dev/dri/renderD128"
++
++#define DRM_NODE_PRIMARY 0
++#define DRM_NODE_RENDER  2
++#define DRM_CLOEXEC      O_CLOEXEC
++#define DRM_RDWR         O_RDWR
++
++/* The highest interface freedreno is told this kernel has: softpin, submit queues and madvise
++ * (4), and nothing above it -- no cached-coherent memory (8), which this kernel's flag is
++ * carried but not implemented. Reported as a minor version; see DRM_MSM_MAX_MINOR in drm_darwin.c. */
++#define DRM_MSM_MAX_MINOR 7
++
++/* The kernel's private MSM_INFO_* ops, which the drm-uapi header does not have (0126, the
++ * contract: 0x80 maps a buffer into this task, 0x85 imports an IOSurface by its ID). They must
++ * not drift from it. */
++#define MSM_INFO_IOS_MMAP   0x80u
++#define MSM_INFO_IOS_IMPORT 0x85u
++
++/* Re-encoded with XNU's directions -- see the banner. */
++#undef DRM_IOCTL_VERSION
++#undef DRM_IOCTL_GEM_CLOSE
++#undef DRM_IOCTL_GEM_FLINK
++#undef DRM_IOCTL_GEM_OPEN
++#undef DRM_IOCTL_GET_CAP
++#undef DRM_IOCTL_MSM_GET_PARAM
++#undef DRM_IOCTL_MSM_SET_PARAM
++#undef DRM_IOCTL_MSM_GEM_NEW
++#undef DRM_IOCTL_MSM_GEM_INFO
++#undef DRM_IOCTL_MSM_GEM_CPU_PREP
++#undef DRM_IOCTL_MSM_GEM_SUBMIT
++#undef DRM_IOCTL_MSM_WAIT_FENCE
++#undef DRM_IOCTL_MSM_GEM_MADVISE
++#undef DRM_IOCTL_MSM_SUBMITQUEUE_NEW
++#undef DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE
++#undef DRM_IOCTL_MSM_SUBMITQUEUE_QUERY
++
++#define DRM_IOCTL_VERSION      _IOWR('d', 0x00, struct drm_version)
++#define DRM_IOCTL_GEM_CLOSE    _IOW('d', 0x09, struct drm_gem_close)
++#define DRM_IOCTL_GEM_FLINK    _IOWR('d', 0x0a, struct drm_gem_flink)
++#define DRM_IOCTL_GEM_OPEN     _IOWR('d', 0x0b, struct drm_gem_open)
++#define DRM_IOCTL_GET_CAP      _IOWR('d', 0x0c, struct drm_get_cap)
++
++#define DRM_IOCTL_MSM_GET_PARAM                                             \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_GET_PARAM, struct drm_msm_param)
++#define DRM_IOCTL_MSM_SET_PARAM                                             \
++   _IOW('d', DRM_COMMAND_BASE + DRM_MSM_SET_PARAM, struct drm_msm_param)
++#define DRM_IOCTL_MSM_GEM_NEW                                               \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_GEM_NEW, struct drm_msm_gem_new)
++#define DRM_IOCTL_MSM_GEM_INFO                                              \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_GEM_INFO, struct drm_msm_gem_info)
++/* pure-write requests: Linux _IOW, so XNU _IOW (IOC_IN) here */
++#define DRM_IOCTL_MSM_GEM_CPU_PREP                                          \
++   _IOW('d', DRM_COMMAND_BASE + DRM_MSM_GEM_CPU_PREP, struct drm_msm_gem_cpu_prep)
++#define DRM_IOCTL_MSM_GEM_SUBMIT                                            \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, struct drm_msm_gem_submit)
++#define DRM_IOCTL_MSM_WAIT_FENCE                                            \
++   _IOW('d', DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE, struct drm_msm_wait_fence)
++#define DRM_IOCTL_MSM_GEM_MADVISE                                           \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_GEM_MADVISE, struct drm_msm_gem_madvise)
++#define DRM_IOCTL_MSM_SUBMITQUEUE_NEW                                       \
++   _IOWR('d', DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_NEW, struct drm_msm_submitqueue)
++#define DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE                                     \
++   _IOW('d', DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_CLOSE, __u32)
++#define DRM_IOCTL_MSM_SUBMITQUEUE_QUERY                                     \
++   _IOW('d', DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_QUERY, struct drm_msm_submitqueue_query)
++
++/* libdrm's version structure, with the 64-bit lengths of drm_version: the ioctl fills it in
++ * place. (libdrm's own header has size_t here; a 32-bit length would misplace every field
++ * after name_len against what the kernel writes.) */
++typedef struct _drmVersion {
++   int version_major, version_minor, version_patchlevel;
++   size_t name_len;
++   char *name;
++   size_t date_len;
++   char *date;
++   size_t desc_len;
++   char *desc;
++} drmVersion, *drmVersionPtr;
++
++int drmOpenWithType(const char *name, const char *busid, int type);
++int drmIoctl(int fd, unsigned long request, void *arg);
++int drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size);
++int drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size);
++drmVersionPtr drmGetVersion(int fd);
++void drmFreeVersion(drmVersionPtr version);
++int drmGetCap(int fd, uint64_t capability, uint64_t *value);
++
++/* Buffers and fences as file descriptors: there are none. An IOSurface does come in as Linux's
++ * buffers do, by "descriptor" -- its ID, where freedreno passes one. A buffer that was imported
++ * from a surface answers with it again. */
++int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
++int drmPrimeFDToHandle(int fd, int surface, uint32_t *handle);
++
++int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
++int drmSyncobjDestroy(int fd, uint32_t handle);
++int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count);
++int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
++int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
++int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
++int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
++
++/* Not libdrm's: a buffer's memory in this process, in place of mmap() on the device, which XNU
++ * does not route through d_mmap() usefully. The kernel maps, write-combined, and answers with
++ * the address (GEM_INFO, MSM_INFO_IOS_MMAP, 0x80); the mapping is this process's to take away
++ * again. Return MAP_FAILED on error. */
++void *drm_msm_ios_mmap(int fd, uint32_t handle);
++void drm_msm_ios_munmap(void *address, size_t size);
++
++/* Not libdrm's either: what an IOSurface is as a buffer, and its memory (the kernel imports the
++ * pages, GEM_INFO, MSM_INFO_IOS_IMPORT, 0x85). The surface's own mapping is used for the CPU's
++ * side, kept by the lookup's reference, so no kernel mapping of an imported buffer is made: the
++ * kernel keeps the surface alive and pushes the CPU's writes out of its cache when a submission
++ * names the buffer. */
++typedef struct __IOSurface *IOSurfaceRef;
++typedef uint32_t IOSurfaceID;
++
++struct drm_msm_ios_surface {
++   uint32_t size;    /* allocation, in bytes (what the kernel imported) */
++   uint32_t pitch;   /* row length in bytes */
++   uint32_t width, height;
++   uint32_t format;  /* IOSurface pixel format; 'BGRA' is 0x42475241 */
++};
++
++int drm_msm_ios_surface_info(int surface, struct drm_msm_ios_surface *out);
++IOSurfaceRef drm_msm_ios_surface_ref(int surface);
++void drm_msm_ios_surface_unref(IOSurfaceRef surface);
++uint32_t drm_msm_ios_surface_size(int fd, uint32_t handle);
++void *drm_msm_ios_surface_base(uint32_t handle);
++void drm_msm_ios_surface_release(uint32_t handle);
++
++#endif /* IOS_DRM_H */
+
+--- a/src/freedreno/drm/darwin/drm_darwin.c
++++ b/src/freedreno/drm/darwin/drm_darwin.c
+@@ -0,0 +1,360 @@
++/*
++ * The libdrm of xf86drm.h (see the banner there): Linux's DRM requests carried to the kernel's
++ * GPU driver as ioctl(2) on its character device. Request numbers and structures are Linux's
++ * (drm-uapi in this tree); direction and length are XNU's, which is the one thing about them
++ * that cannot be taken as it comes.
++ *
++ * Freedreno knows its device by a file descriptor, and there is one: opening the render node
++ * gives one. The device is the render node only; nothing here modesets.
++ */
++
++#include <errno.h>
++#include <pthread.h>
++#include <sys/ioctl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <mach/mach_init.h> /* mach_task_self() */
++#include <mach/mach_vm.h>   /* mach_vm_deallocate() */
++
++#include "xf86drm.h"
++
++/* IOSurface's own declarations (no framework header is needed for five functions). */
++extern IOSurfaceRef IOSurfaceLookup(IOSurfaceID id);
++extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
++extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
++extern size_t IOSurfaceGetWidth(IOSurfaceRef surface);
++extern size_t IOSurfaceGetHeight(IOSurfaceRef surface);
++extern uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef surface);
++extern IOSurfaceID IOSurfaceGetID(IOSurfaceRef surface);
++extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
++extern void CFRelease(const void *object);
++
++/* The page the kernel maps in (0126 uses PAGE_SIZE); the granularity of unmapping. */
++#define IOS_PAGE 4096u
++
++int
++drmOpenWithType(const char *name, const char *busid, int type)
++{
++   (void)busid;
++   (void)type; /* the one node there is is a render node */
++   if (name != NULL && strcmp(name, "msm") != 0) {
++      errno = ENODEV;
++      return -1;
++   }
++   return open(DRM_DEVICE_RENDER_NODE, O_RDWR | O_CLOEXEC);
++}
++
++/* What an IOSurface was imported as, by the handle it was imported to: the surface is held for
++ * as long as the buffer is (the kernel holds it too, but the mapping used for the CPU's side is
++ * the surface's own and must outlive it), and its numbers are answered from here. */
++#define IOS_MAX_IMPORTS 512
++static struct {
++   uint32_t handle;
++   IOSurfaceRef surface;
++   uint32_t size;
++} ios_imports[IOS_MAX_IMPORTS];
++static pthread_mutex_t ios_imports_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int
++ios_import_slot(uint32_t handle)
++{
++   int free_slot = -1;
++   for (int i = 0; i < IOS_MAX_IMPORTS; i++) {
++      if (ios_imports[i].handle == handle && ios_imports[i].surface != NULL)
++         return i;
++      if (free_slot < 0 && ios_imports[i].surface == NULL)
++         free_slot = i;
++   }
++   return free_slot;
++}
++
++int
++drmIoctl(int fd, unsigned long request, void *arg)
++{
++   int ret;
++   do {
++      ret = ioctl(fd, request, arg);
++   } while (ret == -1 && errno == EINTR);
++   if (ret == 0 && (request & 0xffu) == 0x09u && (request >> 8 & 0xffu) == 'd') {
++      /* GEM_CLOSE: forget what the handle was imported as, and let the surface go */
++      struct drm_gem_close *close = arg;
++      pthread_mutex_lock(&ios_imports_lock);
++      int i = ios_import_slot(close->handle);
++      if (i >= 0 && ios_imports[i].handle == close->handle) {
++         CFRelease(ios_imports[i].surface);
++         ios_imports[i].surface = NULL;
++         ios_imports[i].handle = 0;
++      }
++      pthread_mutex_unlock(&ios_imports_lock);
++   }
++   return ret;
++}
++
++static int
++command(int fd, unsigned index, unsigned direction, void *data, unsigned long size)
++{
++   if (drmIoctl(fd, _IOC(direction, 'd', DRM_COMMAND_BASE + index, size), data))
++      return -errno;
++   return 0;
++}
++
++int
++drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size)
++{
++   return command(fd, index, IOC_IN, (void *)(uintptr_t)data, size);
++}
++
++int
++drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
++{
++   return command(fd, index, IOC_INOUT, data, size);
++}
++
++/* drm_version is drmVersion's layout: the request fills the structure in place. */
++_Static_assert(sizeof(drmVersion) == sizeof(struct drm_version), "drmVersion must be drm_version");
++
++/*
++ * The device says what Linux's says and is of the version whose interface it has (1.10 by its
++ * driver). Freedreno is held to 7 of it: softpin, submit queues and madvise are there and the
++ * kernel implements them; 8 would have it believe in cached-coherent memory, which the kernel
++ * only carries as a flag on the way to a mapping that is write-combined either way.
++ */
++drmVersionPtr
++drmGetVersion(int fd)
++{
++   drmVersionPtr version = calloc(1, sizeof(*version));
++   int ret;
++
++   if (version == NULL)
++      return NULL;
++
++   /* the same layout, the ioctl fills it in place */
++   version->name = calloc(1, 8);
++   if (version->name != NULL) {
++      version->name_len = 8;
++      ret = drmIoctl(fd, DRM_IOCTL_VERSION, version);
++      if (ret == 0 && version->version_major == 1) {
++         if (version->version_minor > DRM_MSM_MAX_MINOR)
++            version->version_minor = DRM_MSM_MAX_MINOR;
++         version->date_len = 0;
++         version->desc_len = 0;
++         free(version->date);
++         free(version->desc);
++         version->date = strdup("");
++         version->desc = strdup("msm on Darwin");
++         return version;
++      }
++   }
++
++   /* an image without the request: what 0126 answers */
++   free(version->name);
++   version->version_major = 1;
++   version->version_minor = DRM_MSM_MAX_MINOR;
++   version->name_len = 3;
++   version->name = strdup("msm");
++   version->date = strdup("");
++   version->desc = strdup("msm on Darwin (no VERSION ioctl)");
++   return version;
++}
++
++void
++drmFreeVersion(drmVersionPtr version)
++{
++   if (version != NULL) {
++      free(version->name);
++      free(version->date);
++      free(version->desc);
++      free(version);
++   }
++}
++
++int
++drmGetCap(int fd, uint64_t capability, uint64_t *value)
++{
++   struct drm_get_cap req = { .capability = capability };
++
++   if (drmIoctl(fd, DRM_IOCTL_GET_CAP, &req)) {
++      *value = 0;
++      return -errno;
++   }
++   *value = req.value; /* 0 for everything, so no sync objects: see fd_has_syncobj() */
++   return 0;
++}
++
++/* ---- IOSurface as a buffer ------------------------------------------------------------- */
++
++int
++drm_msm_ios_surface_info(int surface, struct drm_msm_ios_surface *out)
++{
++   IOSurfaceRef s = IOSurfaceLookup((IOSurfaceID)surface);
++
++   if (s == NULL) {
++      errno = ENOENT;
++      return -1;
++   }
++   out->size = (uint32_t)IOSurfaceGetAllocSize(s);
++   out->pitch = (uint32_t)IOSurfaceGetBytesPerRow(s);
++   out->width = (uint32_t)IOSurfaceGetWidth(s);
++   out->height = (uint32_t)IOSurfaceGetHeight(s);
++   out->format = IOSurfaceGetPixelFormat(s);
++   CFRelease(s);
++   return 0;
++}
++
++IOSurfaceRef
++drm_msm_ios_surface_ref(int surface)
++{
++   return IOSurfaceLookup((IOSurfaceID)surface);
++}
++
++void
++drm_msm_ios_surface_unref(IOSurfaceRef surface)
++{
++   if (surface != NULL)
++      CFRelease(surface);
++}
++
++/* Import: the surface's pages become a buffer of the GPU's address space (MSM_INFO_IOS_IMPORT,
++ * 0x85, the surface's ID in value; the handle comes back in handle). The surface is held here
++ * until the buffer is closed. */
++int
++drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
++{
++   struct drm_msm_gem_info req = {
++      .handle = 0,
++      .info = MSM_INFO_IOS_IMPORT,
++      .value = (uint64_t)(uint32_t)surface,
++   };
++   IOSurfaceRef s;
++   int slot;
++
++   if (drmIoctl(fd, DRM_IOCTL_MSM_GEM_INFO, &req))
++      return -errno;
++
++   s = IOSurfaceLookup((IOSurfaceID)surface);
++   pthread_mutex_lock(&ios_imports_lock);
++   slot = ios_import_slot(req.handle);
++   if (slot >= 0) {
++      ios_imports[slot].handle = req.handle;
++      ios_imports[slot].surface = s;
++      ios_imports[slot].size = s != NULL ? (uint32_t)IOSurfaceGetAllocSize(s) : 0;
++   } else {
++      /* no slot: the buffer exists, but nothing here can be answered about it */
++      drm_msm_ios_surface_unref(s);
++   }
++   pthread_mutex_unlock(&ios_imports_lock);
++
++   *handle = req.handle;
++   return 0;
++}
++
++uint32_t
++drm_msm_ios_surface_size(int fd, uint32_t handle)
++{
++   uint32_t size = 0;
++   (void)fd;
++   pthread_mutex_lock(&ios_imports_lock);
++   int i = ios_import_slot(handle);
++   if (i >= 0 && ios_imports[i].handle == handle)
++      size = ios_imports[i].size;
++   pthread_mutex_unlock(&ios_imports_lock);
++   return size;
++}
++
++void *
++drm_msm_ios_surface_base(uint32_t handle)
++{
++   void *base = NULL;
++   pthread_mutex_lock(&ios_imports_lock);
++   int i = ios_import_slot(handle);
++   if (i >= 0 && ios_imports[i].handle == handle && ios_imports[i].surface != NULL)
++      base = IOSurfaceGetBaseAddress(ios_imports[i].surface);
++   pthread_mutex_unlock(&ios_imports_lock);
++   return base != NULL ? base : MAP_FAILED;
++}
++
++void
++drm_msm_ios_surface_release(uint32_t handle)
++{
++   pthread_mutex_lock(&ios_imports_lock);
++   int i = ios_import_slot(handle);
++   if (i >= 0 && ios_imports[i].handle == handle) {
++      drm_msm_ios_surface_unref(ios_imports[i].surface);
++      ios_imports[i].surface = NULL;
++      ios_imports[i].handle = 0;
++      ios_imports[i].size = 0;
++   }
++   pthread_mutex_unlock(&ios_imports_lock);
++}
++
++/* Export: an imported buffer answers with its surface again; a buffer of Mesa's own has no
++ * descriptor to give (nothing here hands memory to another process -- the window server takes
++ * IOSurfaces, and those are its own). */
++int
++drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
++{
++   int surface = -1;
++   (void)fd;
++   (void)flags;
++   pthread_mutex_lock(&ios_imports_lock);
++   for (int i = 0; i < IOS_MAX_IMPORTS; i++) {
++      if (ios_imports[i].surface != NULL && ios_imports[i].handle == handle) {
++         surface = IOSurfaceGetID(ios_imports[i].surface);
++         break;
++      }
++   }
++   pthread_mutex_unlock(&ios_imports_lock);
++   if (surface < 0) {
++      errno = ENOSYS;
++      return -1;
++   }
++   *prime_fd = surface;
++   return 0;
++}
++
++/* ---- the buffer's memory, mapped by the kernel ----------------------------------------- */
++
++void *
++drm_msm_ios_mmap(int fd, uint32_t handle)
++{
++   struct drm_msm_gem_info req = {
++      .handle = handle,
++      .info = MSM_INFO_IOS_MMAP,
++   };
++
++   if (drmIoctl(fd, DRM_IOCTL_MSM_GEM_INFO, &req) || req.value == 0)
++      return MAP_FAILED;
++   return (void *)(uintptr_t)req.value;
++}
++
++void
++drm_msm_ios_munmap(void *address, size_t size)
++{
++   if (address == NULL || address == MAP_FAILED)
++      return;
++   size = (size + IOS_PAGE - 1u) & ~(size_t)(IOS_PAGE - 1u);
++   mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)address,
++                      (mach_vm_size_t)size);
++}
++
++/* ---- buffers and fences as file descriptors: none -------------------------------------- */
++
++static int
++none(void)
++{
++   errno = ENOSYS;
++   return -1;
++}
++
++#define NONE(name, ...)                                                        \
++   int name(__VA_ARGS__) { return none(); }
++
++NONE(drmSyncobjCreate, int fd, uint32_t flags, uint32_t *handle)
++NONE(drmSyncobjDestroy, int fd, uint32_t handle)
++NONE(drmSyncobjReset, int fd, const uint32_t *handles, uint32_t count)
++NONE(drmSyncobjFDToHandle, int fd, int obj_fd, uint32_t *handle)
++NONE(drmSyncobjHandleToFD, int fd, uint32_t handle, int *obj_fd)
++NONE(drmSyncobjImportSyncFile, int fd, uint32_t handle, int sync_file_fd)
++NONE(drmSyncobjExportSyncFile, int fd, uint32_t handle, int *sync_file_fd)

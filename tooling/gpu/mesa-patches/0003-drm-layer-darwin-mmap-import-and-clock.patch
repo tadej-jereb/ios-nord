@@ -1,0 +1,198 @@
+From: lane 3 <lane3@ios-nord>
+Subject: [PATCH] freedreno/drm: map buffers through the kernel, import IOSurfaces, wait on the right clock
+
+
+XNU does not route mmap() on a character device to the driver's d_mmap() usefully, so msm's
+.map calls GEM_INFO/MSM_INFO_IOS_MMAP and the returned address is unmapped by the same
+process when the buffer goes (fd_bo.map_owned; a suballocated buffer's map is its block's
+and an imported one the surface's, so neither is taken away).
+
+An import hands in an IOSurface ID where a descriptor would be, so its size cannot come from
+lseek(); it is the surface's allocation, and the buffer notes that its memory is a surface's
+so the surface is released with it.
+
+The wait timeouts are made of CLOCK_MONOTONIC, but the kernel reads them against
+mach_continuous_time(): on Darwin that is CLOCK_MONOTONIC_RAW, and a time made of one clock
+and read in the other is long past, so nothing is waited for at all.
+
+---
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -214,6 +214,10 @@
+    uint32_t alloc_flags; /* flags that control allocation/mapping, ie. FD_BO_x */
+    uint64_t iova;
+    void *map;
++   /* the mapping is this process's, made for this buffer, to be taken away when it goes -- not
++    * the block's a suballocated buffer sits in, nor the surface's one an imported buffer is (Darwin)
++    */
++   bool map_owned;
+    const struct fd_bo_funcs *funcs;
+ 
+    enum {
+
+--- a/src/freedreno/drm/freedreno_priv.h
++++ b/src/freedreno/drm/freedreno_priv.h
+@@ -37,6 +37,14 @@
+ #include "freedreno_rd_output.h"
+ #include "freedreno_ringbuffer.h"
+ 
++#ifdef __APPLE__
++/* Nothing here is a file descriptor, and an IOSurface is not one either; freedreno hands one in
++ * where a buffer's descriptor would be, and the two below are what the drm layer asks of an
++ * import that came back (both in msm/msm_bo.c). */
++uint32_t fd_msm_surface_size(struct fd_device *dev, uint32_t handle);
++void fd_msm_surface_attach(struct fd_bo *bo);
++#endif
++
+ extern simple_mtx_t table_lock;
+ extern simple_mtx_t fence_lock;
+ extern uint64_t os_page_size;
+
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -245,11 +245,20 @@
+    if (bo)
+       goto out_unlock;
+ 
++#if defined(__APPLE__)
++   /* what came in is an IOSurface, and the "file descriptor" its ID: no lseek on one */
++   size = fd_msm_surface_size(dev, handle);
++#else
+    /* lseek() to get bo size */
+    size = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_CUR);
++#endif
+ 
+    bo = import_bo_from_handle(dev, size, handle);
++#if defined(__APPLE__)
++   if (bo)
++      fd_msm_surface_attach(bo);
++#endif
+ 
+    VG_BO_ALLOC(bo);
+ 
+@@ -473,8 +482,16 @@
+ 
+    fd_bo_fini_fences(bo);
+ 
+-   if (bo->map)
++   if (bo->map) {
++#if defined(__APPLE__)
++      /* (a suballocated buffer's map is its block's, an imported one its surface's: neither is
++       * this process's to take away) */
++      if (bo->map_owned)
++         drm_msm_ios_munmap(bo->map, bo->size);
++#else
+       os_munmap(bo->map, bo->size);
++#endif
++   }
+ 
+    if (handle) {
+       simple_mtx_lock(&table_lock);
+
+--- a/src/freedreno/drm/msm/msm_priv.h
++++ b/src/freedreno/drm/msm/msm_priv.h
+@@ -52,6 +52,11 @@
+ struct msm_bo {
+    struct fd_bo base;
+    uint64_t offset;
++#ifdef __APPLE__
++   /* the memory is an IOSurface's, imported (MSM_INFO_IOS_IMPORT): the CPU side of it is the
++    * surface's own mapping, and the kernel keeps the surface until the buffer is closed */
++   bool from_surface;
++#endif
+ };
+ FD_DEFINE_CAST(fd_bo, msm_bo);
+ 
+@@ -176,7 +181,15 @@
+    if (ns == OS_TIMEOUT_INFINITE)
+       ns = 3600ULL * NSEC_PER_SEC; /* 1 hour timeout is almost infinite */
+ 
++#ifdef __APPLE__
++   /* The kernel goes by mach_continuous_time() (drm_ms_until(), 0126): the clock that runs on
++    * while the machine sleeps, which on Darwin is CLOCK_MONOTONIC_RAW. CLOCK_MONOTONIC is
++    * another clock there (the date less the date the system says it started); a time made of
++    * one and read in the other is long past, and nothing is waited for at all. */
++   clock_gettime(CLOCK_MONOTONIC_RAW, &t);
++#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
++#endif
+    tv->tv_sec = t.tv_sec + ns / NSEC_PER_SEC;
+    tv->tv_nsec = t.tv_nsec + ns % NSEC_PER_SEC;
+    if (tv->tv_nsec >= NSEC_PER_SEC) { /* handle nsec overflow */
+
+--- a/src/freedreno/drm/msm/msm_bo.c
++++ b/src/freedreno/drm/msm/msm_bo.c
+@@ -154,9 +154,62 @@
+    return ret;
+ }
+ 
++/*
++ * The buffer's memory in this process. XNU does not route mmap() on a character device to the
++ * driver's d_mmap() usefully, so the kernel maps it instead (GEM_INFO, MSM_INFO_IOS_MMAP, 0x80:
++ * write-combined into this task, address back), and this process takes the mapping away when
++ * the buffer goes -- hence map_owned. A buffer imported from an IOSurface is the exception: its
++ * memory is the surface's own mapping, which the kernel and the shim keep, so mmap() on one of
++ * those is left to fail rather than map the surface twice.
++ */
++static void *
++msm_bo_map(struct fd_bo *bo)
++{
++#ifdef __APPLE__
++   void *p;
++
++   if (to_msm_bo(bo)->from_surface)
++      return drm_msm_ios_surface_base(bo->handle);
++
++   p = drm_msm_ios_mmap(bo->dev->fd, bo->handle);
++   if (p != MAP_FAILED)
++      bo->map_owned = true;
++   return p;
++#else
++   return fd_bo_map_os_mmap(bo);
++#endif
++}
++
++static void
++msm_bo_destroy(struct fd_bo *bo)
++{
++#ifdef __APPLE__
++   if (to_msm_bo(bo)->from_surface)
++      drm_msm_ios_surface_release(bo->handle);
++#endif
++   fd_bo_fini_common(bo);
++}
++
++#ifdef __APPLE__
++/* An IOSurface import of freedreno_bo.c: what the buffer's size is (the kernel took the
++ * surface's whole allocation), and the note that the buffer's memory is a surface's -- which
++ * must be given up with the buffer. */
++uint32_t
++fd_msm_surface_size(struct fd_device *dev, uint32_t handle)
++{
++   return drm_msm_ios_surface_size(dev->fd, handle);
++}
++
++void
++fd_msm_surface_attach(struct fd_bo *bo)
++{
++   to_msm_bo(bo)->from_surface = true;
++}
++#endif
++
+ static const struct fd_bo_funcs funcs = {
+    .offset = msm_bo_offset,
+-   .map = fd_bo_map_os_mmap,
++   .map = msm_bo_map,
+    .cpu_prep = msm_bo_cpu_prep,
+    .madvise = msm_bo_madvise,
+    .iova = msm_bo_iova,
+@@ -164,7 +217,7 @@
+    .set_metadata = msm_bo_set_metadata,
+    .get_metadata = msm_bo_get_metadata,
+    .dmabuf = fd_bo_dmabuf_drm,
+-   .destroy = fd_bo_fini_common,
++   .destroy = msm_bo_destroy,
+ };
+ 
+ /* allocate a buffer handle: */
