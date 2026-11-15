@@ -16,6 +16,9 @@ int sweet_objc_load(struct objc_api *o)
     LOAD(method, "class_getInstanceMethod");
     LOAD(implementation, "method_getImplementation");
     LOAD(send, "objc_msgSend");
+    LOAD(metaClass, "objc_getMetaClass");
+    LOAD(retain, "objc_retain");
+    LOAD(release, "objc_release");
 #undef LOAD
     return 1;
 }

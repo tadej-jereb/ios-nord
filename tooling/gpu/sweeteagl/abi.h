@@ -62,6 +62,9 @@ struct objc_api {
     Method (*method)(Class, SEL);
     IMP (*implementation)(Method);
     void (*send)(void);
+    Class (*metaClass)(const char *);
+    id (*retain)(id);
+    void (*release)(id);
 };
 int sweet_objc_load(struct objc_api *);
 #endif

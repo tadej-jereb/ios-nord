@@ -11,6 +11,7 @@
 #include <stdarg.h>
 
 #include <limits.h>
+#include <pthread.h>
 
 static struct objc_api objc;
 static Class eagl_class;
@@ -422,6 +423,43 @@ static void dealloc_context(id self, SEL cmd)
     ((void (*)(id, SEL))super_dealloc)(self, cmd);
 }
 
+/*
+ * +setCurrentContext: / +currentContext. Apple's (OpenGLES 0x1d3f517ec) stores _private with
+ * _eagl_ctx_tls_set: pthread_setspecific(30, priv) -- the static slot TPIDRRO_EL0+0xf0 that the
+ * gl* stubs read (E §2) -- and then on a key that only _eagl_init creates (pthread_once ->
+ * pthread_key_create, 0x1d3f52488 / 0x1d3f52760). _eagl_init runs inside Apple's
+ * initWithAPI:, which this shim replaces, so that key is never made and setCurrentContext:
+ * returns NO (seen on the phone, logs/phone/eagltest-1.txt). Own both class methods:
+ * same static slot, own key for the object, retain new / release old as Apple does.
+ */
+#define SWEET_OPENGL_TSD_SLOT 30 /* 0xf0 / 8 */
+static pthread_key_t current_key;
+static pthread_once_t current_once = PTHREAD_ONCE_INIT;
+static void current_key_make(void) { (void)pthread_key_create(&current_key, NULL); }
+static id current_context(id cls, SEL cmd)
+{
+    (void)cls; (void)cmd;
+    pthread_once(&current_once, current_key_make);
+    return (id)pthread_getspecific(current_key);
+}
+static BOOL set_current_context(id cls, SEL cmd, id ctx)
+{
+    method_entry(cmd);
+    id old = current_context(cls, cmd);
+    if (ctx == old) return true;
+    void *priv = ctx ? objc.getIvar(ctx, private_ivar) : NULL;
+    if (ctx && !priv) return false;
+    if (pthread_setspecific(SWEET_OPENGL_TSD_SLOT, priv) || pthread_setspecific(current_key, ctx))
+        return false;
+    if (ctx) {
+        objc.retain(ctx);
+        struct sweet_context *e = context(ctx);
+        if (e) (void)sweet_enter(e, 0);
+    }
+    if (old) objc.release(old);
+    return true;
+}
+
 int sweeteagl_install(void)
 {
     if (installed) return 1;
@@ -467,6 +505,10 @@ int sweeteagl_install(void)
     };
     for (unsigned i = 0; i < sizeof(methods)/sizeof(methods[0]); ++i)
         objc.replace(eagl_class, objc.selector(methods[i].name), methods[i].imp, methods[i].encoding);
-    installed = 1; event(12, "SweetEAGL installed (8 methods)"); return 1;
+    Class meta = objc.metaClass("EAGLContext");
+    if (!meta) { event(13, "FAIL EAGLContext metaclass"); return 0; }
+    objc.replace(meta, objc.selector("setCurrentContext:"), (IMP)set_current_context, "B24@0:8@16");
+    objc.replace(meta, objc.selector("currentContext"), (IMP)current_context, "@16@0:8");
+    installed = 1; event(12, "SweetEAGL installed (8 methods + 2 class methods)"); return 1;
 }
 __attribute__((constructor)) static void install_constructor(void) { (void)sweeteagl_install(); }
