@@ -600,3 +600,12 @@ aa48fd0e8ee81192853b15fc2639662818b783723450b1a92da414c12959eab7  SweetGLES.bund
 ```
 update 2026-11-15T19:49:45Z: SweetEAGL.dylib e0d0b05928b9051a6b37d89f03822d51605a0e80729f807cccd137968831f69a (reject logging)
 update 2026-11-15T19:52:43Z: bundle moved out to /var/root/gpu/SweetGLES.bundle.off (black screen: render target b3a8 rejected); CPU renderer restored
+update 2026-11-15T20:00:01Z: bundle moved back into /System/Library/Extensions (user OK) to test CAEnableDeepFramebuffer=false
+update 2026-11-15T20:03:44Z: SweetEAGL.dylib 528687e8242dd0788c664c2159658438d4d1232130e527546bf97577be744e44 (all texImageIOSurface formats, seed-based refresh)
+update 2026-11-15T20:14:22Z: Mesa 0008 (IOSurface import of A008/L008/LA08/RGhA/w30r) + SweetEAGL import-first
+```
+aa48fd0e8ee81192853b15fc2639662818b783723450b1a92da414c12959eab7  SweetGLES.bundle/SweetGLES
+b992022ded214bd282aee65eaa5b4f2f66eee6bb3fb0e179df22294c561f8671  SweetGLES.bundle/SweetEAGL.dylib
+3c94faa573adc02df2fa0dfec86d1022e806f1b5ae30ffbf81180316719b4432  SweetGLES.bundle/libOSMesa.8.dylib
+3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
+```

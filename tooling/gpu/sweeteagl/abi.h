@@ -39,6 +39,7 @@ extern size_t IOSurfaceGetHeight(IOSurfaceRef);
 extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);
 extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef);
 extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef);
+extern uint32_t IOSurfaceGetSeed(IOSurfaceRef);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
 extern int IOSurfaceLock(IOSurfaceRef, uint32_t, uint32_t *);
 extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t, uint32_t *);

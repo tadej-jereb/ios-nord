@@ -1,0 +1,62 @@
+Mesa 0008: IOSurface import of the formats backboardd uses (A008, L008, LA08, RGhA, w30r), not only BGRA.
+The window server samples glyph masks and gradients from IOSurfaces that its CPU side keeps
+writing; copies go stale (IOSurface seeds do not change on CPU writes here), so they must be
+imported zero-copy like the render target. Formats the GPU cannot render to are imported
+sampler-only.
+
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -74,11 +74,32 @@ osmesa_create_screen(void);
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
+ 
++/*
++ * IOSurface pixel formats (four-character codes) the window server samples or draws into, and
++ * the gallium format of the same bytes. Seen from backboardd on the phone: 'BGRA' render targets
++ * and images, 'A008' glyph masks, 'LA08' masks, 'RGhA' half-float gradients, 'w30r' full-screen
++ * intermediates (drawn and read back only by the GPU, so the 10-bit packing only has to be
++ * consistent). Anything else: no import, the caller copies.
++ */
++static enum pipe_format
++osmesa_surface_format(uint32_t fourcc, uint32_t *bpp)
++{
++   switch (fourcc) {
++   case 0x42475241: /* 'BGRA' */ *bpp = 4; return PIPE_FORMAT_B8G8R8A8_UNORM;
++   case 0x41303038: /* 'A008' */ *bpp = 1; return PIPE_FORMAT_A8_UNORM;
++   case 0x4c303038: /* 'L008' */ *bpp = 1; return PIPE_FORMAT_L8_UNORM;
++   case 0x4c413038: /* 'LA08' */ *bpp = 2; return PIPE_FORMAT_L8A8_UNORM;
++   case 0x52476841: /* 'RGhA' */ *bpp = 8; return PIPE_FORMAT_R16G16B16A16_FLOAT;
++   case 0x77333072: /* 'w30r' */ *bpp = 4; return PIPE_FORMAT_B10G10R10A2_UNORM;
++   default: *bpp = 0; return PIPE_FORMAT_NONE;
++   }
++}
++
+ /*
+  * The memory of an IOSurface as a texture to draw with and into (Darwin): the kernel's GPU
+  * driver makes a buffer of the surface, and the surface comes in as Linux's buffers come in, by
+  * a "descriptor" that is its ID. NULL: the screen is not the GPU's, or the surface is not one
+- * plane of 32-bit pixels, blue first, in rows the GPU can address.
++ * plane of a format above, in rows the GPU can address.
+  */
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+@@ -94,10 +115,18 @@ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+    };
+    struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
+ 
++   uint32_t bpp;
++
+    if (gpu_fd < 0 || drm_msm_ios_surface_info((int)surface, &s) != 0)
+       return NULL;
+-   if (s.format != 0x42475241 /* 'BGRA' */ || s.pitch < s.width * 4u)
++   templ.format = osmesa_surface_format(s.format, &bpp);
++   if (templ.format == PIPE_FORMAT_NONE || s.pitch < s.width * bpp ||
++       !screen->is_format_supported(screen, templ.format, PIPE_TEXTURE_2D, 0, 0,
++                                    PIPE_BIND_SAMPLER_VIEW))
+       return NULL;
++   if (!screen->is_format_supported(screen, templ.format, PIPE_TEXTURE_2D, 0, 0,
++                                    PIPE_BIND_RENDER_TARGET))
++      templ.bind = PIPE_BIND_SAMPLER_VIEW;
+    templ.width0 = s.width;
+    templ.height0 = s.height;
+    /* the kernel imports the surface's pages whole, from page 0: offset 0 */

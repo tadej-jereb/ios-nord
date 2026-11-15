@@ -107,6 +107,12 @@ struct image {
     GLuint texture;
     GLsizei width, height;
     bool copy, dirty, invert;
+    /* What QuartzCore asked for (texImageIOSurface:) and what the copy path passes to Mesa.
+     * bgra: 4-byte BGRA, the only kind that is imported zero-copy or written back. */
+    bool bgra;
+    GLenum internal, format, type;
+    unsigned bpp;
+    uint32_t seed;
 };
 /* Isolate transfers from CA's pixel-store and PBO state. Row padding is copied
  * explicitly, so even a stride not divisible by four is safe (E §§5/10). */
@@ -135,7 +141,7 @@ static void pixel_end(const struct pixel_state *s, bool pack)
 }
 static int upload(struct image *im, bool allocate)
 {
-    size_t row = (size_t)im->width * 4, total = row * (size_t)im->height;
+    size_t row = (size_t)im->width * im->bpp, total = row * (size_t)im->height;
     unsigned char *buf = malloc(total);
     if (!buf) return 0;
     if (IOSurfaceLock(im->surface, SWEET_SURFACE_READONLY, NULL)) { free(buf); return 0; }
@@ -144,13 +150,14 @@ static int upload(struct image *im, bool allocate)
     if (!base) { IOSurfaceUnlock(im->surface, SWEET_SURFACE_READONLY, NULL); free(buf); return 0; }
     for (int y = 0; y < im->height; ++y)
         memcpy(buf + row*y, base + stride*(im->invert ? im->height-1-y : y), row);
+    im->seed = IOSurfaceGetSeed(im->surface);
     IOSurfaceUnlock(im->surface, SWEET_SURFACE_READONLY, NULL);
     struct pixel_state saved;
     pixel_begin(&saved, false);
     if (allocate)
-        p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, im->width, im->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, buf);
+        p_glTexImage2D(GL_TEXTURE_2D, 0, (GLint)im->internal, im->width, im->height, 0, im->format, im->type, buf);
     else
-        p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, im->width, im->height, GL_BGRA, GL_UNSIGNED_BYTE, buf);
+        p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, im->width, im->height, im->format, im->type, buf);
     pixel_end(&saved, false);
     free(buf);
     return p_glGetError() == GL_NO_ERROR;
@@ -161,7 +168,7 @@ static int upload(struct image *im, bool allocate)
 void sweet_writeback(struct sweet_context *e)
 {
     for (struct image *im = e->images; im; im = im->next) {
-        if (!im->copy || !im->dirty) continue;
+        if (!im->copy || !im->dirty || !im->bgra) continue;
         size_t row = (size_t)im->width * 4;
         unsigned char *buf = malloc(row * (size_t)im->height);
         if (!buf) { event(1, "FAIL writeback allocation"); continue; }
@@ -210,11 +217,13 @@ void sweet_before_draw(struct sweet_context *e)
     p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
     for (struct image *im = e->images; im; im = im->next) {
         if (!im->copy) continue;
-        if (!im->dirty) {
+        /* Re-upload only when the CPU changed the surface since the last copy. */
+        if (!im->dirty && IOSurfaceGetSeed(im->surface) != im->seed) {
+            event(15, "surface CPU refresh on seed change");
             p_glBindTexture(GL_TEXTURE_2D, im->texture);
             if (!upload(im, false)) { event(3, "FAIL CPU refresh"); reject("refresh-upload", im->surface, im->texture, im->invert, p_glGetError()); }
         }
-        if (im->texture == (GLuint)texture) im->dirty = true;
+        if (im->bgra && im->texture == (GLuint)texture) im->dirty = true;
     }
     p_glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 }
@@ -391,14 +400,41 @@ static void reject(const char *why, IOSurfaceRef s, unsigned long a, unsigned lo
              IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerElement(s),
              IOSurfaceGetBytesPerRow(s), IOSurfaceGetPlaneCount(s), a, b, c);
 }
-static BOOL attach(struct sweet_context *e, unsigned long target, IOSurfaceRef s, BOOL invert)
+/* Bytes per pixel of a client (format, type) pair, 0 if unknown. */
+static unsigned pixel_bytes(GLenum format, GLenum type)
+{
+    unsigned n;
+    switch (format) {
+    case GL_ALPHA: case GL_LUMINANCE: case GL_RED: n = 1; break;
+    case GL_LUMINANCE_ALPHA: case GL_RG: n = 2; break;
+    case GL_RGB: n = 3; break;
+    case GL_RGBA: case GL_BGRA: n = 4; break;
+    default: return 0;
+    }
+    switch (type) {
+    case GL_UNSIGNED_BYTE: return n;
+    case GL_HALF_FLOAT: case 0x8D61 /* GL_HALF_FLOAT_OES */: case GL_UNSIGNED_SHORT: return 2 * n;
+    case GL_FLOAT: return 4 * n;
+    default: return 0;
+    }
+}
+struct fmt_desc { GLenum internal, format, type; };
+static const struct fmt_desc bgra_desc = { GL_RGBA8, GL_BGRA, GL_UNSIGNED_BYTE };
+
+static BOOL attach(struct sweet_context *e, unsigned long target, IOSurfaceRef s, BOOL invert,
+                   const struct fmt_desc *d)
 {
     if (!e || !s || target != GL_TEXTURE_2D || !sweet_enter(e, 0)) { reject("attach-target", s, target, 0, 0); return false; }
     uint32_t fmt = IOSurfaceGetPixelFormat(s);
     size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s);
-    if ((fmt != SWEET_BGRA && fmt != 0) || IOSurfaceGetBytesPerElement(s) != 4 ||
+    bool bgra = d->format == GL_BGRA && d->type == GL_UNSIGNED_BYTE;
+    unsigned bpp = pixel_bytes(d->format, d->type);
+    /* A BGRA copy of a surface in another 32-bit format would be wrong; such surfaces ('w30r')
+     * are only usable through the zero-copy import, where Mesa picks the format (patch 0008). */
+    bool copyable = !bgra || fmt == SWEET_BGRA || fmt == 0;
+    if (!bpp || IOSurfaceGetBytesPerElement(s) != bpp ||
         IOSurfaceGetPlaneCount(s) || !w || !h || w > INT_MAX || h > INT_MAX ||
-        w > SIZE_MAX/4/h || IOSurfaceGetBytesPerRow(s) < w*4) { reject("attach-format", s, target, invert, 0); return false; }
+        w > SIZE_MAX/bpp/h || IOSurfaceGetBytesPerRow(s) < w*bpp) { reject("attach-format", s, d->internal, d->format, d->type); return false; }
     GLint tex;
     p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
     if (!tex) { reject("attach-no-texture", s, 0, 0, 0); return false; }
@@ -409,31 +445,42 @@ static BOOL attach(struct sweet_context *e, unsigned long target, IOSurfaceRef s
     if (!im) return false;
     im->surface = (IOSurfaceRef)CFRetain(s); im->texture = texture;
     im->width = (GLsizei)w; im->height = (GLsizei)h; im->invert = invert;
+    im->bgra = bgra; im->bpp = bpp; im->format = d->format; im->type = d->type;
+    /* Apple's GL_BGRA internal token means BGRA8; Mesa's ES takes GL_RGBA8 + GL_BGRA (eagltest --cpu). */
+    im->internal = bgra ? GL_RGBA8 : d->internal;
     const char *cpu = getenv("SWEETEAGL_CPU");
-    im->copy = (cpu && !strcmp(cpu, "1")) || invert || fmt == 0 || !p_glEGLImageTargetTexture2DOES;
+    /* Import every surface Mesa can take (patch 0008: BGRA, A8, L8, LA88, RGBA16F, w30r), so the
+     * GPU reads the surface's own memory and sees every CPU update; IOSurface seeds do not change
+     * on CPU writes here (lock/unlock never enter the kernel), so copies go stale. */
+    im->copy = (cpu && !strcmp(cpu, "1")) || invert || !p_glEGLImageTargetTexture2DOES;
     if (!im->copy) {
         /* E §5 superseded by Mesa patch 0005: image is an IOSurface ID, no EGL. */
         for (unsigned i = 0; i < 32 && p_glGetError() != GL_NO_ERROR; ++i) {}
         p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void *)(uintptr_t)IOSurfaceGetID(s));
         im->copy = p_glGetError() != GL_NO_ERROR;
     }
-    if (im->copy && !upload(im, true)) { reject("attach-upload", s, invert, fmt, 0); CFRelease(s); free(im); return false; }
+    if (im->copy && !copyable) { reject("attach-not-importable", s, d->internal, d->format, d->type); CFRelease(s); free(im); return false; }
+    if (im->copy && !upload(im, true)) { reject("attach-upload", s, d->internal, d->format, d->type); CFRelease(s); free(im); return false; }
     event(im->copy ? 5 : 6, im->copy ? "surface CPU copy" : "surface IOSurface-ID import");
     im->next = e->images; e->images = im;
     return true;
 }
 static BOOL attach_image(id self, SEL cmd, unsigned long target, IOSurfaceRef s, BOOL invert)
 {
-    method_entry(cmd); return attach(context(self), target, s, invert);
+    method_entry(cmd); return attach(context(self), target, s, invert, &bgra_desc);
 }
 static BOOL tex_surface(id self, SEL cmd, IOSurfaceRef s, unsigned long target, unsigned long internal,
                         unsigned w, unsigned h, unsigned long fmt, unsigned long type, unsigned plane, BOOL invert)
 {
     method_entry(cmd);
-    if (!s || plane || w != IOSurfaceGetWidth(s) || h != IOSurfaceGetHeight(s) ||
-        (internal != GL_RGBA && internal != GL_RGBA8 && internal != GL_BGRA) ||
-        fmt != GL_BGRA || type != GL_UNSIGNED_BYTE) { reject("teximage-args", s, internal, fmt, type | (unsigned long)plane << 32); return false; } /* E §§3/5 */
-    return attach(context(self), target, s, invert);
+    if (!s || plane || w != IOSurfaceGetWidth(s) || h != IOSurfaceGetHeight(s)) {
+        reject("teximage-args", s, internal, fmt, type | (unsigned long)plane << 32); return false;
+    }
+    /* Any (internal, format, type) QuartzCore passes is copied with exactly that triple: seen on
+     * the phone A8 (GL_ALPHA), LA88 (GL_LUMINANCE_ALPHA), RGBA16F/GL_HALF_FLOAT, BGRA. */
+    struct fmt_desc d = { (GLenum)internal, (GLenum)fmt, (GLenum)type };
+    if (fmt == GL_BGRA && type == GL_UNSIGNED_BYTE) d = bgra_desc;
+    return attach(context(self), target, s, invert, &d);
 }
 static void dealloc_context(id self, SEL cmd)
 {
