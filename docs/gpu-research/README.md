@@ -272,3 +272,24 @@ statement of state is "builds a driver, never driven it".
    `SweetGLES.bundle` and a test binary per G stage 0, and run OSMesa `clear` + readback over SSH.
    That touches `GET_PARAM`, `GEM_NEW`, `SUBMIT`, `WAIT_FENCE` and `GEM_CLOSE` in one go. Only after
    it passes does G stage 1 (`sweetgles=1`, a throwaway `EAGLContext` process) become worth a boot.
+
+## Round 4 (main agent): why QuartzCore picks a 10-bit 'b3a8' framebuffer on the GL path
+
+First backboardd run on SweetGLES (`logs/phone/backboardd-gles-3.txt`): QuartzCore created an ES 3.2
+context on Mesa, then asked for its screen render target as `'b3a8'` (2 planes, 1125x2436, bpr 4544),
+which SweetEAGL rejects, so the panel went black. The CPU renderer swaps plain `'BGRA'`.
+
+* `IOMFBDisplay::framebuffer_pixel_format` (0x1882c5320) returns `'b3a8'` when bit 3 of
+  `Display+0x220` is set (0x1882c541c `tbnz w8,#3`), else tail-calls with `'BGRA'`.
+* Bit 3 is `supportsExtendedColors` (`-[CAWindowServerDisplay supportsExtendedColors]` 0x1884e700c,
+  `ubfx w0,w8,#3,#1`). `AppleDisplay::AppleDisplay` sets it (0x1883ad034, `orr #0x8`) iff the byte
+  written by `CADeviceUseCIF10`'s once-block is non-zero.
+* `___CADeviceUseCIF10_block_invoke` (0x188381f38):
+  `enable = MGGetBoolAnswer("Aixt/MEN2O2B7f+8m4TxUA")`; if true,
+  `CFPreferencesGetAppBooleanValue("CAEnableDeepFramebuffer", <current app>, &valid)` overrides it
+  when `valid`. CFString constants at 0x1d5b5f1c0 / 0x1d5b5f1e0.
+* Off switch, no binary change: `CAEnableDeepFramebuffer = false` in backboardd's domain
+  (`/var/mobile/Library/Preferences/com.apple.backboardd.plist`, owner mobile, 0600). Applied
+  2026-11-15; original kept at `logs/phone/prefs/com.apple.backboardd.orig.plist` and on the phone
+  at `/var/root/gpu/com.apple.backboardd.orig.plist`. Effect on the GL path: UNVERIFIED until the
+  bundle is reinstalled.
