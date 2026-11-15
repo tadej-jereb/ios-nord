@@ -1,0 +1,9 @@
+PASS generator: 0x00d0 is the full export list, excluded; E §4 repairs applied
+ae0edcf26632c17fbb0abe10edad6573cdf1b0809a18b2c655438bb6ec8376bc  /home/tadej/ios-nord/build/phone/gpu/SweetEAGL.dylib
+74154bb0a0fd9d09c123bc33ce850c9b52dd63681eba9efc6c7a0bf698af70c8  /home/tadej/ios-nord/build/phone/gpu/eagltest
+PASS coverage: 402 unique slots, all 58 QC offsets, glGetString 0x03b0 wrap
+PASS Mesa resolution: 323 direct names; 53 proc-address-only (proc-only.txt)
+INFO non-pass-through stub offsets: 0x0018, 0x00b8, 0x00c0, 0x0660, 0x0668, 0x0678, 0x0688, 0x0690, 0x0b00, 0x1fa0, 0x1fa8, 0x1fb0, 0x1fb8
+PASS SweetEAGL.dylib: arm64, signed, platform ios, minos 16.0, absolute dylibs, 30 undefined symbols in stubs
+PASS eagltest: arm64, signed, platform ios, minos 16.0, absolute dylibs, 25 undefined symbols in stubs
+PASS host checks (phone execution remains UNVERIFIED)
