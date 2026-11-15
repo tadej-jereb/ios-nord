@@ -12,6 +12,7 @@
 
 #include <limits.h>
 #include <pthread.h>
+#include <mach/mach_time.h>
 
 static struct objc_api objc;
 static Class eagl_class;
@@ -256,7 +257,29 @@ void sweet_frame_mark(struct sweet_context *e, unsigned offset)
         flush_finishes = access("/private/var/tmp/sweeteagl.flushonly", F_OK) != 0;
     if (__atomic_fetch_add(&marks, 1, __ATOMIC_RELAXED) < 60)
         log_line("frame-mark %#06x\n", offset);
-    if (offset == 0x2d8 && flush_finishes) p_glFinish();
+    if (offset != 0x2d8) { (void)e; return; }
+    /* Frame rate while frames flow: QuartzCore flushes once per frame. Intervals over 100 ms
+     * (idle between gestures) are left out. Every 120 frames: fps, mean frame interval, the
+     * slowest interval, and the mean time this thread waited for the GPU. */
+    static uint64_t last, active, waited, worst, frames;
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    uint64_t a = mach_absolute_time();
+    if (flush_finishes) p_glFinish();
+    uint64_t b = mach_absolute_time();
+    uint64_t gap = last ? b - last : 0;
+    last = b;
+    double gap_ms = (double)gap * tb.numer / tb.denom / 1e6;
+    if (!gap || gap_ms > 100.0) return;
+    active += gap; waited += b - a; frames++;
+    if (gap > worst) worst = gap;
+    if (frames == 120) {
+        double span = (double)active * tb.numer / tb.denom / 1e9;
+        log_line("fps %.1f active (%.1f ms/frame, worst %.1f ms), gpu wait %.2f ms/frame\n",
+                 frames / span, span * 1e3 / frames, (double)worst * tb.numer / tb.denom / 1e6,
+                 (double)waited * tb.numer / tb.denom / 1e6 / frames);
+        active = waited = worst = frames = 0;
+    }
     (void)e;
 }
 /* Offmap 0x0e80–0x0eb0: synchronous APPLE_fence compatibility. Waiting

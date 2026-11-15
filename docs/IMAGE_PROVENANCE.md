@@ -610,3 +610,11 @@ b992022ded214bd282aee65eaa5b4f2f66eee6bb3fb0e179df22294c561f8671  SweetGLES.bund
 3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
 ```
 update 2026-11-15T20:47:52Z: SweetEAGL.dylib a1708e336d5ec00092fdd634ab9f4c291e52c3215f32c12ae35a34d736b00756 (glFlush waits for GPU, frame-mark log)
+update 2026-11-15T20:52:38Z: fps counter + Mesa w30r->R10G10B10A2
+```
+aa48fd0e8ee81192853b15fc2639662818b783723450b1a92da414c12959eab7  SweetGLES.bundle/SweetGLES
+53c51106146eb7db20bc564715127ff008cc98c9fda6e7e0c2d55d2e2e47d3ae  SweetGLES.bundle/SweetEAGL.dylib
+5a2112de6c9477735c804d9302f68722e831dfff32a23592f2a3cda03de5a6cd  SweetGLES.bundle/libOSMesa.8.dylib
+3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
+```
+update 2026-11-15T20:54:55Z: SweetEAGL.dylib 37fcce490046e1532314a8c7968d2170189f6557d87d0229144a5b8186b3a325 (active fps counter)

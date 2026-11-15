@@ -26,7 +26,7 @@ sampler-only.
 +   case 0x4c303038: /* 'L008' */ *bpp = 1; return PIPE_FORMAT_L8_UNORM;
 +   case 0x4c413038: /* 'LA08' */ *bpp = 2; return PIPE_FORMAT_L8A8_UNORM;
 +   case 0x52476841: /* 'RGhA' */ *bpp = 8; return PIPE_FORMAT_R16G16B16A16_FLOAT;
-+   case 0x77333072: /* 'w30r' */ *bpp = 4; return PIPE_FORMAT_B10G10R10A2_UNORM;
++   case 0x77333072: /* 'w30r' */ *bpp = 4; return PIPE_FORMAT_R10G10B10A2_UNORM;
 +   default: *bpp = 0; return PIPE_FORMAT_NONE;
 +   }
 +}
