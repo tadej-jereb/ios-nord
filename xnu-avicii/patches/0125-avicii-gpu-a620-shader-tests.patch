@@ -1,0 +1,301 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -20,6 +20,7 @@
+  *   9  + (layer 3, gpu_core_start) the 3D core's memory in SMMU context 0, the zap shader through
+  *      TrustZone, the vendor's a6xx_start registers for the a620, the SQE (a650_sqe.fw) started,
+  *      ME_INIT, out of secure mode, CP_MEM_WRITE + CACHE_FLUSH_TS to our memory.
++ *  10  + (layer 4, gpu_shader_tests) a compute shader's store and a triangle drawn to memory, read back.
+  *
+  * Firmware is not in git: tooling/71-phone-image.sh passes src/gpu-fw to mkpayload.py --fw,
+  * which puts a650_gmu.bin, a650_sqe.fw and the a620_zap pieces into the ADT's /sweet-fw.
+@@ -1552,6 +1553,268 @@ gpu_core_start(void)
+ 	return scratch[0] == 0x600dc0deu && scratch[2] == 0x12345678u ? 0 : -8;
+ }
+ 
++/* ============================== stage 10: shaders run ============================== */
++/*
++ * Port of raphael-ios-gpu 0110 (itself davinci's stages N and O): a compute kernel storing 0xDEADBEEF to an
++ * address given as a constant, and a red triangle drawn straight into a 256x256 RGBA8 buffer (no GMEM), read
++ * back by the CPU. The A620's own values (Mesa 25.0.7 src/freedreno/common/freedreno_devices.py GPUId(620)):
++ * magic_regs PC_POWER_CNTL 0, TPL1_DBG_ECO_CNTL 0x01008000, SP_CHICKEN_BITS 0x400, SP_DBG_ECO_CNTL
++ * 0x01000000, RB_UNKNOWN_8E01 0 (the A640's: 1, 0x8000, 0x420, 0, 1); num_ccu 1, so for sysmem the colour
++ * cache sits after one 64K depth cache (fd6_screen.cc): RB_CCU_CNTL COLOR_OFFSET [31:23] = 64K >> 12 =
++ * 0x08000000 (the A640's two CCUs: 0x10000000).
++ */
++#define TEST_SHADERS              0x01300000u     /* cs +0, vs +0x1000, fs +0x2000 */
++#define TEST_VBO                  0x01400000u
++#define TEST_TARGET               0x02000000u
++#define TEST_TARGET_SIZE          0x40000u        /* 256 x 256 x 4 */
++#define CP_EXEC_CS                51u
++#define CP_LOAD_STATE6_GEOM       0x32u
++#define CP_LOAD_STATE6_FRAG       0x34u
++#define CP_DRAW_INDX_OFFSET       0x38u
++#define CP_SET_MARKER             0x65u
++#define CP_SKIP_IB2_ENABLE_GLOBAL 0x1du
++#define CP_SKIP_IB2_ENABLE_LOCAL  0x23u
++#define CP_SET_VISIBILITY_OVERRIDE 0x64u
++#define EVENT_PC_CCU_FLUSH_COLOR_TS 0x1du
++
++static struct gmu_block g_test_sh, g_test_vbo, g_test_rt;
++
++/* A type-4 packet: `count` registers from `reg` on, the values follow. */
++static void
++ring_regs(uint32_t reg, uint32_t count)
++{
++	ring_put(4u << 28 | count | odd_parity(count) << 7 | reg << 8 | odd_parity(reg) << 27);
++}
++
++static void
++ring_reg(uint32_t reg, uint32_t value)
++{
++	ring_regs(reg, 1);
++	ring_put(value);
++}
++
++/* Tables changed under a live context: out to memory, the context's TLB entries dropped. */
++static void
++core_tlb_flush(void)
++{
++	uint32_t cb = SMMU_CB(CORE_CONTEXT);
++	for (unsigned i = 0; i < g_gmu_ntables; i++) {
++		gpu_to_memory((vm_offset_t)g_gmu_tables[i].va, 4096);
++	}
++	gpu_wr(g_smmu, cb + SMMU_CB_TLBIASID, CORE_CONTEXT);
++	gpu_wr(g_smmu, cb + SMMU_CB_TLBSYNC, 1);
++	for (unsigned polls = 0; polls < 1000u && (gpu_rd(g_smmu, cb + SMMU_CB_TLBSTATUS) & 1u); polls++) {
++		delay_for_interval(1, NSEC_PER_USEC);
++	}
++}
++
++static int
++gpu_shader_tests(void)
++{
++	/* ir3, {low, high} per instruction, padded to 16 (davinci's, from Mesa computerator and the ir3 ISA) */
++	static const uint32_t cs_bin[32] = {
++		0x00000000u, 0x202cc000u,  /* mov.u32u32 r0.x, c0.x */
++		0x00000001u, 0x202cc001u,  /* mov.u32u32 r0.y, c0.y */
++		0xdeadbeefu, 0x204cc004u,  /* mov.u32u32 r1.x, 0xdeadbeef */
++		0x00000000u, 0x00000500u,  /* (rpt5)nop */
++		0x01800008u, 0xc0c60100u,  /* stg.u32 g[r0.x], r1.x, 1 */
++		0x00000000u, 0x03000000u,  /* end */
++	};
++	static const uint32_t vs_bin[32] = {
++		0x00000000u, 0x20044b00u,  /* (rpt3)mov.f32f32 r0.x, (r)r0.x */
++		0x00000000u, 0x03000000u,  /* end */
++	};
++	static const uint32_t fs_bin[32] = {
++		0x3f800000u, 0x20444000u,  /* mov.f32f32 r0.x, 1.0 */
++		0x00000000u, 0x20444001u,  /* mov.f32f32 r0.y, 0.0 */
++		0x00000000u, 0x20444002u,  /* mov.f32f32 r0.z, 0.0 */
++		0x3f800000u, 0x20444003u,  /* mov.f32f32 r0.w, 1.0 */
++		0x00000000u, 0x03000000u,  /* end */
++	};
++	static const uint32_t vbo_data[12] = {
++		0x00000000u, 0x3f19999au, 0x00000000u, 0x3f800000u,  /* ( 0.0,  0.6, 0, 1) */
++		0xbf19999au, 0xbf19999au, 0x00000000u, 0x3f800000u,  /* (-0.6, -0.6, 0, 1) */
++		0x3f19999au, 0xbf19999au, 0x00000000u, 0x3f800000u,  /* ( 0.6, -0.6, 0, 1) */
++	};
++	static const uint32_t draw_regs[][2] = {
++		/* the a620's "magic" (Mesa GPUId(620)) */
++		{0x9804u,0x1fu},{0x9805u,0u},{0xb600u,0x01008000u},{0x8600u,0u},{0xae03u,0x400u},{0xae00u,0x01000000u},
++		{0x8e04u,0x04100000u},{0xbe04u,0u},{0x8e01u,0u},{0x9600u,0x02000000u},{0x0e12u,1u},
++		/* bypass bin size = BUFFERS_IN_SYSMEM << 22 */
++		{0x80a1u,0x00c00000u},{0x8800u,0x00c00000u},{0x88d3u,0u},{0xa007u,0u},
++		/* scissors / window */
++		{0x80f0u,0u},{0x80f1u,0x00ff00ffu},{0x80b0u,0u},{0x80b1u,0x00ff00ffu},
++		{0x80d0u,0u},{0x80d1u,0x00ff00ffu},{0x8890u,0u},{0x88d4u,0u},
++		/* MRT0 (base below) and the FS output */
++		{0x8822u,0x00000030u},{0x8823u,0x00000010u},{0x8824u,0x00001000u},
++		{0x8827u,0u},{0x8820u,0x00000780u},{0xa996u,0x00000030u},{0xa98eu,0u},
++		{0x880bu,0u},{0x880cu,1u},{0xa98du,1u},{0xa98bu,0x0000000fu},
++		{0x880du,0x0000000fu},{0x880fu,0u},{0xa98au,0u},{0x8801u,0x00000010u},
++		/* no depth/stencil, LRZ off */
++		{0x8871u,0u},{0x8870u,0u},{0x8872u,0u},{0x8098u,0u},{0x8880u,0u},
++		{0x8881u,0u},{0x8100u,0u},{0x8898u,0u},
++		/* 1x MSAA, sample mask */
++		{0x80a2u,0u},{0x80a3u,0x4u},{0x8802u,0u},{0x8803u,0x4u},{0xb300u,0u},
++		{0xb301u,0x4u},{0x8865u,0xffff0000u},{0xa989u,0u},{0x8810u,0u},
++		/* viewport 128 + 128x, z 0..1 */
++		{0x8010u,0x43000000u},{0x8011u,0x43000000u},{0x8012u,0x43000000u},
++		{0x8013u,0x43000000u},{0x8014u,0u},{0x8015u,0x3f800000u},
++		{0x8070u,0u},{0x8071u,0x3f800000u},
++		/* raster, clip, primitives */
++		{0x8000u,0u},{0x8090u,0u},{0x80a0u,0u},{0x8005u,0u},{0x8809u,0u},
++		{0x880au,0u},{0x9b00u,0u},{0x9980u,0u},{0x9304u,0xff00ff00u},{0x9803u,0xffffffffu},
++		{0x9981u,3u},{0x9108u,3u},{0xa00eu,0u},{0xa00fu,0u},
++		/* vertex fetch (base/size/stride below) */
++		{0xa000u,0x00000101u},{0xa001u,0xffffffffu},{0xa090u,0x88200000u},
++		{0xa091u,1u},{0xa0d0u,0x0000000fu},
++		/* programs */
++		{0xa823u,0x00000100u},{0xab04u,0x00000100u},{0xb800u,0x00000100u},
++		{0xbb10u,0x00000100u},{0xa800u,0x00000400u},{0xa980u,0x01000400u},
++		{0xab00u,0x00000005u},{0xb980u,0u},{0xb982u,0u},{0xb983u,0xfcfcfcfcu},
++		{0xb984u,0xfcfcfcfcu},{0xb985u,0xfcfcfcfcu},{0xb986u,0xfcfcfcfcu},
++		/* VS -> FS: position only */
++		{0xa803u,0x00000f00u},{0xa813u,0u},{0xa802u,1u},{0x9301u,0x00ff0004u},
++		{0x9b01u,4u},{0x9212u,0xffffffffu},{0x9213u,0xffffffffu},
++		{0x9214u,0xffffffffu},{0x9215u,0xffffffffu},{0x9306u,1u},
++		{0x9104u,0x0000ffffu},{0x9b07u,0u},{0xa99eu,0u},
++		{0xa824u,1u},{0xab05u,1u},
++	};
++	volatile uint32_t *res = (volatile uint32_t *)g_scratch.va;
++	uint32_t sh = TEST_SHADERS, cres = CORE_SCRATCH_ADDRESS + 0x40u;
++	uint32_t centre, corner, red = 0;
++
++	gpu_log("SWEET GPU: [TEST] step: shader tests: memory\n");
++	if (!block_fill(&g_test_sh, g_core_l1, TEST_SHADERS, 0x3000u, PTE_CORE) ||
++	    !block_fill(&g_test_vbo, g_core_l1, TEST_VBO, 0x1000u, PTE_CORE) ||
++	    !block_fill(&g_test_rt, g_core_l1, TEST_TARGET, TEST_TARGET_SIZE, PTE_CORE)) {
++		return -1;
++	}
++	memcpy((void *)g_test_sh.va, cs_bin, sizeof(cs_bin));
++	memcpy((void *)(g_test_sh.va + 0x1000u), vs_bin, sizeof(vs_bin));
++	memcpy((void *)(g_test_sh.va + 0x2000u), fs_bin, sizeof(fs_bin));
++	memcpy((void *)g_test_vbo.va, vbo_data, sizeof(vbo_data));
++	for (unsigned i = 0; i < TEST_TARGET_SIZE / 4u; i++) {
++		((volatile uint32_t *)g_test_rt.va)[i] = 0xff400000u;       /* dark blue */
++	}
++	gpu_to_memory(g_test_sh.va, 0x3000u);
++	gpu_to_memory(g_test_vbo.va, 0x1000u);
++	gpu_to_memory(g_test_rt.va, TEST_TARGET_SIZE);
++	core_tlb_flush();
++
++	gpu_log("SWEET GPU: [TEST] step: shader tests: compute store\n");
++	ring_reg(0xae0fu, 0x20u);                       /* SP_PERFCTR_SHADER_MASK = CS */
++	ring_reg(0xab00u, 0x5u);                        /* SP_MODE_CNTL */
++	ring_reg(0xbb08u, 0xbfu);                       /* SP_UPDATE_CNTL: invalidate CS state */
++	ring_reg(0xb987u, 0x101u);                      /* HLSQ_CS_CNTL: constlen 1, enabled */
++	ring_reg(0xa9bbu, 0x100u);                      /* SP_CS_CONFIG: enabled */
++	ring_reg(0xa9bcu, 0x1u);                        /* SP_CS_INSTRLEN */
++	ring_reg(0xa9b0u, 0x102u);                      /* SP_CS_CTRL_REG0 */
++	ring_reg(0xa9b1u, 0x0u);
++	ring_reg(0xb997u, 0xfcfcfcfcu);                 /* HLSQ_CS_CNTL_0 */
++	ring_reg(0xb998u, 0xfcu);
++	ring_regs(0xa9b4u, 2);                          /* SP_CS_OBJ_START */
++	ring_put(sh);
++	ring_put(0);
++	ring_command(CP_LOAD_STATE6_FRAG, 3);           /* the shader, from memory */
++	ring_put(0x00760000u);
++	ring_put(sh);
++	ring_put(0);
++	ring_command(CP_LOAD_STATE6_FRAG, 7);           /* c0 = where to store */
++	ring_put(0x00744000u);
++	ring_put(0);
++	ring_put(0);
++	ring_put(cres);
++	ring_put(0);
++	ring_put(0);
++	ring_put(0);
++	ring_command(CP_SET_MARKER, 1);
++	ring_put(0x8u);                                 /* RM6_COMPUTE */
++	ring_regs(0xb990u, 7);                          /* HLSQ_CS_NDRANGE 1x1x1 */
++	ring_put(1); ring_put(1); ring_put(0); ring_put(1); ring_put(0); ring_put(1); ring_put(0);
++	ring_regs(0xb999u, 3);                          /* HLSQ_CS_KERNEL_GROUP */
++	ring_put(1); ring_put(1); ring_put(1);
++	ring_command(CP_EXEC_CS, 4);
++	ring_put(0); ring_put(1); ring_put(1); ring_put(1);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring_put(EVENT_CACHE_FLUSH_TS);
++	ring_put(CORE_SCRATCH_ADDRESS + 0x80u);
++	ring_put(0);
++	ring_put(0xc0deu);
++	(void)ring_run("the compute store");
++	gpu_to_memory(g_scratch.va, 0x100u);
++	gpu_log("SWEET GPU: [TEST] compute: %#x (want deadbeef), timestamp %#x (want c0de): %s\n", res[0x10], res[0x20],
++	    res[0x10] == 0xdeadbeefu ? "A SHADER RAN AND STORED TO MEMORY" : "no");
++
++	gpu_log("SWEET GPU: [TEST] step: shader tests: a triangle\n");
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_reg(0x8e07u, 0x08000000u);                 /* RB_CCU_CNTL: sysmem, colour after 1 x 64K depth */
++	ring_command(CP_SET_MARKER, 1);
++	ring_put(0x1u);                                 /* RM6_DIRECT_RENDER */
++	ring_command(CP_SKIP_IB2_ENABLE_GLOBAL, 1);
++	ring_put(0);
++	ring_command(CP_SKIP_IB2_ENABLE_LOCAL, 1);
++	ring_put(1);
++	ring_command(CP_SET_VISIBILITY_OVERRIDE, 1);
++	ring_put(1);
++	for (unsigned n = 0; n < sizeof(draw_regs) / sizeof(draw_regs[0]); n++) {
++		ring_reg(draw_regs[n][0], draw_regs[n][1]);
++	}
++	ring_regs(0x8825u, 2);                          /* RB_MRT_BASE[0] */
++	ring_put(TEST_TARGET);
++	ring_put(0);
++	ring_regs(0xa010u, 2);                          /* VFD_FETCH[0].BASE */
++	ring_put(TEST_VBO);
++	ring_put(0);
++	ring_reg(0xa012u, 48u);
++	ring_reg(0xa013u, 16u);
++	ring_regs(0xa81cu, 2);                          /* SP_VS_OBJ_START */
++	ring_put(sh + 0x1000u);
++	ring_put(0);
++	ring_regs(0xa983u, 2);                          /* SP_FS_OBJ_START */
++	ring_put(sh + 0x2000u);
++	ring_put(0);
++	ring_command(CP_LOAD_STATE6_GEOM, 3);
++	ring_put(2u << 16 | 8u << 18 | 1u << 22);
++	ring_put(sh + 0x1000u);
++	ring_put(0);
++	ring_command(CP_LOAD_STATE6_FRAG, 3);
++	ring_put(2u << 16 | 0xcu << 18 | 1u << 22);
++	ring_put(sh + 0x2000u);
++	ring_put(0);
++	ring_command(CP_DRAW_INDX_OFFSET, 3);
++	ring_put(0x84u);                                /* triangles, auto index, no visibility */
++	ring_put(1);
++	ring_put(3);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring_put(EVENT_PC_CCU_FLUSH_COLOR_TS);
++	ring_put(CORE_SCRATCH_ADDRESS + 0xc0u);
++	ring_put(0);
++	ring_put(0xd3adu);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring_put(EVENT_CACHE_FLUSH_TS);
++	ring_put(CORE_SCRATCH_ADDRESS + 0xc8u);
++	ring_put(0);
++	ring_put(0xd3aeu);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	(void)ring_run("the triangle");
++	gpu_to_memory(g_scratch.va, 0x100u);
++	gpu_to_memory(g_test_rt.va, TEST_TARGET_SIZE);
++	centre = ((volatile uint32_t *)g_test_rt.va)[128u * 256u + 128u];
++	corner = ((volatile uint32_t *)g_test_rt.va)[10u * 256u + 10u];
++	for (unsigned y = 0; y < 256u; y += 8u) {
++		for (unsigned x = 0; x < 256u; x += 8u) {
++			red += ((volatile uint32_t *)g_test_rt.va)[y * 256u + x] == 0xff0000ffu;
++		}
++	}
++	gpu_log("SWEET GPU: [TEST] triangle: centre %#x (want ff0000ff), corner %#x (want ff400000), %u of 1024 samples red, "
++	    "timestamps %#x %#x: %s\n", centre, corner, red, res[0x30], res[0x32],
++	    centre == 0xff0000ffu && corner == 0xff400000u && red > 10u ? "THE GPU DRAWS" :
++	    red ? "some red" : "nothing drawn");
++	return res[0x10] == 0xdeadbeefu && centre == 0xff0000ffu ? 0 : -4;
++}
++
++
+ static void
+ gpu_probe(void)
+ {
+@@ -1593,7 +1856,11 @@ gpu_probe(void)
+ 		int r = gpu_gmu_boot();
+ 		gpu_log("SWEET GMU: boot -> %d\n", r);
+ 		if (r == 0 && gpu_level >= 9) {
+-			gpu_log("SWEET GPU: command processor -> %d\n", gpu_core_start());
++			int c = gpu_core_start();
++			gpu_log("SWEET GPU: command processor -> %d\n", c);
++			if (c == 0 && gpu_level >= 10) {
++				gpu_log("SWEET GPU: shader tests -> %d\n", gpu_shader_tests());
++			}
+ 		}
+ 	}
+ }
+@@ -1621,7 +1888,7 @@ sweet_gpu_init(void)
+ 	gpu_started = true;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+-		gpu_log("SWEET GPU: disabled (sweetgpu=1..9 for the bring-up stages)\n");
++		gpu_log("SWEET GPU: disabled (sweetgpu=1..10 for the bring-up stages)\n");
+ 		return;
+ 	}
+ 	gpu_level = enabled;
