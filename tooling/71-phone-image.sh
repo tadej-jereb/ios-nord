@@ -38,6 +38,7 @@ cd "$repo"
 SERIAL=${SERIAL:-64f70df8}
 ADT=${ADT:-avicii/adt/avicii-live.adt}
 SHIM=${SHIM:-build/phone/shim-out-d0/Image.gz-dtb}   # DIAG_STAGE=0: jumps, does not park
+GPU_FW=${GPU_FW-src/gpu-fw}   # GPU firmware into the ADT's /sweet-fw when present (GPU_FW= to leave out)
 
 COMMON="debug=0xc cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetlog=1"
 declare -A PRESET=(
@@ -90,7 +91,12 @@ esac
 img=build/phone/ufsroot.$name.img
 payload=build/phone/payload-$name.bin
 
-python3 avicii/tools/mkpayload.py "$kernel" "$ADT" "$payload" --cmdline "$cmdline" >/dev/null
+fwarg=()
+if [ -n "$GPU_FW" ] && [ -f "$GPU_FW/SHA256SUMS" ]; then
+	(cd "$GPU_FW" && sha256sum -c --quiet SHA256SUMS) || { echo "error: $GPU_FW fails its SHA256SUMS" >&2; exit 4; }
+	fwarg=(--fw "$GPU_FW")
+fi
+python3 avicii/tools/mkpayload.py "$kernel" "$ADT" "$payload" --cmdline "$cmdline" "${fwarg[@]}" >/dev/null
 ./avicii/tools/mkbootimg_v1.sh --kernel "$SHIM" --ramdisk "$payload" -o "$img" >/dev/null
 ./avicii/tools/mkbootimg_v1.sh --verify "$img" | tail -1
 grep -qaF "$cmdline" "$img" || { echo "error: cmdline not found in $img" >&2; exit 4; }

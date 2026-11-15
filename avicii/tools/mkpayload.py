@@ -163,6 +163,24 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
     return adt.serialize(root)
 
 
+# GPU firmware (src/gpu-fw, from the LOS 21 vendor image; never in git) as properties of
+# /sweet-fw, read by bsd/dev/sweet_gpu.c (xnu patch 0122), the way raphael-ios-gpu does it.
+GPU_FW_FILES = ('a650_gmu.bin', 'a650_sqe.fw', 'a620_zap.mdt', 'a620_zap.b00', 'a620_zap.b01',
+                'a620_zap.b02')
+
+
+def add_fw_node(adt_blob, fw_dir):
+    """Return the ADT with a /sweet-fw node holding each GPU firmware file as a property."""
+    root, _ = adt.parse(adt_blob)
+    assert not any(c.name == 'sweet-fw' for c in root.children), 'ADT already has /sweet-fw'
+    fw = adt.Node()
+    fw.props.append(('name', 0, b'sweet-fw\0'))
+    for f in GPU_FW_FILES:
+        fw.props.append((f, 0, open(os.path.join(fw_dir, f), 'rb').read()))
+    root.children.append(fw)
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     """Kernel-managed RAM <base, size> from the ADT's /chosen dram-base/dram-size."""
     root, _ = adt.parse(adt_blob)
@@ -172,7 +190,7 @@ def adt_dram(adt_blob):
 
 
 def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_cache_path=None,
-          ramdisk_addr=None):
+          ramdisk_addr=None, fw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -186,6 +204,8 @@ def build(kernel_path, adt_path, out_path, cmdline, ramdisk_path=None, shared_ca
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if fw_dir:
+        adt_blob = add_fw_node(adt_blob, fw_dir)
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -287,8 +307,9 @@ if __name__ == '__main__':
                     help='physical address for --ramdisk (default: after the kernel, or '
                          f'{RAMDISK_CLEAR:#x} when that would land in the early console band)')
     ap.add_argument('--shared-cache', help='dyld shared cache to place as /chosen/memory-map "dyld shared cache"')
+    ap.add_argument('--fw', help='GPU firmware directory (src/gpu-fw) to put into the ADT as /sweet-fw')
     a = ap.parse_args()
-    info = build(a.kernel, a.adt, a.out, a.cmdline, a.ramdisk, a.shared_cache, a.ramdisk_addr)
+    info = build(a.kernel, a.adt, a.out, a.cmdline, a.ramdisk, a.shared_cache, a.ramdisk_addr, a.fw)
     for k, v in info.items():
         if k != 'segs':
             print(f'{k}: {v}')
