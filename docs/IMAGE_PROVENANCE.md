@@ -583,3 +583,20 @@ Phone images are built with `tooling/71-phone-image.sh` from here on (presets `g
 | `logs/phone/20261114-204628-0113-usb` | `build/phone/ufsroot.0113-usb.img` (kernel `kernel-0113`, CI `43638217772`: + HS PHY rails L5/L12/L2 voted through RPMh) | — | **USB ETHERNET WORKS**: host sees CDC-ECM `enx02005e77ee01` 5 s after boot, `ping 192.168.7.2` 0.6 ms, live kernel log on UDP 5140 (`logs/phone/live-20261114-0113-usb.txt`). Host side: `tooling/72-usbnet.sh` |
 | `build/ios16-root.img` (16 GiB HFSX root) | `tooling/73-root-add-ssh.sh` on `ios16-root.pre-ssh.img` (`a2e11e3e…ea0c`, kept): Procursus `bootstrap-ssh-iphoneos-arm64.tar.zst` (`2c639b83…7c08`) → `/private/var/jb`, sshd launchd job, key `~/.ssh/ios_nord_ed25519.pub` | `6f40b37b9351579aff57cf007a1a35ee07820c183bdb5ace319f303973ad7a61` | fstool check clean. **Written to `userdata` (`sda16`) 2026-11-15 08:07–08:14 UTC** from recovery (`adb shell -T 'dd of=/dev/block/sda16 bs=1M conv=fsync'`), read-back sha of the first 16 GiB matches |
 | `logs/phone/20261115-081534-usb-kernel-0114` | `build/phone/ufsroot.usb-kernel-0114.img` (kernel `kernel-0114`, CI `43640897954`, `--preset usb`) | `25b6bb3e…8f65` | **SSH WORKS**: port 22 open 80 s after boot; `ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2` → uid 0, iPhone OS 16.7.16 (20H392), zsh, 184 processes, SpringBoard/backboardd/lsd up. Live log `logs/phone/live-20261115-0114-ssh.txt` |
+
+## 2026-11-15 SweetGLES.bundle -> /System/Library/Extensions (user OK; kernel 0129 sweetgpu=11 sweetgles=1; undo: rm -rf the bundle or boot without sweetgles)
+```
+b0b7fea353806a1d7de139a9bd2e2224a805c7f47532cf38c7b58e8a0f46f143  SweetGLES.bundle/SweetGLES
+2a4aa897f63f0bc633ecf6ff17215f96008badf602562e52710dbd8144dbfb2e  SweetGLES.bundle/SweetEAGL.dylib
+3aa21f7191af8b793c41070e27725eaa1405fe0cfd60be3d54e94d5d1b298774  SweetGLES.bundle/libOSMesa.8.dylib
+3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
+```
+update 2026-11-15T19:48:18Z: logs moved to /private/var/tmp
+```
+aa48fd0e8ee81192853b15fc2639662818b783723450b1a92da414c12959eab7  SweetGLES.bundle/SweetGLES
+7d7e0178467da32a3d93b0e360306bba488bba7f29dbab0795e27cca51e9bf27  SweetGLES.bundle/SweetEAGL.dylib
+3aa21f7191af8b793c41070e27725eaa1405fe0cfd60be3d54e94d5d1b298774  SweetGLES.bundle/libOSMesa.8.dylib
+3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
+```
+update 2026-11-15T19:49:45Z: SweetEAGL.dylib e0d0b05928b9051a6b37d89f03822d51605a0e80729f807cccd137968831f69a (reject logging)
+update 2026-11-15T19:52:43Z: bundle moved out to /var/root/gpu/SweetGLES.bundle.off (black screen: render target b3a8 rejected); CPU renderer restored

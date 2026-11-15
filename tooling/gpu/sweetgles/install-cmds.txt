@@ -131,8 +131,8 @@ Require exit 0 and every test PASS, including initial API-3 nil, API-2 retry rep
 
 ```bash
 /private/var/root/gpu/sweetgles-stage/eagltest --via-bundle
-tail -n 50 /private/var/root/gpu/sweetgles.log
-tail -n 80 /private/var/root/gpu/sweeteagl.log
+tail -n 50 /private/var/tmp/sweetgles.log
+tail -n 80 /private/var/tmp/sweeteagl.log
 exit
 ```
 
@@ -171,6 +171,6 @@ Allow launchd to restart it before reading the PID. In sweetgles.log require tha
 
 ```bash
 ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 pgrep -x backboardd
-ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/root/gpu/sweetgles.log
-ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/root/gpu/sweeteagl.log
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/tmp/sweetgles.log
+ssh -i ~/.ssh/ios_nord_ed25519 root@192.168.7.2 tail -n 100 /private/var/tmp/sweeteagl.log
 ```

@@ -96,7 +96,7 @@ overrides Mesa loading and must be absolute. Otherwise the loader tries
 `/private/var/root/gpu/SweetEAGL.dylib`. There are no dyld path-expansion tokens
 in load commands. `SWEETEAGL_TRACE=1` logs the first call at each known slot;
 `SWEETEAGL_CPU=1` forces copying. Logging uses an append-only, unbuffered fd at
-`/private/var/root/gpu/sweeteagl.log`, first 200 method entries globally, and one
+`/private/var/tmp/sweeteagl.log`, first 200 method entries globally, and one
 record per event/stub/trace offset. No per-frame GL logging continues afterward.
 
 ## Decisions and spec corrections

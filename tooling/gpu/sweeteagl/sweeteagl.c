@@ -38,6 +38,7 @@ static void event(unsigned which, const char *s)
 {
     if (!__atomic_test_and_set(&events[which], __ATOMIC_RELAXED)) log_line("%s\n", s);
 }
+static void reject(const char *why, IOSurfaceRef s, unsigned long a, unsigned long b, unsigned long c);
 static void method_entry(SEL cmd)
 {
     /* E §3 method list; task logging bound N=200, global across contexts. */
@@ -211,7 +212,7 @@ void sweet_before_draw(struct sweet_context *e)
         if (!im->copy) continue;
         if (!im->dirty) {
             p_glBindTexture(GL_TEXTURE_2D, im->texture);
-            if (!upload(im, false)) event(3, "FAIL CPU refresh");
+            if (!upload(im, false)) { event(3, "FAIL CPU refresh"); reject("refresh-upload", im->surface, im->texture, im->invert, p_glGetError()); }
         }
         if (im->texture == (GLuint)texture) im->dirty = true;
     }
@@ -378,17 +379,29 @@ static unsigned long parameter(id self, SEL cmd, unsigned p, const int *values)
 }
 static id sharegroup(id self, SEL cmd) { method_entry(cmd); (void)self; return NULL; }
 
+/* Rejected surfaces, first 40 per process: what QuartzCore actually hands us. */
+static unsigned rejects;
+static void reject(const char *why, IOSurfaceRef s, unsigned long a, unsigned long b, unsigned long c)
+{
+    if (__atomic_fetch_add(&rejects, 1, __ATOMIC_RELAXED) >= 40) return;
+    if (!s) { log_line("reject %s (no surface)\n", why); return; }
+    uint32_t f = IOSurfaceGetPixelFormat(s);
+    log_line("reject %s id=%u fmt=%#x '%c%c%c%c' %zux%zu bpe=%zu bpr=%zu planes=%zu args=%#lx,%#lx,%#lx\n",
+             why, IOSurfaceGetID(s), f, (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f,
+             IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerElement(s),
+             IOSurfaceGetBytesPerRow(s), IOSurfaceGetPlaneCount(s), a, b, c);
+}
 static BOOL attach(struct sweet_context *e, unsigned long target, IOSurfaceRef s, BOOL invert)
 {
-    if (!e || !s || target != GL_TEXTURE_2D || !sweet_enter(e, 0)) return false;
+    if (!e || !s || target != GL_TEXTURE_2D || !sweet_enter(e, 0)) { reject("attach-target", s, target, 0, 0); return false; }
     uint32_t fmt = IOSurfaceGetPixelFormat(s);
     size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s);
     if ((fmt != SWEET_BGRA && fmt != 0) || IOSurfaceGetBytesPerElement(s) != 4 ||
         IOSurfaceGetPlaneCount(s) || !w || !h || w > INT_MAX || h > INT_MAX ||
-        w > SIZE_MAX/4/h || IOSurfaceGetBytesPerRow(s) < w*4) return false;
+        w > SIZE_MAX/4/h || IOSurfaceGetBytesPerRow(s) < w*4) { reject("attach-format", s, target, invert, 0); return false; }
     GLint tex;
     p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
-    if (!tex) return false;
+    if (!tex) { reject("attach-no-texture", s, 0, 0, 0); return false; }
     GLuint texture = (GLuint)tex;
     sweet_writeback(e);
     sweet_delete_textures(e, 1, &texture);
@@ -404,7 +417,7 @@ static BOOL attach(struct sweet_context *e, unsigned long target, IOSurfaceRef s
         p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void *)(uintptr_t)IOSurfaceGetID(s));
         im->copy = p_glGetError() != GL_NO_ERROR;
     }
-    if (im->copy && !upload(im, true)) { CFRelease(s); free(im); return false; }
+    if (im->copy && !upload(im, true)) { reject("attach-upload", s, invert, fmt, 0); CFRelease(s); free(im); return false; }
     event(im->copy ? 5 : 6, im->copy ? "surface CPU copy" : "surface IOSurface-ID import");
     im->next = e->images; e->images = im;
     return true;
@@ -419,7 +432,7 @@ static BOOL tex_surface(id self, SEL cmd, IOSurfaceRef s, unsigned long target, 
     method_entry(cmd);
     if (!s || plane || w != IOSurfaceGetWidth(s) || h != IOSurfaceGetHeight(s) ||
         (internal != GL_RGBA && internal != GL_RGBA8 && internal != GL_BGRA) ||
-        fmt != GL_BGRA || type != GL_UNSIGNED_BYTE) return false; /* E §§3/5 */
+        fmt != GL_BGRA || type != GL_UNSIGNED_BYTE) { reject("teximage-args", s, internal, fmt, type | (unsigned long)plane << 32); return false; } /* E §§3/5 */
     return attach(context(self), target, s, invert);
 }
 static void dealloc_context(id self, SEL cmd)
@@ -479,7 +492,7 @@ static BOOL set_current_context(id cls, SEL cmd, id ctx)
 int sweeteagl_install(void)
 {
     if (installed) return 1;
-    if (log_fd < 0) log_fd = open("/private/var/root/gpu/sweeteagl.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (log_fd < 0) log_fd = open("/private/var/tmp/sweeteagl.log", O_WRONLY|O_CREAT|O_APPEND, 0666);
     const char *t = getenv("SWEETEAGL_TRACE"); trace = t && !strcmp(t, "1");
     if (!dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW|RTLD_LOCAL) ||
         !sweet_objc_load(&objc) || !(eagl_class = objc.getClass("EAGLContext")) ||

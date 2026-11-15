@@ -32,7 +32,7 @@ static void *fake_dlsym(void *handle, const char *symbol)
 }
 static int fake_open(const char *path, int flags, ...)
 {
-    assert(!strcmp(path, "/private/var/root/gpu/sweetgles.log"));
+    assert(!strcmp(path, "/private/var/tmp/sweetgles.log"));
     assert(flags == (O_WRONLY|O_CREAT|O_APPEND));
     return fail_log ? -1 : 42;
 }

@@ -29,7 +29,7 @@ static void event(const char *message)
             for (size_t i = 0; i + 1 < count; ++i)
                 if (buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
             buf[count - 1] = '\n';
-            int fd = open("/private/var/root/gpu/sweetgles.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+            int fd = open("/private/var/tmp/sweetgles.log", O_WRONLY|O_CREAT|O_APPEND, 0666);
             if (fd >= 0) { (void)write(fd, buf, count); (void)close(fd); }
         }
     }
