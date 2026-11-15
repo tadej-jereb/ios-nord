@@ -1,0 +1,47 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -275,7 +275,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 10000; i++) {      /* 10 ms (0132; was 1 ms) */
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -944,7 +944,34 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/*
++	 * 0132: global setup ABL does in fastboot mode and nobody does on a boot from flash
++	 * (logs/phone/20261115-boot_a-flash: GCTL 0x00102000, GUSB2PHYCFG 0x2500, then
++	 * "ep0 cmd 0x1 timeout"; after `fastboot boot` ABL left GCTL 0x00112001, GUSB2PHYCFG
++	 * 0x2400). Linux dwc3_send_gadget_ep_cmd: in USB 2.0 operation GUSB2PHYCFG.ENBLSLPM and
++	 * .SUSPHY must be clear for an endpoint command to complete. boot-arg sweetusbinit
++	 * (default 3): 1 GCTL DSBLCLKGTNG|U2RSTECN as ABL, 2 clear ENBLSLPM|SUSPHY,
++	 * 4 GUSB3PIPECTL.SUSPHY (the SuperSpeed PHY is never powered here).
++	 */
++	{
++		uint32_t init = 3;
++		PE_parse_boot_argn("sweetusbinit", &init, sizeof(init));
++		uint32_t gctl = dwc_rd(GCTL), u2 = dwc_rd(0xc200), u3 = dwc_rd(0xc2c0), guctl = dwc_rd(0xc12c);
++		if (init & 1) {
++			dwc_wr(GCTL, gctl | (1u << 0) | (1u << 16));
++		}
++		if (init & 2) {
++			dwc_wr(0xc200, u2 & ~((1u << 8) | (1u << 6)));
++		}
++		if (init & 4) {
++			dwc_wr(0xc2c0, u3 | (1u << 17));
++		}
++		printf("SWEET USB: global init 0x%x: GCTL 0x%08x->0x%08x GUSB2PHYCFG 0x%08x->0x%08x "
++		    "GUSB3PIPECTL 0x%08x->0x%08x GUCTL 0x%08x\n", init, gctl, dwc_rd(GCTL), u2,
++		    dwc_rd(0xc200), u3, dwc_rd(0xc2c0), guctl);
++	}
++
++	/* Device controller soft reset. */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
