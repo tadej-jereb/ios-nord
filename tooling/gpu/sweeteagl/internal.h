@@ -21,6 +21,7 @@ void sweet_writeback(struct sweet_context *);
 void sweet_delete_textures(struct sweet_context *, GLsizei, const GLuint *);
 const GLubyte *sweet_string(struct sweet_context *, GLenum);
 void sweet_finish(struct sweet_context *);
+void sweet_frame_mark(struct sweet_context *, unsigned offset);
 void sweet_delete_program(GLuint);
 void sweet_glGenFencesAPPLE(struct sweet_context *, GLsizei, GLuint *);
 void sweet_glDeleteFencesAPPLE(struct sweet_context *, GLsizei, const GLuint *);

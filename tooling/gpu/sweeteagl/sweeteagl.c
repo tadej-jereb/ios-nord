@@ -241,6 +241,24 @@ void sweet_delete_textures(struct sweet_context *e, GLsizei n, const GLuint *tex
     }
 }
 void sweet_finish(struct sweet_context *e) { p_glFinish(); sweet_writeback(e); }
+/*
+ * Frame-end calls (glFlush 0x2d8, glFinish 0x2d0, glFenceSync 0x1860, glClientWaitSync 0x1878,
+ * glFinishObjectAPPLE 0xeb8): log the first 60 in order, to see how the window server ends a
+ * frame. And glFlush waits for the GPU: the kernel's display copy has no GPU fence to wait on,
+ * so a flushed-but-unfinished frame can be copied half drawn. Disable with the file
+ * /private/var/tmp/sweeteagl.flushonly (checked once per process).
+ */
+void sweet_frame_mark(struct sweet_context *e, unsigned offset)
+{
+    static unsigned marks;
+    static int flush_finishes = -1;
+    if (flush_finishes < 0)
+        flush_finishes = access("/private/var/tmp/sweeteagl.flushonly", F_OK) != 0;
+    if (__atomic_fetch_add(&marks, 1, __ATOMIC_RELAXED) < 60)
+        log_line("frame-mark %#06x\n", offset);
+    if (offset == 0x2d8 && flush_finishes) p_glFinish();
+    (void)e;
+}
 /* Offmap 0x0e80–0x0eb0: synchronous APPLE_fence compatibility. Waiting
  * eagerly in SetFence is conservative but makes advertising E §4's APPLE_fence
  * honest, without relying on Mesa exporting that legacy API. QC's 0x1860/

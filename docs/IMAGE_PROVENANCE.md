@@ -609,3 +609,4 @@ b992022ded214bd282aee65eaa5b4f2f66eee6bb3fb0e179df22294c561f8671  SweetGLES.bund
 3c94faa573adc02df2fa0dfec86d1022e806f1b5ae30ffbf81180316719b4432  SweetGLES.bundle/libOSMesa.8.dylib
 3f5ab040f9cc079bbc5effd73315ebade9e507e77ab01390a433d49cd788e19a  SweetGLES.bundle/Info.plist
 ```
+update 2026-11-15T20:47:52Z: SweetEAGL.dylib a1708e336d5ec00092fdd634ab9f4c291e52c3215f32c12ae35a34d736b00756 (glFlush waits for GPU, frame-mark log)

@@ -201,6 +201,7 @@ static void slot_02d0(void *opaque) {
     if (!p_slot_02d0) { sweet_missing(720); return; }
     p_slot_02d0();
     sweet_writeback(e);
+    sweet_frame_mark(e, 720);
 }
 /* E §4 / offmap 0x02d8: glFlush */
 static void (*p_slot_02d8)(void);
@@ -210,6 +211,7 @@ static void slot_02d8(void *opaque) {
     if (!p_slot_02d8) { sweet_missing(728); return; }
     p_slot_02d8();
     sweet_writeback(e);
+    sweet_frame_mark(e, 728);
 }
 /* E §4 / offmap 0x02e0: glFogf */
 static void (*p_slot_02e0)(GLenum, GLfloat);
@@ -933,7 +935,7 @@ static GLboolean slot_0eb0(void *opaque, GLenum a0, GLuint a1) {
 static void slot_0eb8(void *opaque, GLenum a0, GLuint a1) {
     struct sweet_context *e = opaque;
     if (!sweet_enter(e, 3768)) { return; }
-    (void)a0; (void)a1; sweet_finish(e);
+    (void)a0; (void)a1; sweet_finish(e); sweet_frame_mark(e, 0xeb8);
 }
 /* E §4 / offmap 0x0ee8: glVertexAttrib1f */
 static void (*p_slot_0ee8)(GLuint, GLfloat);
@@ -2090,6 +2092,7 @@ static GLsync slot_1860(void *opaque, GLenum a0, GLbitfield a1) {
     if (!sweet_enter(e, 6240)) { return 0; }
     if (!p_slot_1860) { sweet_missing(6240); return 0; }
     return p_slot_1860(a0, a1);
+    sweet_frame_mark(e, 6240);
 }
 /* E §4 / offmap 0x1868: glIsSync */
 static GLboolean (*p_slot_1868)(GLsync);
@@ -2114,6 +2117,7 @@ static GLenum slot_1878(void *opaque, GLsync a0, GLbitfield a1, GLuint64 a2) {
     if (!sweet_enter(e, 6264)) { return 0; }
     if (!p_slot_1878) { sweet_missing(6264); return 0; }
     return p_slot_1878(a0, a1, a2);
+    sweet_frame_mark(e, 6264);
 }
 /* E §4 / offmap 0x1880: glWaitSync */
 static void (*p_slot_1880)(GLsync, GLbitfield, GLuint64);

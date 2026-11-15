@@ -106,7 +106,7 @@ def generate():
         if name == 'glGetString':
             c.append('    return sweet_string(e, a0);')
         elif name == 'glFinishObjectAPPLE':
-            c.append('    (void)a0; (void)a1; sweet_finish(e);')
+            c.append('    (void)a0; (void)a1; sweet_finish(e); sweet_frame_mark(e, 0xeb8);')
         elif name == 'glFramebufferParameteriAPPLE':
             c.append('    (void)a0; if (a1 == 0x8A79 && a2) *a2 = 0; /* E §§4/10 */')
         elif name in APPLE_FENCES:
@@ -126,6 +126,8 @@ def generate():
             c.append(f'    {"return " if ret != "void" else ""}p_{fn}({args});')
             if name in ('glFinish', 'glFlush'):
                 c.append('    sweet_writeback(e);')
+            if name in ('glFinish', 'glFlush', 'glFenceSync', 'glClientWaitSync'):
+                c.append(f'    sweet_frame_mark(e, {off});')
         else:
             c.extend(f'    (void)a{i};' for i in range(len(types)))
             c.append(f'    sweet_missing({off}); {default}')
