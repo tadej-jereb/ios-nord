@@ -23,7 +23,7 @@
  		fb->present(rec);
 +		/* The frame's pixels are in the panel now: its surface is free again (0130). */
 +		IOLockLock(fb->fLock);
-+		fb->fShownID = get32(rec, 0x50);
++		memcpy(&fb->fShownID, rec + 0x50, sizeof(fb->fShownID));   /* swap id; get32 is below */
 +		IOLockWakeup(fb->fLock, &fb->fShownID, false);
 +		IOLockUnlock(fb->fLock);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
