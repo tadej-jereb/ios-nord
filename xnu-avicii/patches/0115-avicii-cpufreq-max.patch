@@ -1,0 +1,155 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_smmu.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,121 @@
++/*
++ * SWEET CPU frequency (avicii): request the top level of each OSM cpufreq-hw
++ * domain at boot.
++ *
++ * Nothing in this kernel programs the CPU frequency, so the cores stay at the
++ * level ABL left; the spacewar port measured its big cores there at ~3.5x below
++ * fmax (refs/anonbeat1-ios-sweet/NOTES.md cpufreq1). backboardd renders every
++ * frame on the CPU, so this is the first lever on GUI frame rate.
++ *
++ * avicii (lito) is "qcom,cpufreq-hw" (avicii/lito.dtsi:1758), three domains at
++ * 0x18323000 (A55 x6), 0x18325800 (A76 gold), 0x18327800 (A76 prime), 0x1000
++ * each (avicii/CONSTANTS.md). Layout from LineageOS android_kernel_oneplus_sm7250
++ * lineage-20 drivers/cpufreq/qcom-cpufreq-hw.c (cpufreq_qcom_std_offsets):
++ *   ENABLE 0x0 (bit 0), FREQ_LUT 0x110, PERF_STATE 0x920, LUT rows 32 bytes,
++ *   at most 40; row [31:30] source (0 = alternate clock), [7:0] L (MHz = L *
++ *   19.2), [18:16] cores the row allows. The table ends at a repeated row.
++ *   Rows allowing fewer cores than the domain's maximum are boost levels; the
++ *   top row requested here is the highest one allowing the maximum.
++ * Thermal limits stay in hardware (LMh clamps the domain on its own).
++ *
++ * Boot-args: sweetcpufreq=0 leaves ABL's levels; sweetcpulevel=N caps the row.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define OSM_ENABLE      0x000u
++#define OSM_FREQ_LUT    0x110u
++#define OSM_PERF_STATE  0x920u
++#define OSM_LUT_ROW     32u
++#define OSM_LUT_MAX     40u
++#define OSM_DOM_SIZE    0x1000u
++
++static const uint64_t osm_domain_pa[] = { 0x18323000ull, 0x18325800ull, 0x18327800ull };
++static const char *const osm_domain_name[] = { "A55", "A76 gold", "A76 prime" };
++
++static uint32_t
++osm_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static unsigned
++osm_mhz(uint32_t row)
++{
++	return (row >> 30) ? (row & 0xffu) * 192u / 10u : 0u;   /* 0: alternate clock */
++}
++
++static unsigned
++osm_cores(uint32_t row)
++{
++	return (row >> 16) & 0x7u;
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	static int done;
++	uint32_t enabled = 1, cap = OSM_LUT_MAX;
++
++	if (done) {
++		return;
++	}
++	done = 1;
++	(void)PE_parse_boot_argn("sweetcpufreq", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetcpulevel", &cap, sizeof(cap));
++	if (!enabled) {
++		printf("SWEET CPUFREQ: disabled (sweetcpufreq=0), ABL levels kept\n");
++		return;
++	}
++	for (unsigned d = 0; d < sizeof(osm_domain_pa) / sizeof(osm_domain_pa[0]); d++) {
++		vm_offset_t b = ml_io_map(osm_domain_pa[d], OSM_DOM_SIZE);
++		if (!b) {
++			printf("SWEET CPUFREQ: domain %u map failed\n", d);
++			continue;
++		}
++		uint32_t en = osm_rd(b, OSM_ENABLE);
++		if (!(en & 1u)) {
++			printf("SWEET CPUFREQ: domain %u (%s) not enabled (0x%x), left alone\n",
++			    d, osm_domain_name[d], en);
++			continue;
++		}
++		uint32_t rows[OSM_LUT_MAX];
++		unsigned n = 0, maxc = 0;
++		for (unsigned i = 0; i < OSM_LUT_MAX; i++) {
++			rows[i] = osm_rd(b, OSM_FREQ_LUT + i * OSM_LUT_ROW);
++			n = i + 1;
++			if (osm_cores(rows[i]) > maxc) {
++				maxc = osm_cores(rows[i]);
++			}
++			if (i > 0 && rows[i] == rows[i - 1]) {
++				break;
++			}
++		}
++		unsigned top = 0;
++		for (unsigned i = 0; i < n; i++) {
++			if (osm_cores(rows[i]) == maxc && osm_mhz(rows[i]) > osm_mhz(rows[top])) {
++				top = i;
++			}
++		}
++		if (top > cap) {
++			top = cap;
++		}
++		uint32_t was = osm_rd(b, OSM_PERF_STATE);
++		printf("SWEET CPUFREQ: domain %u (%s) LUT %u rows: row0 %u MHz, top valid row %u %u MHz (%u cores); was row %u (%u MHz)\n",
++		    d, osm_domain_name[d], n, osm_mhz(rows[0]), top, osm_mhz(rows[top]), maxc,
++		    was, was < n ? osm_mhz(rows[was]) : 0);
++		__asm__ volatile ("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(b + OSM_PERF_STATE) = top;
++		__asm__ volatile ("dsb osh" ::: "memory");
++		printf("SWEET CPUFREQ: domain %u -> row %u (perf_state reads %u)\n",
++		    d, top, osm_rd(b, OSM_PERF_STATE));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -726,6 +726,8 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++extern void sweet_cpufreq_init(void);
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -735,6 +737,9 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
++	/* avicii: cores left at ABL's cpufreq levels; first SWEET hook in BSD init. */
++	sweet_cpufreq_init();
++
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
