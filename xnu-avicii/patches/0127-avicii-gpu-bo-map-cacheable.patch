@@ -1,0 +1,79 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3444,6 +3444,11 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 			struct kgsl_bo_ent *b = kgsl_bo_find(chunk[j].handle);
+ 			uint32_t seed;
+ 			int64_t written;
++			if (b != NULL && b->surf == NULL && b->cva != 0 && !gpu_bo_wc()) {
++				gpu_to_memory(b->cva, b->mmapsize);      /* what the process wrote through its cacheable map */
++				g_stat.flushed += b->mmapsize;
++				continue;
++			}
+ 			if (b == NULL || b->surf == NULL) { continue; }
+ 			seed = sweet_surface_gpu_seed(b->surf);
+ 			if (seed == b->seed && began - b->pushed < again) { continue; }
+@@ -3551,6 +3556,24 @@ extern kern_return_t mach_vm_map_external(vm_map_t target_map,
+                          vm_inherit_t inheritance);
+ extern void          mach_memory_entry_port_release(ipc_port_t port);
+ 
++/*
++ * How a buffer is mapped into its process. Default (0): cacheable, as the kernel maps it; the kernel
++ * pushes a buffer's lines out of the cache when a submission names it and takes them back on
++ * GEM_CPU_PREP (the caches are physically indexed: the kernel's view cleans the process's writes).
++ * sweetgpu_bowc=1: raphael's write-combined mapping (a named entry with MAP_MEM_WCOMB over kernel
++ * memory) -- on this phone the first such mapping froze the whole system (drmtest step 5, 0126).
++ */
++static int g_bo_wc = -1;
++static bool
++gpu_bo_wc(void)
++{
++	if (g_bo_wc < 0) {
++		int v = 0;
++		g_bo_wc = PE_parse_boot_argn("sweetgpu_bowc", &v, sizeof(v)) && v != 0;
++	}
++	return g_bo_wc != 0;
++}
++
+ static int
+ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
+ {
+@@ -3565,7 +3588,14 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
+ 	}
+ 	/* named entry over the BO's object-backed cacheable kernel range, forcing WC
+ 	 * (cache mode = bits[31:24] of permission; MAP_MEM_WCOMB<<24, outside the flag mask) */
+-	perm = VM_PROT_READ | VM_PROT_WRITE | ((vm_prot_t)MAP_MEM_WCOMB << 24);
++	perm = VM_PROT_READ | VM_PROT_WRITE | (gpu_bo_wc() ? ((vm_prot_t)MAP_MEM_WCOMB << 24) : 0);
++	{
++		static uint32_t said;
++		if (said++ < 8u) {
++			printf("SWEET DRM: gem_mmap id=%u size=%#lx %s: making the memory entry\n", bo->id,
++			    (unsigned long)bo->mmapsize, gpu_bo_wc() ? "write-combined" : "cacheable");
++		}
++	}
+ 	kr = mach_make_memory_entry_64(kernel_map, &entry_size,
+ 	        (memory_object_offset_t)bo->cva, perm, &entry, IPC_PORT_NULL);
+ 	if (kr != KERN_SUCCESS || entry == IPC_PORT_NULL) {
+@@ -3584,7 +3614,7 @@ drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
+ 	{
+ 		static uint32_t told;
+ 		if (told++ < 16u) {
+-			printf("SWEET DRM: gem_mmap id=%u iova=%#llx -> uva=%#llx size=%#lx (WC)\n",
++			printf("SWEET DRM: gem_mmap id=%u iova=%#llx -> uva=%#llx size=%#lx\n",
+ 			    bo->id, (unsigned long long)bo->gpuaddr, (unsigned long long)uaddr,
+ 			    (unsigned long)bo->mmapsize);
+ 		}
+@@ -3845,7 +3875,13 @@ drm_ioctl_locked(unsigned nr, caddr_t data)
+ 		} else {
+ 			ms = drm_ms_until(&cp->timeout);
+ 		}
+-		return gpu_fence_wait(fence, ms) ? 0 : EBUSY;
++		if (!gpu_fence_wait(fence, ms)) {
++			return EBUSY;
++		}
++		if (bo != NULL && bo->surf == NULL && bo->cva != 0 && !gpu_bo_wc()) {
++			gpu_to_memory(bo->cva, bo->mmapsize);          /* the GPU's writes: stale lines out (dc civac) */
++		}
++		return 0;
+ 	}
+ 	case DRM_NR_MSM_GEM_SUBMIT: {
+ 		struct drm_msm_gem_submit *s = (struct drm_msm_gem_submit *)data;

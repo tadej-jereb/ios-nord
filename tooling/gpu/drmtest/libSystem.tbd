@@ -1,0 +1,11 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1311.100.3
+compatibility-version: 1.0
+exports:
+  - targets:         [ arm64-ios ]
+    symbols:         [ _open, _close, _ioctl, _printf, _exit, _mach_absolute_time, _mach_timebase_info ]
+    objc-classes:    []
+...
