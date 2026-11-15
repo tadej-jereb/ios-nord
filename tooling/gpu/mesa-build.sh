@@ -4,13 +4,14 @@
 #   tooling/gpu/mesa-build.sh [build]   ninja
 # Inputs (not in git): build/gpu/sysroot (tooling/gpu/mksysroot.sh, with the libSystem
 # alias fix), build/gpu/mesa-src (Mesa 25.0.7 + tooling/gpu/mesa-patches/*).
+# MESA_SRC / MESA_BUILD override those source and build directories.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 export PATH=$repo/tooling/opt/mesa-venv/bin:$PATH
 llvm=$repo/tooling/opt/llvm/bin
 sr=$repo/build/gpu/sysroot
-src=$repo/build/gpu/mesa-src
-bld=$repo/build/gpu/mesa-build
+src=${MESA_SRC:-$repo/build/gpu/mesa-src}
+bld=${MESA_BUILD:-$repo/build/gpu/mesa-build}
 cross=$repo/build/gpu/cross-ios16.ini
 # -DXNU_PLATFORM_iPhoneOS: without it cdefs.h links $UNIX2003 symbols.
 # -D_USE_EXTENDED_LOCALES_: Libc xlocale.h hides the *_l prototypes libc++ <locale> needs.

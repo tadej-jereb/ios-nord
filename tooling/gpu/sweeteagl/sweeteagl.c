@@ -326,12 +326,24 @@ static id init_context(id self, SEL cmd, unsigned long api, id properties)
     if (api != 2 && api != 3) { release_object(self); return NULL; }
     struct sweet_context *e = calloc(1, sizeof(*e));
     if (!e) { release_object(self); return NULL; }
-    /* OSMesa has desktop profiles only. Request compatibility GL 3.3 for ES3
-     * functions and glAlphaFunc. Never fabricate a Mesa ES version string. */
-    const int attrs[] = {OSMESA_FORMAT, OSMESA_RGBA, OSMESA_PROFILE, OSMESA_COMPAT_PROFILE,
-                        OSMESA_CONTEXT_MAJOR_VERSION, 3, OSMESA_CONTEXT_MINOR_VERSION, 3, 0};
-    e->api = api;
-    e->mesa = p_OSMesaCreateContextAttribs(attrs, NULL);
+    /* Mesa patch 0007's public token; keep building with the old header too,
+     * so an older libOSMesa can reject ES and take the desktop fallback. */
+#ifndef OSMESA_ES_PROFILE
+#define OSMESA_ES_PROFILE 0x38
+#endif
+    const int es_attrs[] = {OSMESA_FORMAT, OSMESA_RGBA, OSMESA_PROFILE, OSMESA_ES_PROFILE,
+                           OSMESA_CONTEXT_MAJOR_VERSION, 3, OSMESA_CONTEXT_MINOR_VERSION, 0, 0};
+    const int desktop_attrs[] = {OSMESA_FORMAT, OSMESA_RGBA, OSMESA_PROFILE, OSMESA_COMPAT_PROFILE,
+                                OSMESA_CONTEXT_MAJOR_VERSION, 3, OSMESA_CONTEXT_MINOR_VERSION, 3, 0};
+    const char *desktop = getenv("SWEETEAGL_DESKTOP");
+    int forced_desktop = desktop && !strcmp(desktop, "1");
+    int using_es = 0;
+    e->api = 3; /* E §1: QuartzCore retries API 2, then requires API == 3. */
+    if (!forced_desktop) {
+        e->mesa = p_OSMesaCreateContextAttribs(es_attrs, NULL);
+        using_es = e->mesa != NULL;
+    }
+    if (!e->mesa) e->mesa = p_OSMesaCreateContextAttribs(desktop_attrs, NULL);
     e->priv = calloc(1, SWEET_PRIVATE_SIZE); /* E §2 */
     if (!e->mesa || !e->priv || !sweet_enter(e, 0)) {
         if (e->mesa) p_OSMesaDestroyContext(e->mesa);
@@ -339,17 +351,21 @@ static id init_context(id self, SEL cmd, unsigned long api, id properties)
     }
     unsigned char *p = e->priv;
     *(id *)(p + 0x00) = self; /* E §2: +currentContext's owner */
-    *(uint64_t *)(p + 0x10) = api; /* E §2: API */
+    *(uint64_t *)(p + 0x10) = 3; /* E §2: API */
     void **table = (void **)(p + SWEET_TABLE_OFFSET);
     table[0] = e; /* E §2 context-first ABI; table[1] is intentionally NULL */
     sweet_slots_fill(table);
     objc.setIvar(self, private_ivar, p);
-    event(4, "context created (OSMesa desktop compatibility profile)");
+    event(using_es ? 4 : 14, using_es
+          ? "context created (OSMesa OpenGL ES profile, requested 3.0)"
+          : "context created (OSMesa desktop compatibility profile, requested 3.3)");
+    log_line("context API 3: %s%s\n", (const char *)p_glGetString(GL_VERSION),
+             forced_desktop ? " (SWEETEAGL_DESKTOP=1)" : (using_es ? "" : " (ES fallback)"));
     return self;
 }
 static unsigned long get_api(id self, SEL cmd)
 {
-    method_entry(cmd); struct sweet_context *e = context(self); return e ? e->api : 0;
+    method_entry(cmd); return context(self) ? 3 : 0;
 }
 static void *get_table(id self, SEL cmd)
 {

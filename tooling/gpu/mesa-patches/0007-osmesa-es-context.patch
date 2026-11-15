@@ -1,0 +1,86 @@
+From: ios-nord <ios-nord@localhost>
+Subject: [PATCH] osmesa: allow real OpenGL ES 2/3 contexts
+
+Select the same API_OPENGLES2 state tracker used by EGL, with ES 3.0 as
+the default and valid requests limited to ES 2.0 and 3.0--3.2. The state
+tracker rejects versions above the screen's capabilities. Dispatch lookup
+and patch 0005's EGLImage hooks are unchanged. Build with gles2=enabled;
+shared-glapi already contains the GLES entry points, so no new option is
+needed (gles1 is unrelated).
+
+---
+--- a/include/GL/osmesa.h
++++ b/include/GL/osmesa.h
+@@ -106,6 +106,8 @@
+ #define OSMESA_COMPAT_PROFILE        0x35
+ #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
+ #define OSMESA_CONTEXT_MINOR_VERSION 0x37
++/* Port extension: next unused OSMesa token, after the version attributes. */
++#define OSMESA_ES_PROFILE            0x38
+ 
+ 
+ typedef struct osmesa_context *OSMesaContext;
+@@ -150,9 +152,12 @@
+  * OSMESA_DEPTH_BITS             0*, 16, 24, 32
+  * OSMESA_STENCIL_BITS           0*, 8
+  * OSMESA_ACCUM_BITS             0*, 16
+- * OSMESA_PROFILE                OSMESA_COMPAT_PROFILE*, OSMESA_CORE_PROFILE
++ * OSMESA_PROFILE                OSMESA_COMPAT_PROFILE*, OSMESA_CORE_PROFILE, OSMESA_ES_PROFILE
+  * OSMESA_CONTEXT_MAJOR_VERSION  1*, 2, 3
+  * OSMESA_CONTEXT_MINOR_VERSION  0+
++ *
++ * OSMESA_ES_PROFILE selects OpenGL ES 2.0 or 3.0--3.2 (default 3.0).
++ * The screen must support at least the requested version, as for desktop GL.
+  *
+  * Note: * = default value
+  *
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -597,6 +597,7 @@
+    GLenum format = GL_RGBA;
+    int depthBits = 0, stencilBits = 0, accumBits = 0;
+    int profile = OSMESA_COMPAT_PROFILE, version_major = 1, version_minor = 0;
++   bool version_major_set = false;
+    int i;
+ 
+    if (sharelist) {
+@@ -642,10 +643,12 @@
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != OSMESA_ES_PROFILE)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
++         version_major_set = true;
+          version_major = attribList[i+1];
+          if (version_major < 1)
+             return NULL;
+@@ -664,6 +667,14 @@
+       }
+    }
+ 
++   if (profile == OSMESA_ES_PROFILE) {
++      if (!version_major_set)
++         version_major = 3;
++      if (!((version_major == 2 && version_minor == 0) ||
++            (version_major == 3 && version_minor <= 2)))
++         return NULL;
++   }
++
+    osmesa = (OSMesaContext) CALLOC_STRUCT(osmesa_context);
+    if (!osmesa)
+       return NULL;
+@@ -689,8 +700,8 @@
+     * Create the rendering context
+     */
+    memset(&attribs, 0, sizeof(attribs));
+-   attribs.profile = (profile == OSMESA_CORE_PROFILE)
+-      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   attribs.profile = profile == OSMESA_ES_PROFILE ? API_OPENGLES2 :
++      (profile == OSMESA_CORE_PROFILE ? API_OPENGL_CORE : API_OPENGL_COMPAT);
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */

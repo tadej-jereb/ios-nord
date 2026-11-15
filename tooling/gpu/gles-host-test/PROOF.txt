@@ -1,0 +1,95 @@
+OSMesa ES context proof — 2026-11-15
+Native: x86_64 Linux, Mesa 25.0.7 + patches 0001–0007, softpipe only.
+iOS: arm64-apple-ios16.0, existing repo libc/sysroot and LLVM, no Apple SDK.
+No phone commands or execution. Main mesa-src / mesa-build were not modified.
+Transcript formatting: trailing spaces omitted.
+
+$ tooling/gpu/gles-host-test/run.sh
+PASS source: pristine + all seven patches (no Linux exceptions)
+ninja: Entering directory `/home/tadej/ios-nord-B/build/gpu/mesa-build-host'
+[1/5] Generating src/git_sha1.h with a custom command
+INFO gles2=enabled supplies ES dispatch; shared-glapi=enabled unchanged; gles1 not needed
+ES GL_VERSION: OpenGL ES 3.1 Mesa 25.0.7 (git-742a20f48c)
+ES GLSL_VERSION: OpenGL ES GLSL ES 3.10
+ES GL_RENDERER: softpipe
+ES extensions (raw Mesa, no SweetEAGL additions):
+GL_EXT_blend_minmax GL_EXT_multi_draw_arrays GL_EXT_texture_filter_anisotropic GL_EXT_texture_compression_s3tc GL_EXT_texture_compression_dxt1 GL_EXT_texture_compression_rgtc GL_EXT_texture_format_BGRA8888 GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_element_index_uint GL_OES_fbo_render_mipmap GL_OES_mapbuffer GL_OES_rgb8_rgba8 GL_OES_standard_derivatives GL_OES_stencil8 GL_OES_texture_3D GL_OES_texture_float GL_OES_texture_float_linear GL_OES_texture_half_float GL_OES_texture_half_float_linear GL_OES_texture_npot GL_OES_vertex_half_float GL_EXT_draw_instanced GL_EXT_texture_sRGB_decode GL_OES_EGL_image GL_OES_depth_texture GL_OES_packed_depth_stencil GL_EXT_texture_type_2_10_10_10_REV GL_NV_conditional_render GL_OES_get_program_binary GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_read_format_bgra GL_EXT_texture_storage GL_NV_pack_subimage GL_EXT_frag_depth GL_NV_fbo_color_attachments GL_OES_EGL_image_external GL_OES_EGL_sync GL_OES_vertex_array_object GL_OES_viewport_array GL_ANGLE_pack_reverse_row_order GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_EXT_occlusion_query_boolean GL_EXT_texture_rg GL_EXT_unpack_subimage GL_NV_draw_buffers GL_NV_read_buffer GL_NV_read_depth GL_NV_read_depth_stencil GL_NV_read_stencil GL_APPLE_sync GL_EXT_draw_buffers GL_EXT_instanced_arrays GL_EXT_map_buffer_range GL_EXT_shadow_samplers GL_KHR_debug GL_NV_generate_mipmap_sRGB GL_NV_pixel_buffer_object GL_OES_depth_texture_cube_map GL_OES_required_internalformat GL_OES_surfaceless_context GL_EXT_color_buffer_float GL_EXT_debug_label GL_EXT_sRGB_write_control GL_EXT_separate_shader_objects GL_EXT_shader_implicit_conversions GL_EXT_shader_integer_mix GL_EXT_base_instance GL_EXT_compressed_ETC1_RGB8_sub_texture GL_EXT_copy_image GL_EXT_draw_buffers_indexed GL_EXT_draw_elements_base_vertex GL_EXT_gpu_shader5 GL_EXT_multi_draw_indirect GL_EXT_primitive_bounding_box GL_EXT_render_snorm GL_EXT_shader_io_blocks GL_EXT_texture_border_clamp GL_EXT_texture_buffer GL_EXT_texture_cube_map_array GL_EXT_texture_norm16 GL_EXT_texture_view GL_KHR_context_flush_control GL_NV_image_formats GL_NV_shader_noperspective_interpolation GL_OES_copy_image GL_OES_draw_buffers_indexed GL_OES_draw_elements_base_vertex GL_OES_gpu_shader5 GL_OES_primitive_bounding_box GL_OES_shader_io_blocks GL_OES_texture_border_clamp GL_OES_texture_buffer GL_OES_texture_cube_map_array GL_OES_texture_stencil8 GL_OES_texture_storage_multisample_2d_array GL_OES_texture_view GL_EXT_blend_func_extended GL_EXT_buffer_storage GL_EXT_float_blend GL_EXT_geometry_point_size GL_EXT_geometry_shader GL_EXT_texture_sRGB_R8 GL_EXT_texture_sRGB_RG8 GL_KHR_no_error GL_OES_EGL_image_external_essl3 GL_OES_geometry_point_size GL_OES_geometry_shader GL_OES_shader_image_atomic GL_EXT_clear_texture GL_EXT_clip_cull_distance GL_EXT_conservative_depth GL_EXT_disjoint_timer_query GL_EXT_texture_compression_s3tc_srgb GL_MESA_shader_integer_functions GL_EXT_clip_control GL_EXT_color_buffer_half_float GL_EXT_texture_compression_bptc GL_EXT_texture_mirror_clamp_to_edge GL_KHR_parallel_shader_compile GL_EXT_EGL_image_storage GL_MESA_framebuffer_flip_y GL_EXT_depth_clamp GL_EXT_texture_query_lod GL_MESA_sampler_objects GL_EXT_EGL_image_storage_compression GL_EXT_texture_storage_compression GL_MESA_bgra
+E section 4: GL_APPLE_fence                                 absent
+E section 4: GL_APPLE_texture_filter_cubic                  absent
+E section 4: GL_APPLE_texture_ycbcr_basic_formats           absent
+E section 4: GL_APPLE_texture_ycbcr_extended_formats        absent
+E section 4: GL_APPLE_texture_xr                            absent
+E section 4: GL_APPLE_tile_order_rot                        absent
+E section 4: GL_EXT_shader_framebuffer_fetch                absent
+E section 4: GL_EXT_texture_filter_anisotropic              present
+E section 4: GL_EXT_texture_lod_bias                        absent
+E section 4: GL_IMG_texture_compression_pvrtc               absent
+E section 4: GL_KHR_texture_compression_astc_ldr            absent
+E section 4: GL_OES_standard_derivatives                    present
+E section 4: GL_OES_texture_float                           present
+E section 4: GL_OES_texture_float_linear                    present
+E section 4: GL_OES_texture_half_float                      present
+E section 4: GL_OES_texture_half_float_linear               present
+INFO E section 4: 6/16 present on native softpipe (freedreno may differ)
+PASS GL_EXT_texture_format_BGRA8888 and GL_OES_EGL_image exposed
+PASS ES GLSL ES 100 vertex compile
+PASS ES GLSL ES 100 fragment compile
+PASS ES GLSL ES 100 link
+PASS ES GLSL100 RGBA8 FBO: all 256 pixels exact; blended pixel(4,0)=128,0,127,128; GLsync wait=0x911a
+PASS ES GLSL ES 300 vertex compile
+PASS ES GLSL ES 300 fragment compile
+PASS ES GLSL ES 300 link
+PASS ES GLSL300 RGBA8 FBO: all 256 pixels exact; blended pixel(4,0)=128,0,127,128; GLsync wait=0x911a
+PASS ES glEGLImageTargetTexture2DOES invalid ID -> GL_INVALID_VALUE (Linux has no IOSurface)
+PASS ES glAlphaFunc -> GL_INVALID_OPERATION (genuine ES dispatch)
+PASS request ES 2.0: OpenGL ES 3.1 Mesa 25.0.7 (git-742a20f48c)
+PASS request ES 3.0: OpenGL ES 3.1 Mesa 25.0.7 (git-742a20f48c)
+PASS request ES 3.1: OpenGL ES 3.1 Mesa 25.0.7 (git-742a20f48c)
+PASS request ES 3.2: rejected (invalid or above screen capability)
+PASS request ES 1.0: rejected (invalid or above screen capability)
+PASS request ES 2.1: rejected (invalid or above screen capability)
+PASS request ES 3.3: rejected (invalid or above screen capability)
+PASS request ES 4.0: rejected (invalid or above screen capability)
+DESKTOP GL_VERSION: 3.3 (Compatibility Profile) Mesa 25.0.7 (git-742a20f48c)
+DESKTOP GLSL_VERSION: 3.30
+PASS DESKTOP negative control GLSL ES 100 vertex compile
+PASS DESKTOP negative control GLSL ES 100 fragment compile
+PASS DESKTOP negative control GLSL ES 100 link
+INFO DESKTOP same GLSL ES 100: accepted by Mesa compatibility
+PASS DESKTOP GLSL100 RGBA8 FBO: all 256 pixels exact; blended pixel(4,0)=128,0,127,128; GLsync wait=0x911a
+PASS DESKTOP negative control GLSL ES 300 vertex compile
+PASS DESKTOP negative control GLSL ES 300 fragment compile
+PASS DESKTOP negative control GLSL ES 300 link
+INFO DESKTOP same GLSL ES 300: accepted by Mesa compatibility
+PASS DESKTOP GLSL300 RGBA8 FBO: all 256 pixels exact; blended pixel(4,0)=128,0,127,128; GLsync wait=0x911a
+PASS negative control: desktop strings and AlphaFunc semantics differ even if ES shaders compile
+PASS all native GLES context checks
+PASS run.sh (native Linux softpipe; iOS GPU execution remains unverified)
+exit status: 0
+
+$ python3 tooling/gpu/gles-host-test/verify-ios.py
+PASS iOS cross-build: 1134/1134, zero failed commands
+PASS arm64 dylib: CS_ADHOC flags=0x20002; 3908 SHA-256 code pages verified
+SHA256 libOSMesa.8.dylib 5a4cba662237b95bc270d85d6f6678585cec5dac57d6c145bb0990b5a0aea332
+/home/tadej/ios-nord-B/build/gpu/mesa-build-es/src/gallium/targets/osmesa/libOSMesa.8.dylib:
+	@rpath/libOSMesa.8.dylib (compatibility version 9.0.0, current version 9.0.0)
+	/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.11)
+	/System/Library/Frameworks/IOSurface.framework/IOSurface (compatibility version 1.0.0, current version 1.0.0)
+	/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation (compatibility version 150.0.0, current version 1979.1.102)
+	/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 1500.65.0)
+	/usr/lib/libc++abi.dylib (compatibility version 1.0.0, current version 1500.65.0)
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1319.100.3)
+INFO install name and framework dependencies unchanged; no separate GLES library needed
+exit status: 0
+
+$ tooling/gpu/sweeteagl/check.sh
+PASS generator: 0x00d0 is the full export list, excluded; E §4 repairs applied
+2a4aa897f63f0bc633ecf6ff17215f96008badf602562e52710dbd8144dbfb2e  /home/tadej/ios-nord-B/build/phone/gpu/SweetEAGL.dylib
+a65970a732f22ed092c2bc00d10dce438b5530d3871d557a879a1a089f2afcb4  /home/tadej/ios-nord-B/build/phone/gpu/eagltest
+PASS coverage: 402 unique slots, all 58 QC offsets, glGetString 0x03b0 wrap
+PASS Mesa resolution: 323 direct names; 53 proc-address-only (proc-only.txt)
+INFO non-pass-through stub offsets: 0x0018, 0x00b8, 0x00c0, 0x0660, 0x0668, 0x0678, 0x0688, 0x0690, 0x0b00, 0x1fa0, 0x1fa8, 0x1fb0, 0x1fb8
+PASS SweetEAGL.dylib: arm64, signed, platform ios, minos 16.0, absolute dylibs, 34 undefined symbols in stubs
+PASS eagltest: arm64, signed, platform ios, minos 16.0, absolute dylibs, 25 undefined symbols in stubs
+PASS host checks (phone execution remains UNVERIFIED)
+exit status: 0

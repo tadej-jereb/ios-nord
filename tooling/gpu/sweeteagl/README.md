@@ -121,14 +121,25 @@ record per event/stub/trace offset. No per-frame GL logging continues afterward.
   NULL as expressly permitted by E §2/task. All other table words, including
   unextracted holes, contain a callable zero-return stub before named entries
   are installed. Unknown holes log as offset zero, not a fabricated mapping.
-* **OSMesa is not an ES frontend:** local Mesa `osmesa.c` selects desktop core
-  or compatibility profiles only. We request compatibility GL 3.3 with a private
-  16×16 RGBA buffer to retain `glAlphaFunc` and modern functions. API-2 and API-3
-  requests are both accepted; the Objective-C API query reports the request.
-  E §4's advice to advertise an ES version string would misrepresent the Mesa
-  context, so Mesa's actual GL strings are preserved. **UNVERIFIED:** CA's ES
-  shader sources and extension-dependent behavior on this desktop context.
-  No claim that rewriting a string changes Mesa's shader compiler is made.
+* **Real OpenGL ES context:** Mesa patch 0007 adds `OSMESA_ES_PROFILE` (`0x38`)
+  and selects Mesa's `API_OPENGLES2` state tracker. We request ES 3.0 with a
+  private 16×16 RGBA buffer; Mesa returns at least that version if the screen
+  supports it. If creation fails (including an older Mesa without 0007), we
+  request desktop compatibility GL 3.3. `SWEETEAGL_DESKTOP=1` forces that path.
+  The chosen profile and actual Mesa version are logged; GL strings are preserved.
+  API-2 and API-3 requests both return API **3**, including in the private record,
+  because QuartzCore retries API 2 and then requires `[ctx API] == 3` (E §1).
+  ES3 serves ES2 clients. `gles2=enabled` is required; existing shared glapi is
+  sufficient, and `gles1` is unnecessary. See
+  [native proof](../gles-host-test/PROOF.txt) for real ES dispatch, GLSL ES
+  1.00/3.00, BGRA sampling, exact FBO pixels, sync and the desktop control.
+  The native proof uses Linux softpipe: the iOS freedreno context and IOSurface
+  import still need a phone run. The desktop control's results must not be
+  interpreted as guaranteed GLSL ES failure on desktop Mesa. Before deploying,
+  handle the existing `glAlphaFunc` forwarding slot: a resolved address raises
+  `GL_INVALID_OPERATION` in ES. Its wrapper/generator are outside this task's
+  edit scope; exact locations and the extension comparison are in the
+  [handoff notes](../gles-host-test/README.md#deployment-handoff).
 * **Import contract:** E §5/§8's EGL/dma-buf description and suggested GLESv2
   dylib are superseded by the task and Mesa patch 0005. The image pointer is
   the IOSurface ID, passed to Mesa's `glEGLImageTargetTexture2DOES`.
