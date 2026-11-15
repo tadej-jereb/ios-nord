@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -331,7 +331,9 @@ parse_int(const char **p, int *out)
+ 		any = 1;
+ 	}
+ 	*p = s;
+-	*out = neg ? -v : v;
++	if (any) {
++		*out = neg ? -v : v;    /* nothing parsed: *out keeps its default */
++	}
+ 	return any;
+ }
+ 
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -199,6 +199,22 @@ cpuid_get_cpufamily(void)
+ 		break;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * avicii: the Kryo 475 (Cortex-A76/A55) is an unknown family, so hw.cpufamily
++	 * and the commpage say 0 and family-dispatched userland code takes its
++	 * generic path. Boot-arg sweetcpufamily=0xe81e7ef6 (CPUFAMILY_ARM_MONSOON_MISTRAL,
++	 * the iPhone X's A11, whose ARMv8.2 instruction set the A76/A55 cover)
++	 * reports the family the 20H392 userland was tuned for. Only the commpage
++	 * and hw.cpufamily read this; the kernel's own CPU handling does not.
++	 */
++	{
++		uint32_t fam = 0;
++		if (PE_parse_boot_argn("sweetcpufamily", &fam, sizeof(fam)) && fam != 0) {
++			cpufamily = (int)fam;
++		}
++	}
++#endif
+ 	return cpufamily;
+ }
+ 
