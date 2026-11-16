@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b47b869..d5a0307 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -156,7 +156,22 @@ avicii_usb_power_up(vm_offset_t gcc)
+ 		uint32_t id = usb_rd(dwc, 0xc120);
+ 		printf("SWEET USB: power-up: guard GDSC 0x%08x mock_utmi 0x%08x GSNPSID 0x%08x\n",
+ 		    gdsc, utmi, id);
+-		if ((id & 0xffff0000u) == 0x55330000u) {
++		/* 0141: a flash boot (ABL not in fastboot) leaves GDSC, master,
++		 * mock_utmi and a valid GSNPSID on, but the pipe CBCR (0x0f05c)
++		 * reads CLK_OFF and the first ep0 command times out (ring,
++		 * 2026-11-16 21:27Z). "Up" also needs a running pipe clock or
++		 * QSCRATCH GENERAL_CFG UTMI-as-PIPE (bits 0|3, as the cold path sets).
++		 */
++		uint32_t pipe = usb_rd(gcc, 0x0f05c);
++		uint32_t gcfg = 0;
++		vm_offset_t qsg = ml_io_map(LITO_QSCRATCH_PA, 0x100);
++		if (qsg) {
++			gcfg = usb_rd(qsg, 0x08);
++		}
++		bool pipe_ok = !(pipe & CBCR_CLK_OFF) || (gcfg & 9u) == 9u;
++		printf("SWEET USB: power-up: guard pipe CBCR 0x%08x QSCRATCH GENERAL_CFG 0x%08x -> pipe %s\n",
++		    pipe, gcfg, pipe_ok ? "running" : "NOT RUNNING, cold path");
++		if ((id & 0xffff0000u) == 0x55330000u && pipe_ok) {
+ 			printf("SWEET USB: power-up: already up, skipping\n");
+ 			return true;
+ 		}
