@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 89ce174..fed5e7f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3272,7 +3272,6 @@ gpu_stage_u(void)
+ 	    rc, c ? c->ts_retired : 0, got,
+ 	    (rc == 0 && got == 0x5AFE600Du) ?
+ 	    "KGSL UAPI SUBMIT OK (create+alloc+submit+ts via ioctl handlers)" : "FAIL");
+-	(void)0;
+ }
+ 
+ static int g_kgsl_major = -1;
+@@ -3489,12 +3488,6 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 		uint64_t waiting;
+ 		absolutetime_to_nanoseconds(g_waiting, &waiting);
+ 		gpu_times();
+-		{
+-			static unsigned every;
+-			if (every++ % 6u == 0) {
+-				(void)0;
+-			}
+-		}
+ 		{
+ 			volatile uint64_t *tm = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
+ 			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
+@@ -4002,7 +3995,6 @@ gpu_stage_v(void)
+ 	    dst->id, (unsigned long long)dst->gpuaddr, rc, fence, got,
+ 	    (rc == 0 && got == 0x5AFEDA7Au && chip == GPU_CHIP_ID) ?
+ 	    "MSM-DRM GEM NEW+SUBMIT+FENCE OK (gallium-freedreno path)" : "FAIL");
+-	(void)0;
+ }
+ 
+ static int g_drm_major = -1;

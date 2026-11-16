@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 38ddb6b..9909c18 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -341,9 +341,13 @@ again:
+ 		    " status 0x%x sense %x/%02x/%02x attempt %u\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], key, asc, ascq,
+ 		    attempt);
++		/* The activation command is itself issued through here: do not recurse if it too is "not ready". */
++		static bool activating;
+ 		if (status == UPIU_STATUS_CHECK && key == SENSE_NOT_READY &&
+-		    asc == 0x04 && ascq == 0x02) {
++		    asc == 0x04 && ascq == 0x02 && !activating) {
++			activating = true;
+ 			ufs_device_active();
++			activating = false;
+ 		}
+ 		if (ufs_retryable(status, key) && attempt++ < UFS_RETRIES) {
+ 			delay(1000 * (int)attempt);     /* 1, 2, 3 ms */
+@@ -433,11 +437,12 @@ ufs_find_partition(const char *want)
+ 	memcpy(&esz, b + 84, 4);
+ 	uint64_t last_usable;
+ 	memcpy(&last_usable, b + 48, 8);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++	/* 64-bit product: a corrupt nent must not wrap the size check and run the loop below past the bounce buffer. */
++	if (esz != 128 || nent == 0 || (uint64_t)nent * esz > BOUNCE_SIZE) {
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	error = ufs_read_blocks(entry_lba, (uint32_t)(((uint64_t)nent * esz + UFS_BLOCK - 1) / UFS_BLOCK));
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -700,7 +705,7 @@ sweet_ufs_psize(__unused dev_t dev)
+  */
+ #define SWEET_RAW_CHUNK (256u << 10)
+ static LCK_MTX_DECLARE(sweet_raw_lock, &sweet_ufs_grp);
+-static uint8_t sweet_raw_stage[SWEET_RAW_CHUNK] __attribute__((aligned(64)));
++static char sweet_raw_stage[SWEET_RAW_CHUNK] __attribute__((aligned(64)));
+ 
+ static int
+ sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)

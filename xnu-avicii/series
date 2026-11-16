@@ -143,3 +143,5 @@ apply 0145-avicii-panic-string-printf.patch
 apply 0146-avicii-publish-iortc-no-30s-wait.patch
 apply 0147-avicii-ufs-raw-uiomove.patch
 apply 0148-avicii-wall-clock-bootarg.patch
+apply 0149-avicii-ufs-hardening.patch
+apply 0150-avicii-gpu-dead-code.patch
