@@ -1,0 +1,35 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index ff15331..6f09228 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1095,6 +1095,30 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	{
+ 		extern void sweet_log_panic_flush(void);
+ 		extern void sweet_reset_after_panic(void);
++		/*
++		 * 0145: handle_debugger_trap() returns before
++		 * debugger_collect_diagnostics() when DebuggerHaltOtherCores()
++		 * fails, so no paniclog is written (0144 test: the panicked boot's
++		 * log ends at "SWEET RESET: panic" with no panic text). Print the
++		 * panic string ourselves; printf reaches the sweetlog ring.
++		 */
++		if (panic_format_str != NULL) {
++			char sweet_pstr[256];
++			va_list sweet_pargs;
++			sweet_pstr[0] = '\0';
++			if (panic_args != NULL) {
++				va_copy(sweet_pargs, *panic_args);
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wformat-nonliteral"
++				vsnprintf(sweet_pstr, sizeof(sweet_pstr), panic_format_str, sweet_pargs);
++#pragma clang diagnostic pop
++				va_end(sweet_pargs);
++			}
++			printf("SWEET PANIC: cpu %u caller 0x%lx: %s\n", (unsigned)cpu_number(),
++			    panic_caller, sweet_pstr[0] ? sweet_pstr : panic_format_str);
++			printf("SWEET PANIC: debugger halt-other-cores ret %d, diagnostics %s\n",
++			    (int)CPUDEBUGGERRET, debugger_panic_str ? "entered" : "not entered");
++		}
+ 		sweet_log_panic_flush();
+ 		/* 0133: reset into fastboot instead of spinning (sweetreset=0 keeps the spin). */
+ 		sweet_reset_after_panic();
