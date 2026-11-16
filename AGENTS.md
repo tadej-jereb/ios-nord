@@ -8,6 +8,8 @@ Bootloader unlocked **2026-11-12**. Current rung and what is proven: `docs/STATU
 
 ## Read first, in this order
 
+0. `README.md` — the project map (layout, which docs are current, which are history), then the
+   newest `docs/NEXT-*.md` — where the last session stopped and the next commands.
 1. `docs/STATUS.md` — where the work actually is, what is proven, what is next.
 2. `avicii/CONSTANTS.md` — every hardware constant with its dts citation. Do not use a
    number that is not in this file and cited.
@@ -29,8 +31,9 @@ Bootloader unlocked **2026-11-12**. Current rung and what is proven: `docs/STATU
   `docs/IMAGE_PROVENANCE.md` before it runs.
 - Procedures are numbered transcripts: one literal command per line, no prose inside a
   block, a gate before every destructive action.
-- No serial port exists on this phone. The log ring in `userdata` (pulled via TWRP or USB
-  ECM) is the only channel; `tooling/42-log-pull.sh` fetches it.
+- No serial port exists on this phone. Channels: SSH over USB Ethernet (root@192.168.7.2,
+  preset `usb`), the kernel log streamed as UDP to 192.168.7.1:5140 while USB is up, and the
+  log ring in `userdata` (`tooling/70-phone-boot.sh --pull` from recovery), which survives crashes.
 
 ## Layout
 

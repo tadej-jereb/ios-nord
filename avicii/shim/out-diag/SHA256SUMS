@@ -1,7 +1,0 @@
-754a9bc87c50feee87fc5428d373d956c8ea65b7aa3659285c76b69af5203714  stage-1/shim-boot.img
-f9793a701b2d387ab3cd455fbf99b0f4b3f044539087f6268a636c2d9141dfa5  stage-2/shim-boot.img
-95e1ab1c1a9e63ae1d7c4f69df2fd4af8f88fd228104ec88c03746eb3c1cb7fd  stage-3/shim-boot.img
-b85cc8afb64dd19bc14d515ce2a7b5996ec8a7378f263ea708b67c1b7cd5e22a  stage-4/shim-boot.img
-ead37aaab5e581fd93bb98d8f421c0b62cfb1f48a6d7ca87ad7806263b9ba651  stage-5/shim-boot.img
-cc3ad84bf0968a08624664b3a1d18aa4a60fd191930232fd09a4ac58c10526a9  ro1/shim-boot.img
-0c569aab06752e7669c719bc303d5f8e16a7ff730015f19c3611e45bd1aa1a2a  ro2/shim-boot.img

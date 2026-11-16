@@ -33,9 +33,9 @@ thing that kills a rung.
 | fact | source |
 |---|---|
 | a diag body of nothing but `for(;;) wfe` still dies ~6 s in, before the park | bisect result (trusted) |
-| **the death is a constant ~6 s whatever the image does** — even a body that deliberately self-resets after a 30 s counter spin dies at 6 s, i.e. the CPU never reaches the code and the 6 s is a host-side refusal/timeout, not a shim crash | `PROGRESS.txt:36-43` |
-| an **untouched stock `boot.img` boots** (18 s to the ABL's next stage), while the **same stock kernel re-packed by our packer does not** → the slot, the partition, the flash path and the ABL hand-off all work; what differs is *our packaging* | `PROGRESS.txt:46-58` |
-| header v1 vs v2 and the cmdline change nothing on our images; an AVB footer alone is not sufficient | `PROGRESS.txt:48-50` |
+| **the death is a constant ~6 s whatever the image does** — even a body that deliberately self-resets after a 30 s counter spin dies at 6 s, i.e. the CPU never reaches the code and the 6 s is a host-side refusal/timeout, not a shim crash | `docs/history/PROGRESS.txt:36-43` |
+| an **untouched stock `boot.img` boots** (18 s to the ABL's next stage), while the **same stock kernel re-packed by our packer does not** → the slot, the partition, the flash path and the ABL hand-off all work; what differs is *our packaging* | `docs/history/PROGRESS.txt:46-58` |
+| header v1 vs v2 and the cmdline change nothing on our images; an AVB footer alone is not sufficient | `docs/history/PROGRESS.txt:48-50` |
 | the stock boot image carries an **unsigned AVB hash footer** (`AVBf`, algorithm NONE) and `mkbootimg_v1.sh` now pads to the 96 MiB partition and appends one; until 2026-11-12 20:40 it did not, so **every image that has crashed so far had no footer** | `avicii/tools/mkbootimg_v1.sh` (`add_hash_footer --algorithm NONE`), `out-diag/bisect-1u` vs `bisect-1` |
 | the AVB footer is big-endian (`original_image_size` = BE u64 at footer offset 12); the `--verify` code reads that field little-endian and so always compares a huge number (harmless, but say `'>Q'` if that check is ever tightened) | observed footer bytes of any built image |
 | no console text ever, no ring line ever → console and UFS log are unproven | every image so far |
@@ -66,7 +66,7 @@ partition with nothing at the tail. This explains all four observations exactly:
 prints, nothing logs, the failure is body-independent, and it is quicker than any
 watchdog. Rung **1u** (rung 1 with the footer cut off) is the deliberate reproduction and
 **N1** (identical code, footer present) the single-variable swap. Note the parent's
-result that a footer alone is *not* sufficient (`PROGRESS.txt:50`) — H0a is a necessary
+result that a footer alone is *not* sufficient (`docs/history/PROGRESS.txt:50`) — H0a is a necessary
 piece, not the whole answer, which is exactly why 1u/1 are run before anything else.
 
 **H0b — the gzip carriage.** Our kernel section is a gzip member; the stock section is a

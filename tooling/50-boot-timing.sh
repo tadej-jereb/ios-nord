@@ -19,7 +19,7 @@
 # Nothing here is destructive beyond `flash boot_b` (the fallback slot the
 # project reserved for exactly this). Never `flash boot` unslotted.
 #
-#   tooling/50-boot-timing.sh --image out-telem/stage-6/shim-boot.img --runs 5
+#   tooling/50-boot-timing.sh --image build/phone/<boot>.img --runs 5
 #   tooling/50-boot-timing.sh --control --runs 5        # untouched stock image
 #   tooling/50-boot-timing.sh --image X --runs 1 --no-flash   # device is already
 #                                                           # in fastboot, image flashed
@@ -36,7 +36,7 @@ IMAGE=""
 CONTROL=0
 NOFLASH=0
 TIMEOUT_MS=${TIMEOUT_MS:-90000}
-OUTDIR=${OUTDIR:-$repo/out-telem/timing}
+OUTDIR=${OUTDIR:-$repo/logs/phone/timing}
 
 while [ $# -gt 0 ]; do
 	case $1 in

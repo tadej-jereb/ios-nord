@@ -33,7 +33,7 @@ of a core that parked, and it must be longer than any ABL retry or watchdog.
 ## 2. Expected signature per outcome
 
 Thresholds are in the table; they come from the two measured controls in
-`PROGRESS.txt:146-153` (stock 16.1 s to adb, our images ~6 s to fastboot, both
+`docs/history/PROGRESS.txt:146-153` (stock 16.1 s to adb, our images ~6 s to fastboot, both
 with the adb server killed) and from the ladder's own definition of a park
 (`docs/BISECT.md:14-17`: a park is *no* re-enumeration for 90 s).
 

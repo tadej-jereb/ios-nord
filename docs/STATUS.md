@@ -462,7 +462,7 @@ hang: the RAMDisk root had no job table and no job plists, so launchd had nothin
   /bin/sh -c '... ./tooling/60-qemu-boot.sh ...'` gives the same cap and leaves the run
   artifacts owned by the user, so the `chown` step drops out.
 - Phone: untouched. No `dd`, `build/ios16-root.img` not opened.
-- Next: `HANDOFF-HERMES-DAEMONS.md` (five parallel lanes: job map, tier-1 daemons on the RAMDisk,
+- Next: `docs/history/HANDOFF-HERMES-DAEMONS.md` (five parallel lanes: job map, tier-1 daemons on the RAMDisk,
   exec-failure log, run summary + parallel-safe harness, `userdata` gate options).
 
 # Status — 2026-11-14, launchd reaches "Early boot complete" (QEMU)
