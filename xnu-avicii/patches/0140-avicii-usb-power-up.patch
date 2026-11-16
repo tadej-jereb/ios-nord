@@ -1,0 +1,224 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -77,6 +77,200 @@
+ 	return v;
+ }
+ 
++/* 0140: sweetusbinit mask 16 (0x10), off by default. All register
++ * provenance and the mainline/CLO comparison are in avicii/CONSTANTS.md.
++ * Run before 0135 can enable mock_utmi: otherwise a partial cold boot
++ * could be mistaken for ABL's already-running USB path.
++ */
++#define USB_INIT_POWER_UP       16u
++#define LITO_HSPHY_PA           0x088e3000
++#define LITO_HSPHY_SIZE         0x110
++#define LITO_USB_MASTER_RCG     0x0f020
++#define LITO_USB_UTMI_RCG       0x0f038
++#define LITO_USB_BCR            0x0f000
++#define LITO_PHY_BCR            0x12000
++#define LITO_QSCRATCH_PA        0x0a6f8800
++
++static void
++usb_power_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Every configuration write reports its immediate readback. */
++static void
++usb_power_mask(const char *step, vm_offset_t base, uint32_t off,
++    uint32_t mask, uint32_t value)
++{
++	uint32_t before = usb_rd(base, off);
++	usb_power_write(base, off, (before & ~mask) | (value & mask));
++	printf("SWEET USB: power-up: %s +0x%05x 0x%08x -> 0x%08x\n",
++	    step, off, before, usb_rd(base, off));
++}
++
++static bool
++usb_power_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (unsigned us = 0; us < 10000; us++) {
++		if ((usb_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++usb_power_rcg(vm_offset_t gcc, uint32_t rcg, uint32_t cfg, const char *name)
++{
++	/* Source [10:8], HID [4:0], mode [13:12], HW control [20].
++	 * F(133333333, GPLL0_OUT_MAIN, 4.5, 0, 0) => 0x108.
++	 * F(19200000, BI_TCXO, 1, 0, 0) => 0x001 (not rain's 0).
++	 */
++	usb_power_mask(name, gcc, rcg + 4, 0x10371fu, cfg);
++	usb_power_mask("RCG UPDATE", gcc, rcg, 1u, 1u);
++	bool ok = usb_power_poll(gcc, rcg, 1u, 0);
++	printf("SWEET USB: power-up: RCG %s CMD 0x%08x CFG 0x%08x (%s)\n",
++	    name, usb_rd(gcc, rcg), usb_rd(gcc, rcg + 4), ok ? "ok" : "STUCK");
++	return ok;
++}
++
++static bool
++avicii_usb_power_up(vm_offset_t gcc)
++{
++	uint32_t gdsc = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	uint32_t master = usb_rd(gcc, 0x0f010), utmi = usb_rd(gcc, 0x0f01c);
++	uint32_t cfg = usb_rd(gcc, 0x0f07c);
++	vm_offset_t dwc = 0;
++	/* Never read the core across a gated NoC path. GSNPSID is only
++	 * "readable" here when its signature matches DWC3, not merely nonzero.
++	 */
++	if ((gdsc & (1u << 31)) &&
++	    !((master | cfg | utmi) & CBCR_CLK_OFF)) {
++		dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++		if (!dwc) {
++			printf("SWEET USB: power-up: DWC3 map failed, aborting\n");
++			return false;
++		}
++		uint32_t id = usb_rd(dwc, 0xc120);
++		printf("SWEET USB: power-up: guard GDSC 0x%08x mock_utmi 0x%08x GSNPSID 0x%08x\n",
++		    gdsc, utmi, id);
++		if ((id & 0xffff0000u) == 0x55330000u) {
++			printf("SWEET USB: power-up: already up, skipping\n");
++			return true;
++		}
++	} else {
++		printf("SWEET USB: power-up: guard GDSC 0x%08x master 0x%08x mock_utmi 0x%08x cfg 0x%08x; GSNPSID not read (gated)\n",
++		    gdsc, master, utmi, cfg);
++	}
++	/* Map everything before changing power/reset state. EUD is a separate
++	 * DT resource, not the old driver's fictitious QUSB2 register window.
++	 */
++	vm_offset_t phy = ml_io_map(LITO_HSPHY_PA, LITO_HSPHY_SIZE);
++	vm_offset_t eud = ml_io_map(QUSB2_PA, 4);
++	vm_offset_t qs = ml_io_map(LITO_QSCRATCH_PA, 0x100);
++	if (!dwc) {
++		dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	}
++	if (!phy || !eud || !qs || !dwc) {
++		printf("SWEET USB: power-up: MMIO map failed, aborting\n");
++		return false;
++	}
++	uint32_t eud_before = usb_rd(eud, 0);
++	printf("SWEET USB: power-up: EUD 0x%08x (read only)\n", eud_before);
++	if (eud_before) {
++		printf("SWEET USB: power-up: EUD enabled, aborting (CLO guard)\n");
++		return false;
++	}
++	/* Same RPMh helper and requests as 0113; no direct PMIC writes.
++	 * RPMh has no rail-voltage readback API: log each vote's return code.
++	 */
++	int e5 = sweet_rpmh_vreg_enable("ldoa5", 880);
++	printf("SWEET USB: power-up: rail L5 vote 880 mV result %d\n", e5);
++	int e12 = sweet_rpmh_vreg_enable("ldoa12", 1800);
++	printf("SWEET USB: power-up: rail L12 vote 1800 mV result %d\n", e12);
++	int e2 = sweet_rpmh_vreg_enable("ldoa2", 3075);
++	printf("SWEET USB: power-up: rail L2 vote 3075 mV result %d\n", e2);
++	if (e5 || e12 || e2) {
++		printf("SWEET USB: power-up: rail vote failed, aborting\n");
++		return false;
++	}
++	usb_power_mask("GDSC SW_COLLAPSE clear", gcc, GCC_USB30_PRIM_GDSCR, 1u, 0);
++	if (!usb_power_poll(gcc, GCC_USB30_PRIM_GDSCR, 1u << 31, 1u << 31)) {
++		printf("SWEET USB: power-up: GDSC STILL OFF 0x%08x, aborting\n",
++		    usb_rd(gcc, GCC_USB30_PRIM_GDSCR));
++		return false;
++	}
++	printf("SWEET USB: power-up: GDSC on 0x%08x -> 0x%08x\n",
++	    gdsc, usb_rd(gcc, GCC_USB30_PRIM_GDSCR));
++	if (!usb_power_rcg(gcc, LITO_USB_MASTER_RCG, 0x108, "master") ||
++	    !usb_power_rcg(gcc, LITO_USB_UTMI_RCG, 1, "mock_utmi")) {
++		printf("SWEET USB: power-up: RCG timeout, aborting\n");
++		return false;
++	}
++	/* Exactly the six controller clocks in lito-usb.dtsi:29-36.
++	 * No unverified ahb2phy offset; no SS PHY/PIPE dependency for USB2.
++	 */
++	static const struct { const char *name; uint32_t off; } branches[] = {
++		{ "master CBCR", 0x0f010 }, { "cfg-noc-axi CBCR", 0x0f07c },
++		{ "aggre-axi CBCR", 0x0f080 }, { "mock_utmi CBCR", 0x0f01c },
++		{ "sleep CBCR", 0x0f018 }, { "clkref CBCR", 0x8c010 },
++	};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		uint32_t before = usb_rd(gcc, branches[i].off);
++		usb_power_mask(branches[i].name, gcc, branches[i].off, 1u, 1u);
++		bool on = usb_power_poll(gcc, branches[i].off, CBCR_CLK_OFF, 0);
++		printf("SWEET USB: power-up: %s 0x%08x -> 0x%08x (%s)\n",
++		    branches[i].name, before, usb_rd(gcc, branches[i].off), on ? "on" : "STILL OFF");
++		if (!on) {
++			return false;
++		}
++	}
++	usb_power_mask("USB30_PRIM BCR assert", gcc, LITO_USB_BCR, 1u, 1u);
++	usb_power_mask("QUSB2PHY_PRIM BCR assert", gcc, LITO_PHY_BCR, 1u, 1u);
++	delay(100);
++	usb_power_mask("QUSB2PHY_PRIM BCR release", gcc, LITO_PHY_BCR, 1u, 0);
++	usb_power_mask("USB30_PRIM BCR release", gcc, LITO_USB_BCR, 1u, 0);
++	delay(100);
++	usb_power_mask("PHY CFG0 override", phy, 0x94, 2, 2);
++	usb_power_mask("PHY UTMI_CTRL5 POR assert", phy, 0x50, 2, 2);
++	usb_power_mask("PHY COMMON0 FSEL", phy, 0x54, 0x70, 0);
++	usb_power_mask("PHY COMMON1 PLLBTUNE", phy, 0x58, 0x20, 0x20);
++	/* Mainline passes mask=2,value=3; CLO passes mask=3,value=2.
++	 * Task requires omitting disputed steps, so retain REFCLK as found. */
++	printf("SWEET USB: power-up: omitted REFCLK_SEL: mainline/CLO mask-value disagreement, +0xa0 0x%08x unchanged\n",
++	    usb_rd(phy, 0xa0));
++	usb_power_mask("PHY COMMON1 VBUS select", phy, 0x58, 0x10, 0x10);
++	usb_power_mask("PHY CTRL1 VBUS valid", phy, 0x60, 1, 1);
++	usb_power_mask("PHY DT tune0", phy, 0x6c, 0xffffffffu, 0x63);
++	usb_power_mask("PHY DT tune1", phy, 0x70, 0xffffffffu, 0x85);
++	usb_power_mask("PHY DT tune2", phy, 0x74, 0xffffffffu, 0x17);
++	usb_power_mask("PHY COMMON2 VREGBYPASS", phy, 0x5c, 1, 1);
++	usb_power_mask("PHY CTRL2 suspend override", phy, 0x64, 0xc, 0xc);
++	usb_power_mask("PHY UTMI_CTRL0 SLEEPM", phy, 0x3c, 1, 1);
++	printf("SWEET USB: power-up: omitted SIDDQ: absent from CLO msm-4.19 layout\n");
++	delay(10);
++	usb_power_mask("PHY UTMI_CTRL5 POR release", phy, 0x50, 2, 0);
++	delay(10);
++	usb_power_mask("PHY CTRL2 suspend select release", phy, 0x64, 8, 0);
++	usb_power_mask("PHY CFG0 override release", phy, 0x94, 2, 0);
++	delay(1000);
++	usb_power_mask("QSCRATCH UTMI clock disable", qs, 0x08, 0x100, 0x100);
++	delay(200);
++	usb_power_mask("QSCRATCH UTMI as PIPE", qs, 0x08, 9, 9);
++	delay(200);
++	usb_power_mask("QSCRATCH UTMI clock enable", qs, 0x08, 0x100, 0);
++	/* Move the existing USB2 VBUS override ahead of the first ep0 command. */
++	usb_power_mask("QSCRATCH USB2 VBUS override", qs, 0x10, 0x10100000, 0x10100000);
++	usb_power_mask("DWC3 GUSB2PHYCFG", dwc, 0xc200, 0xffffffffu, 0x2400);
++	uint32_t id = usb_rd(dwc, 0xc120);
++	printf("SWEET USB: power-up: complete GSNPSID 0x%08x (%s)\n",
++	    id, (id & 0xffff0000u) == 0x55330000u ? "ok" : "INVALID");
++	printf("SWEET USB: power-up: omitted SS PHY/PIPE and ahb2phy: USB2 DT clock list only\n");
++	return (id & 0xffff0000u) == 0x55330000u;
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -100,6 +294,10 @@
+ 	 */
+ 	uint32_t init = 11; /* bits 1|2 from 0132, bit 8 enables lito clocks */
+ 	PE_parse_boot_argn("sweetusbinit", &init, sizeof(init));
++	if (enabled >= 2 && (init & USB_INIT_POWER_UP) && !avicii_usb_power_up(gcc)) {
++		printf("SWEET USB: power-up: failed, gadget not started\n");
++		return;
++	}
+ 	if (enabled >= 2 && (init & 8)) {
+ 		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+ 			if (!usb_cbcr[i].enable) {
+@@ -982,7 +1180,8 @@
+ 	 * .SUSPHY must be clear for an endpoint command to complete. boot-arg sweetusbinit
+ 	 * (default 11): 1 GCTL DSBLCLKGTNG|U2RSTECN as ABL, 2 clear ENBLSLPM|SUSPHY,
+ 	 * 4 GUSB3PIPECTL.SUSPHY (the SuperSpeed PHY is never powered here),
+-	 * 8 enable lito GCC branches in the probe before entering this function.
++	 * 8 enable lito GCC branches in the probe before entering this function,
++	 * 16 opt-in full lito USB2 power-up before the 0135 branch enables.
+ 	 */
+ 	{
+ 		uint32_t init = 11;

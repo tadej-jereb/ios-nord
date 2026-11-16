@@ -353,3 +353,91 @@ Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
 | Watchdog tick conversion | `32768` ticks/s nominal, as task F requests | NOT a measured watchdog rate: Linux uses **32765** by default; nominal sleep counter is 32768 Hz (`avicii/lito.dtsi:1454-1457`). Timeout labels are nominal seconds. | [same pinned driver, lines 147-151](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L147) |
 
 0136 source file SHA256: `531285a9a9df68f5aa5ac1ba26aaa41f2a983985c9352419b55f8033c820d8a5`. Fajita 0211 uses EN +0x04 / BITE +0x24 at 0x17980000; those offsets are not used on lito.
+
+## USB cold power-up (0140): pinned source ledger
+
+All addresses below are lito addresses; register layouts come from the matching
+vendor driver, checked against mainline. Source keys in the table expand to the
+immutable URLs below. Vendor sources use commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`; mainline is Linux v6.12
+commit `adc218676eef25575469234709c2d87185ca223a`; CLO msm-4.19 uses commit
+`1f946a612986353e1484dbde8e7ed2eb6b0b456b`. The fetched GCC and USB DTS files are byte-identical
+to `refs/lito-dts/gcc-lito.c` and `lito-usb.dtsi` (SHA256 `9ceaf56acd15e6e94cedad190ee5be9f60c56d59f2cc3a7bd57265974ca693ff`
+and `9131ad628fcb1c22a3d141c8345a462d722b1c541983d632425876f22bc46760`).
+
+- **GCC**: [gcc-lito.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/gcc-lito.c)
+- **RCG**: [clk-rcg2.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/clk-rcg2.c)
+- **F**: [clk-rcg.h](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/clk-rcg.h)
+- **B**: [clk-branch.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/clk-branch.c)
+- **RESET**: [reset.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/reset.c)
+- **GDSC**: [gdsc-regulator.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/clk/qcom/gdsc-regulator.c)
+- **DT**: [lito-usb.dtsi](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/arch/arm64/boot/dts/vendor/qcom/lito-usb.dtsi)
+- **GD**: [lito-gdsc.dtsi](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/arch/arm64/boot/dts/vendor/qcom/lito-gdsc.dtsi)
+- **REG**: [lito-regulators.dtsi](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/arch/arm64/boot/dts/vendor/qcom/lito-regulators.dtsi)
+- **CLO**: [phy-msm-snps-hs.c](https://git.codelinaro.org/clo/la/kernel/msm-4.19/-/blob/1f946a612986353e1484dbde8e7ed2eb6b0b456b/drivers/usb/phy/phy-msm-snps-hs.c)
+- **OP**: [phy-msm-snps-hs.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/usb/phy/phy-msm-snps-hs.c)
+- **ML**: [phy-qcom-snps-femto-v2.c](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c)
+- **MSM**: [dwc3-msm.c](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/usb/dwc3/dwc3-msm.c)
+- **QCOM**: [dwc3-qcom.c](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/drivers/usb/dwc3/dwc3-qcom.c)
+- **CORE**: [core.h](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/drivers/usb/dwc3/core.h)
+
+| Register / request | Value used | Exact source |
+|---|---|---|
+| GCC mapping | `0x00100000`, prefix size `0x90000` | 0135 table above, `avicii/lito.dtsi:1662-1664` |
+| USB GDSCR | GCC `+0xf004`; SW_COLLAPSE bit 0 clear, PWR_ON bit 31 set | GD:10-14; GDSC:29,35,289-319 |
+| Master RCG | CMD `+0xf020`, CFG `+4`; source 1 = GPLL0 main, HID `2*4.5-1=8`, mode 0; CFG masked value `0x108` = 133333333 Hz | GCC:49-53,866-893; F:10; RCG:25-41,508-547 |
+| Mock UTMI RCG | CMD `+0xf038`, CFG `+4`; source 0 = TCXO, HID `2*1-1=1`, mode 0; CFG masked value `0x001` = 19200000 Hz | GCC:49-53,815-818,896-912; F:10; RCG:25-41,508-547 |
+| RCG update and field mask | CMD bit 0 (poll clear); CFG mask `0x10371f` = HID `[4:0]`, source `[10:8]`, mode `[13:12]`, HW control bit 20 | RCG:25-41,108-128,508-547; both lito RCGs hid_width=5 |
+| USB30_PRIM BCR | GCC `+0xf000`, bit 0 assert 1 / release 0 | GCC:2606; RESET:32-57 (omitted map bit initializer = 0) |
+| QUSB2PHY_PRIM BCR | GCC `+0x12000`, bit 0 assert 1 / release 0 | GCC:2601; RESET:32-57 |
+| Six CBCRs | master `0xf010`, sleep `0xf018`, mock_utmi `0xf01c`, cfg `0xf07c`, aggre `0xf080`, clkref `0x8c010`; enable bit 0, CLK_OFF bit 31 | GCC:2302-2355,1062-1066,973-977; B:47-67; DT:29-36; 0135 table above |
+| DWC3 mapping | `0x0a600000`; prefix `0xd000` covers globals/device registers | DT:6-9; CORE:99-160 |
+| GSNPSID guard | `+0xc120`, mask `0xffff0000`, expected `0x55330000` | CORE:80-82,105,1246 |
+| HS PHY mapping | `0x088e3000`, span `0x110` | DT:99-104 |
+| EUD mapping / guard | `0x088e2000`, 4 bytes; nonzero => abort without writes | DT:102-105; CLO:346-349; OP:408-411 |
+| Rail votes | L5 `ldoa5` 880 mV; L12 `ldoa12` 1800 mV; L2 `ldoa2` 3075 mV | DT:106-109; REG:119-123,172-176,331-335; existing patch 0113 uses exactly these requests via `sweet_rpmh_vreg_enable` |
+| PHY CFG0 | `+0x94`, common override bit 1 set then clear | CLO:57-59,359-361,455-457; ML:60-62,417-419,464-466; OP:57-59 |
+| PHY UTMI_CTRL5 | `+0x50`, POR bit 1 set then clear | CLO:34-35,363-364,449-450; ML:30-31,420-421,458-459 |
+| PHY COMMON0 | `+0x54`, FSEL mask `0x70` clear to 0 (not unused FSEL_DEFAULT `0x30`) | CLO:37-40,366-367; ML:33-37,422-424 |
+| PHY COMMON1 | `+0x58`, PLLBTUNE bit 5 and VBUSVLDEXTSEL0 bit 4 set | CLO:42-44,369-370,375-376; ML:39-41,425-427,430-432 |
+| PHY CTRL1 | `+0x60`, VBUSVLDEXT0 bit 0 set | CLO:49-50,378-379; ML:46-47,433-435 |
+| PHY tuning | `+0x6c=0x63`, `+0x70=0x85`, `+0x74=0x17`, full 32-bit writes (mask `0xffffffff`) | DT:116-118; CLO:70-73,381-384 and `hsusb_phy_write_seq`; ML:54-56 (offsets) |
+| PHY COMMON2 | `+0x5c`, VREGBYPASS bit 0 set | CLO:46-47,439-440; ML:43-44,444-446 |
+| PHY CTRL2 | `+0x64`, SUSPEND_N bit 2 and SUSPEND_N_SEL bit 3 set; clear bit 3 after POR | CLO:52-55,442-444,452-453; ML:49-52,448-450,461-462 |
+| PHY UTMI_CTRL0 | `+0x3c`, SLEEPM bit 0 set | CLO:24-28,446-447; ML:20-24,452-453 |
+| PHY REFCLK_CTRL (read only here) | `+0xa0`; definitions mask `3`, default `2` agree, init calls disagree, so no write | CLO:61-63,372-373; ML:64-66,428-429 and helper:169-180 |
+| QSCRATCH mapping | DWC3 `+0xf8800` = `0x0a6f8800`; prefix `0x100` | DT:6-9; MSM:74-94 |
+| QSCRATCH GENERAL_CFG | `+0x08`; bit 8 set, bits 0 and 3 set (`9`), bit 8 clear | MSM:75,87-90,2066-2085; QCOM:35-38,517-532 |
+| QSCRATCH HS_PHY_CTRL | `+0x10`; VBUS valid bit 20 and session select bit 28 (`0x10100000`) set before ep0 | MSM:92-94; QCOM:30-33,119-131; existing 0073 override moved earlier in cold path |
+| GUSB2PHYCFG | `+0xc200=0x2400`, full write; 8-bit UTMI, turnaround 9, ENBLSLPM/SUSPHY clear | CORE:137,299-312; hardware ABL values in `docs/STATUS.md` 0132 flash-boot entry, existing 0132 |
+
+**Layout comparison and deliberately omitted steps.** CLO and OnePlus msm-4.19
+match mainline for all PHY offsets used above. Mainline adds COMMON0 SIDDQ bit 2
+and clears it during init (ML:34,455-456); neither downstream defines/uses it:
+0140 omits that write and logs why. REFCLK definitions match, but mainline's
+mask/value call is `(2,3)` while CLO/OnePlus use `(3,2)`. Per task instruction,
+0140 leaves REFCLK untouched and logs its value. It does not silently select one.
+No SS PHY/PIPE setup: USB2 uses QSCRATCH UTMI-as-PIPE, and the DT's six core
+clocks are the only branches enabled by this new function. Rain's ahb2phy branch
+has no counterpart sourced in gcc-lito.c and is omitted/logged. Existing 0135
+behavior remains unchanged after this function returns.
+
+No new GCTL overwrite: the existing 0132 device-mode/global-init sequence runs
+later. No debugfs tuning overrides, RCAL fuse override, EUD disable, or new PLL/
+CX voltage programming: the lito USB DT supplies only its three tune pairs and
+rail requests; the task's sequence does not source additional per-device values.
+EUD nonzero aborts as in CLO. A stuck GDSC/RCG/CBCR or failed RPMh vote aborts
+before the PHY reset; a bad final GSNPSID prevents gadget start.
+
+Timing values are bounded software waits, not new hardware constants: GDSC,
+RCG and branch polls cap at 10 ms; BCR assert/release settle 100 us (CLO reset
+uses 100..150 us); POR settles 10 us, final PHY settles 1 ms (rain template);
+QSCRATCH settles 200 us, inside upstream's 100..1000 us range.
+Rail requests preserve 0113 policy. L12 1800/L2 3075 mV are DT-range-valid
+requests, **UNVERIFIED as exact vendor set points**, not a claim of voltage
+readback. RPMh API returns status only, so rail lines report results instead of
+inventing PMIC before/after values. All new configuration MMIO writes log
+before/after readback. These changes have no hardware validation yet.
+
+Fetched PHY SHA256: ML `b3ada16f3fce7e5600b063016dfe2e81f66d8f092d2051c01f392010a8868f92`;
+CLO `0397d6a8986d7a4df4718bb0539a1518c11c3d7cb1931c428535f5d050059c3f`;
+OnePlus `3a2bf09ef6e6965e054c9f7502503998fb77f82f7fa4475bc7e0e14efb7fe69c`.

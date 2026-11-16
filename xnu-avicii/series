@@ -134,3 +134,4 @@ apply 0135-avicii-usb-lito-clocks.patch
 apply 0136-avicii-hang-watchdog.patch
 apply 0137-avicii-keys-fastboot-combo.patch
 apply 0139-avicii-panic-test.patch
+apply 0140-avicii-usb-power-up.patch
