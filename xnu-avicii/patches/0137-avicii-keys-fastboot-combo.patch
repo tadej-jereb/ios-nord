@@ -1,0 +1,47 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -8,6 +8,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <arm64/sweet_early.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -104,6 +105,11 @@
+ {
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++	int fastboot_combo = 1;
++	bool holding = false, fired = false;
++	uint64_t held_since = 0, hold_time;
++	PE_parse_boot_argn("sweetkeysfb", &fastboot_combo, sizeof(fastboot_combo));
++	nanoseconds_to_absolutetime(3ULL * NSEC_PER_SEC, &hold_time);
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -129,6 +135,24 @@
+ 				    k, state[k], pon, up, dn);
+ 				sweet_hid_key(k, state[k]);
+ 			}
++		}
++		/* 0137: polling thread context, after normal HID delivery. Require
++		 * successful reads of BOTH active-low GPIOs on every sample.
++		 * A release or read error breaks the continuous hold.
++		 */
++		if (fastboot_combo && uok && dok && now[1] && now[2]) {
++			uint64_t stamp = mach_absolute_time();
++			if (!holding) {
++				held_since = stamp;
++				holding = true;
++			} else if (!fired && stamp - held_since >= hold_time) {
++				fired = true; /* only once per hold, even if sweetreset=0 */
++				printf("SWEET KEYS: vol+ and vol- held 3 s: reset to fastboot\n");
++				sweet_reset("keys");
++			}
++		} else {
++			holding = false;
++			fired = false;
+ 		}
+ 		keys_wait();
+ 	}

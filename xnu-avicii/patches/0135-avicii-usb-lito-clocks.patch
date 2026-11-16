@@ -1,0 +1,74 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -52,14 +52,16 @@
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
++	bool        enable; /* 0135: branch to enable before DWC3 global init */
+ } usb_cbcr[] = {
+ 	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
++	{ "sleep", 0x0f018, true },
++	{ "mock_utmi", 0x0f01c, true },
++	{ "cfg-noc-axi", 0x0f07c, true },
++	{ "aggre-axi", 0x0f080, true },
+ 	{ "ahb2phy", 0x6a004 },
+ 	{ "clkref", 0x8c010 },
++	{ "pipe", 0x0f05c, true },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -92,6 +94,34 @@
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	/* 0135: lito GCC branches (refs/lito-dts/gcc-lito.c; CONSTANTS.md).
++	 * Run before the clock guard too: cfg-noc may be off on a flash boot.
++	 * sweetusb=1 remains a read-only probe. Never reset the HS PHY.
++	 */
++	uint32_t init = 11; /* bits 1|2 from 0132, bit 8 enables lito clocks */
++	PE_parse_boot_argn("sweetusbinit", &init, sizeof(init));
++	if (enabled >= 2 && (init & 8)) {
++		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++			if (!usb_cbcr[i].enable) {
++				continue;
++			}
++			uint32_t before = usb_rd(gcc, usb_cbcr[i].off), after = before;
++			if (before & CBCR_CLK_OFF) {
++				/* CLK_OFF is read-only status; request CLK_ENABLE (bit 0). */
++				*(volatile uint32_t *)(gcc + usb_cbcr[i].off) = before | 1u;
++				__asm__ volatile ("dmb oshst" ::: "memory");
++				for (unsigned us = 0; us < 1000; us++) {
++					delay(1);
++					after = usb_rd(gcc, usb_cbcr[i].off);
++					if (!(after & CBCR_CLK_OFF)) {
++						break;
++					}
++				}
++			}
++			printf("SWEET USB: clk %s CBCR 0x%08x -> 0x%08x (%s)\n",
++			    usb_cbcr[i].name, before, after, (after & CBCR_CLK_OFF) ? "STILL OFF" : "on");
++		}
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -950,11 +980,12 @@
+ 	 * "ep0 cmd 0x1 timeout"; after `fastboot boot` ABL left GCTL 0x00112001, GUSB2PHYCFG
+ 	 * 0x2400). Linux dwc3_send_gadget_ep_cmd: in USB 2.0 operation GUSB2PHYCFG.ENBLSLPM and
+ 	 * .SUSPHY must be clear for an endpoint command to complete. boot-arg sweetusbinit
+-	 * (default 3): 1 GCTL DSBLCLKGTNG|U2RSTECN as ABL, 2 clear ENBLSLPM|SUSPHY,
+-	 * 4 GUSB3PIPECTL.SUSPHY (the SuperSpeed PHY is never powered here).
++	 * (default 11): 1 GCTL DSBLCLKGTNG|U2RSTECN as ABL, 2 clear ENBLSLPM|SUSPHY,
++	 * 4 GUSB3PIPECTL.SUSPHY (the SuperSpeed PHY is never powered here),
++	 * 8 enable lito GCC branches in the probe before entering this function.
+ 	 */
+ 	{
+-		uint32_t init = 3;
++		uint32_t init = 11;
+ 		PE_parse_boot_argn("sweetusbinit", &init, sizeof(init));
+ 		uint32_t gctl = dwc_rd(GCTL), u2 = dwc_rd(0xc200), u3 = dwc_rd(0xc2c0), guctl = dwc_rd(0xc12c);
+ 		if (init & 1) {

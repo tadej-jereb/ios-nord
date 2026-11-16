@@ -328,3 +328,28 @@ Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
 | GPU OPP RPMh levels (bin 0) | 275 MHz LOW_SVS (64), 400 SVS (128), 500 SVS_L1 (192), 625 NOM (256) | GMU's own: 200 MHz | `lito-gpu.dtsi:21-62,196-245` |
 | Zap shader load | `a620_zap.mdt` = `.b00`+`.b01` (ELF32 header + hash); one load segment `.b02` (0x68c B, paddr 0x5000, relocatable, **p_align 0x100000**). PAS_MEM_SETUP needs a 1 MiB-aligned base: `pil_gpu_region@8bc15400` is refused (`0xffcfffba`), kernel memory on a 1 MiB boundary accepted (0124) | `qcom,kgsl-hyp` names no memory-region | program headers of `src/gpu-fw/a620_zap.mdt`; `logs/phone/gpu-0123-sweetgpu9.txt`, `gpu-0124-sweetgpu9.txt` |
 | A620 core registers (layer 3, verified) | PC_DBG_ECO_CNTL 0x10200, RB_NC_MODE 0x12, TPL1 0x2, SP 0x22, UCHE_MODE 1<<21, hang 0x3ffff, CP_APRIV_CNTL 0x6e, RB_CNTL 0x800020c; no UCHE GMEM range | ME_INIT + CP_MEM_WRITE verified | vendor `adreno_a6xx.c` a6xx_start/a6xx_rb_start; `lito-gpu.dtsi` ubwc-mode 3, hbb 14 |
+
+| USB GCC constant (0135) | Value | Notes | Citation |
+|---|---|---|---|
+| USB master CBCR | `0xf010` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2302-2306` |
+| USB sleep CBCR | `0xf018` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2338-2342` |
+| USB mock_utmi CBCR | `0xf01c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2320-2324` |
+| USB cfg-noc-axi CBCR | `0xf07c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:1062-1066` |
+| USB aggre-axi CBCR | `0xf080` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:973-977` |
+| USB pipe CBCR | `0xf05c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2400-2404` |
+| USB clkref CBCR | `0x8c010` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2351-2355` |
+| USB GCC mapping | base `0x00100000`, size `0x00090000` | Driver maps a prefix of the vendor `0x1f0000` span; covers all USB CBCRs | `avicii/lito.dtsi:1662-1664` |
+
+| Watchdog constant (0136) | Value | Notes | Citation |
+|---|---|---|---|
+| APSS watchdog mapping | `0x17c10000`, `0x1000` bytes | qcom,msm-watchdog | `avicii/lito.dtsi:1465-1468` |
+| WDT0_RST | `0x04` | Offset from watchdog base | [SM7250 watchdog_v2.c, commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`, line 46](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L46) |
+| WDT0_EN | `0x08` | Offset from watchdog base | [SM7250 watchdog_v2.c, commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`, line 47](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L47) |
+| WDT0_STS | `0x0c` | Offset from watchdog base | [SM7250 watchdog_v2.c, commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`, line 48](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L48) |
+| WDT0_BARK_TIME | `0x10` | Offset from watchdog base | [SM7250 watchdog_v2.c, commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`, line 49](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L49) |
+| WDT0_BITE_TIME | `0x14` | Offset from watchdog base | [SM7250 watchdog_v2.c, commit `9ea68e4dee77be15d37a9044ecae6754fb2ca454`, line 50](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L50) |
+| Watchdog control values | RST `1`, EN `1` enable / `0` disable | Plain MMIO writes | [same pinned driver, lines 187-215](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L187) |
+| Watchdog counter | 20 bits (`0xfffff`) | Policy: accept S=1..26 so (S+5)*32768 fits | [same pinned driver, line 390](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L390) |
+| Watchdog tick conversion | `32768` ticks/s nominal, as task F requests | NOT a measured watchdog rate: Linux uses **32765** by default; nominal sleep counter is 32768 Hz (`avicii/lito.dtsi:1454-1457`). Timeout labels are nominal seconds. | [same pinned driver, lines 147-151](https://github.com/LineageOS/android_kernel_oneplus_sm7250/blob/9ea68e4dee77be15d37a9044ecae6754fb2ca454/drivers/soc/qcom/watchdog_v2.c#L147) |
+
+0136 source file SHA256: `531285a9a9df68f5aa5ac1ba26aaa41f2a983985c9352419b55f8033c820d8a5`. Fajita 0211 uses EN +0x04 / BITE +0x24 at 0x17980000; those offsets are not used on lito.

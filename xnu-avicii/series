@@ -130,3 +130,6 @@ apply 0131-avicii-surface-pitch-64.patch
 apply 0132-avicii-usb-global-init-flash-boot.patch
 apply 0133-avicii-reset-to-fastboot.patch
 apply 0134-avicii-reset-pon-reason.patch
+apply 0135-avicii-usb-lito-clocks.patch
+apply 0136-avicii-hang-watchdog.patch
+apply 0137-avicii-keys-fastboot-combo.patch

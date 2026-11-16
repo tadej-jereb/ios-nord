@@ -1,0 +1,148 @@
+--- /dev/null
++++ b/osfmk/arm64/sweet_wdt.c
+@@ -0,0 +1,122 @@
++/* Avicii APSS watchdog. Register provenance: avicii/CONSTANTS.md (0136).
++ * Offset layout from OnePlus SM7250 watchdog_v2.c, not fajita's SDM845.
++ * sweetwdt=S: bark S seconds, bite S+5; zero leaves hardware untouched.
++ * sweetwdt_test=1 stops feeding at 60 seconds after arming.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <stdint.h>
++#include <kern/startup.h>
++#include <kern/misc_protos.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define WDT_PA         0x17c10000UL
++#define WDT_SIZE       0x1000
++#define WDT_RST        0x04
++#define WDT_EN         0x08
++#define WDT_STS        0x0c
++#define WDT_BARK       0x10
++#define WDT_BITE       0x14
++#define WDT_TICKS      32768u /* requested nominal rate; Linux uses 32765 */
++
++static vm_offset_t wdt_base;
++static thread_call_t wdt_call;
++static uint32_t wdt_seconds, wdt_test;
++static uint64_t wdt_interval, wdt_test_end;
++
++void sweet_wdt_disable(void);
++
++static uint32_t
++wdt_read(uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(wdt_base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++wdt_write(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(wdt_base + off) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Reset path: no allocation, locks or waits. A racing pet cannot re-enable EN. */
++void
++sweet_wdt_disable(void)
++{
++	if (wdt_base) {
++		wdt_write(WDT_EN, 0);
++	}
++}
++
++static void
++wdt_pet(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	uint64_t now = mach_absolute_time();
++	if (wdt_test && now >= wdt_test_end) {
++		printf("SWEET WDT: test: 60 s elapsed, stop petting\n");
++		return;
++	}
++	wdt_write(WDT_RST, 1);
++	uint64_t next = now + wdt_interval;
++	/* Stop precisely at the test deadline, even for a long pet interval. */
++	if (wdt_test && next > wdt_test_end) {
++		next = wdt_test_end;
++	}
++	thread_call_enter_delayed(wdt_call, next);
++}
++
++static void
++wdt_start(void)
++{
++	PE_parse_boot_argn("sweetwdt", &wdt_seconds, sizeof(wdt_seconds));
++	PE_parse_boot_argn("sweetwdt_test", &wdt_test, sizeof(wdt_test));
++	if (!wdt_seconds) {
++		printf("SWEET WDT: disabled (sweetwdt=0)\n");
++		return;
++	}
++	/* STS exposes a 20-bit counter (Linux watchdog_v2.c:390).
++	 * Keep both thresholds below that limit; reject instead of wrapping.
++	 */
++	if (wdt_seconds > 26) {
++		printf("SWEET WDT: not armed: sweetwdt must be 1..26 s\n");
++		return;
++	}
++	wdt_call = thread_call_allocate(wdt_pet, NULL);
++	if (!wdt_call) {
++		printf("SWEET WDT: not armed: thread_call allocation failed\n");
++		return;
++	}
++	wdt_base = ml_io_map(WDT_PA, WDT_SIZE);
++	if (!wdt_base) {
++		thread_call_free(wdt_call);
++		printf("SWEET WDT: not armed: MMIO map failed\n");
++		return;
++	}
++	uint32_t en = wdt_read(WDT_EN), sts = wdt_read(WDT_STS);
++	wdt_write(WDT_EN, 0);
++	wdt_write(WDT_BARK, wdt_seconds * WDT_TICKS);
++	wdt_write(WDT_BITE, (wdt_seconds + 5) * WDT_TICKS);
++	wdt_write(WDT_RST, 1);
++	wdt_write(WDT_EN, 1);
++	if (!(wdt_read(WDT_EN) & 1u)) {
++		wdt_write(WDT_EN, 0);
++		printf("SWEET WDT: not armed: EN readback is disabled\n");
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)wdt_seconds * NSEC_PER_SEC / 2, &wdt_interval);
++	uint64_t duration;
++	nanoseconds_to_absolutetime(60ULL * NSEC_PER_SEC, &duration);
++	wdt_test_end = mach_absolute_time() + duration;
++	printf("SWEET WDT: base mapped, EN %x STS %x -> armed, bark %u s bite %u s\n",
++	    en, sts, wdt_seconds, wdt_seconds + 5);
++	wdt_pet(NULL, NULL);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, wdt_start);
++#endif
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,6 +42,7 @@
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/sweet_reset.c	standard
++osfmk/arm64/sweet_wdt.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+--- a/osfmk/arm64/sweet_reset.c
++++ b/osfmk/arm64/sweet_reset.c
+@@ -237,6 +237,10 @@
+ 		return;
+ 	}
+ 	{
++		extern void sweet_wdt_disable(void);
++		sweet_wdt_disable(); /* 0136: EN=0 before deliberate reset */
++	}
++	{
+ 		uint8_t old = 0;
+ 		int rb = sweet_pon_set_reason(sweet_pon_reason_for(sweet_reset_mode), &old);
+ 		printf("SWEET RESET: %s -> %s (PON %#x -> %#x)\n", why,
