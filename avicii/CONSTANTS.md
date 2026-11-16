@@ -328,3 +328,14 @@ Sources: LineageOS `android_kernel_oneplus_sm7250` `lineage-20`.
 | GPU OPP RPMh levels (bin 0) | 275 MHz LOW_SVS (64), 400 SVS (128), 500 SVS_L1 (192), 625 NOM (256) | GMU's own: 200 MHz | `lito-gpu.dtsi:21-62,196-245` |
 | Zap shader load | `a620_zap.mdt` = `.b00`+`.b01` (ELF32 header + hash); one load segment `.b02` (0x68c B, paddr 0x5000, relocatable, **p_align 0x100000**). PAS_MEM_SETUP needs a 1 MiB-aligned base: `pil_gpu_region@8bc15400` is refused (`0xffcfffba`), kernel memory on a 1 MiB boundary accepted (0124) | `qcom,kgsl-hyp` names no memory-region | program headers of `src/gpu-fw/a620_zap.mdt`; `logs/phone/gpu-0123-sweetgpu9.txt`, `gpu-0124-sweetgpu9.txt` |
 | A620 core registers (layer 3, verified) | PC_DBG_ECO_CNTL 0x10200, RB_NC_MODE 0x12, TPL1 0x2, SP 0x22, UCHE_MODE 1<<21, hang 0x3ffff, CP_APRIV_CNTL 0x6e, RB_CNTL 0x800020c; no UCHE GMEM range | ME_INIT + CP_MEM_WRITE verified | vendor `adreno_a6xx.c` a6xx_start/a6xx_rb_start; `lito-gpu.dtsi` ubwc-mode 3, hbb 14 |
+
+| USB GCC constant (0135) | Value | Notes | Citation |
+|---|---|---|---|
+| USB master CBCR | `0xf010` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2302-2306` |
+| USB sleep CBCR | `0xf018` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2338-2342` |
+| USB mock_utmi CBCR | `0xf01c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2320-2324` |
+| USB cfg-noc-axi CBCR | `0xf07c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:1062-1066` |
+| USB aggre-axi CBCR | `0xf080` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:973-977` |
+| USB pipe CBCR | `0xf05c` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2400-2404` |
+| USB clkref CBCR | `0x8c010` | GCC-relative; enable bit 0; CLK_OFF bit 31 (task E status contract) | `refs/lito-dts/gcc-lito.c:2351-2355` |
+| USB GCC mapping | base `0x00100000`, size `0x00090000` | Driver maps a prefix of the vendor `0x1f0000` span; covers all USB CBCRs | `avicii/lito.dtsi:1662-1664` |
