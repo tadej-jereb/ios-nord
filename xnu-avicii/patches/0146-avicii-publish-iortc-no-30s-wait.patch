@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0fc9e21..6ac5081 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -30,6 +30,14 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
++	/*
++	 * 0146: no RTC driver on avicii. IOKitInitializeTime() waited the full
++	 * 30 s for an IORTC resource on every boot (sweetlogts=1 timeline,
++	 * 2026-11-16: "using N buffer headers" at 16.47 s, next line at 46.47 s).
++	 * Publish it so the wait returns at once, as in
++	 * refs/rrrd-jpg-ios-sweet/xnu/patches/0086-sweet-wall-clock.patch.
++	 */
++	publishResource("IORTC", kOSBooleanTrue);
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
