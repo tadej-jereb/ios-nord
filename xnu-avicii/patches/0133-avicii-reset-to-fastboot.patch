@@ -1,0 +1,188 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..c5faee8 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -753,6 +753,16 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
++#if defined(SWEET)
++	/*
++	 * 0133: PE_halt_restart is NULL on avicii, so PEHaltRestart returned.
++	 * Reset into fastboot (a halt too: an "off" phone cannot be reached again).
++	 */
++	{
++		extern void sweet_reset(const char *why);
++		sweet_reset(reboot ? "reboot" : "halt");
++	}
++#endif
+ 	while (1) {
+ 		;
+ 	}
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..4ff7f41 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,8 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++void sweet_reset(const char *why);
++void sweet_reset_after_panic(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/osfmk/arm64/sweet_reset.c b/osfmk/arm64/sweet_reset.c
+new file mode 100644
+index 0000000..e9b9901
+--- /dev/null
++++ b/osfmk/arm64/sweet_reset.c
+@@ -0,0 +1,121 @@
++/*
++ * 0133 (avicii): a real reset path, so every reboot, halt and panic ends in
++ * the boot loader's fastboot instead of spinning until someone holds the keys.
++ *
++ * XNU leaves PE_halt_restart NULL here (SweetPlatformExpert does not set it),
++ * so halt_all_cpus() and the panic path used to spin forever. This file is the
++ * reset the boot shim already proved on hardware (avicii/shim/shim.c reset()):
++ * write the "bootloader" restart reason into IMEM, then PSCI SYSTEM_RESET,
++ * then drop PS_HOLD as a fallback. ABL reads the IMEM word and stays in
++ * fastboot, where the host can `fastboot boot` the next image unattended.
++ *
++ * Boot-args:
++ *   sweetreset=N      0 = old behaviour (spin), 1 = fastboot (default),
++ *                     2 = recovery (magic UNVERIFIED on avicii), 3 = normal boot
++ *   sweetpanicwait=S  seconds to leave a panic on the panel before the reset (default 3)
++ *
++ * Constants (avicii/CONSTANTS.md):
++ *   IMEM 0x146ab000, restart_reason @0x65c   lito.dtsi:716-719,728-730
++ *   PS_HOLD 0xc264000                        lito.dtsi:1326-1328
++ *   0x77665500 = bootloader                  proven by the shim (SHIM_BOOT.md "A fallback to fastboot")
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <stdint.h>
++#include <kern/startup.h>
++#include <kern/misc_protos.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++#define SWEET_IMEM_PA           0x146ab000UL
++#define SWEET_IMEM_RR_OFF       0x65cUL
++#define SWEET_PSHOLD_PA         0x0c264000UL
++#define SWEET_RR_BOOTLOADER     0x77665500U
++#define SWEET_RR_RECOVERY       0x77665502U     /* UNVERIFIED: msm-poweroff convention */
++#define PSCI_0_2_SYSTEM_RESET   0x84000009ULL
++
++static uint32_t sweet_reset_mode = 1;
++static uint32_t sweet_panic_wait_s = 3;
++static vm_offset_t sweet_imem_va;
++static vm_offset_t sweet_pshold_va;
++
++static const char *
++sweet_reset_mode_name(uint32_t m)
++{
++	switch (m) {
++	case 0: return "spin";
++	case 1: return "fastboot";
++	case 2: return "recovery";
++	case 3: return "normal";
++	default: return "?";
++	}
++}
++
++static void
++sweet_reset_startup(void)
++{
++	(void)PE_parse_boot_argn("sweetreset", &sweet_reset_mode, sizeof(sweet_reset_mode));
++	(void)PE_parse_boot_argn("sweetpanicwait", &sweet_panic_wait_s, sizeof(sweet_panic_wait_s));
++	if (sweet_reset_mode > 3) {
++		sweet_reset_mode = 1;
++	}
++	if (sweet_reset_mode != 0) {
++		/* Mapped now: the panic path must not allocate. */
++		sweet_imem_va = ml_io_map(SWEET_IMEM_PA, 0x1000);
++		sweet_pshold_va = ml_io_map(SWEET_PSHOLD_PA, 0x1000);
++	}
++	printf("SWEET RESET: mode %u (%s), panic wait %u s, imem %s, pshold %s\n",
++	    sweet_reset_mode, sweet_reset_mode_name(sweet_reset_mode), sweet_panic_wait_s,
++	    sweet_imem_va ? "mapped" : "unmapped", sweet_pshold_va ? "mapped" : "unmapped");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_reset_startup);
++
++/* Never returns unless sweetreset=0. Safe in any context: no locks, no allocation. */
++void
++sweet_reset(const char *why)
++{
++	register uint64_t x0 __asm__("x0");
++
++	if (sweet_reset_mode == 0) {
++		return;
++	}
++	printf("SWEET RESET: %s -> %s\n", why, sweet_reset_mode_name(sweet_reset_mode));
++	if (sweet_imem_va != 0 && sweet_reset_mode != 3) {
++		*(volatile uint32_t *)(sweet_imem_va + SWEET_IMEM_RR_OFF) =
++		    sweet_reset_mode == 2 ? SWEET_RR_RECOVERY : SWEET_RR_BOOTLOADER;
++	}
++	__builtin_arm_dsb(0xf);
++	x0 = PSCI_0_2_SYSTEM_RESET;
++	__asm__ volatile("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
++	    "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	/* PSCI returned: drop PS_HOLD (the PMIC then resets the SoC). */
++	if (sweet_pshold_va != 0) {
++		*(volatile uint32_t *)sweet_pshold_va = 0;
++		__builtin_arm_dsb(0xf);
++	}
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
++/* Called from panic_trap_to_debugger() right after the log ring is flushed to disk. */
++void
++sweet_reset_after_panic(void)
++{
++	uint64_t now, end, wait;
++
++	if (sweet_reset_mode == 0) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)sweet_panic_wait_s * NSEC_PER_SEC, &wait);
++	now = mach_absolute_time();
++	end = now + wait;
++	while (mach_absolute_time() < end) {
++		;
++	}
++	sweet_reset("panic");
++}
++#endif /* SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..f26b08c 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_reset.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index f7d263e..5cf7bf6 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1094,7 +1094,10 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	 */
+ 	{
+ 		extern void sweet_log_panic_flush(void);
++		extern void sweet_reset_after_panic(void);
+ 		sweet_log_panic_flush();
++		/* 0133: reset into fastboot instead of spinning (sweetreset=0 keeps the spin). */
++		sweet_reset_after_panic();
+ 	}
+ #endif
+ 

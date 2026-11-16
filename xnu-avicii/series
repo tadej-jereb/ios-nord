@@ -128,3 +128,4 @@ apply 0129-avicii-gpu-gles-bundle-and-bind-accel.patch
 apply 0130-avicii-fb-swapwait-until-shown.patch
 apply 0131-avicii-surface-pitch-64.patch
 apply 0132-avicii-usb-global-init-flash-boot.patch
+apply 0133-avicii-reset-to-fastboot.patch
