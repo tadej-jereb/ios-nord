@@ -1,0 +1,51 @@
+--- /dev/null
++++ b/osfmk/arm64/sweet_panic_test.c
+@@ -0,0 +1,38 @@
++/* Opt-in panic-path test. No hardware access; 0133 handles the panic reset. */
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <stdint.h>
++#include <kern/startup.h>
++#include <kern/misc_protos.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++
++static void
++sweet_panic_test_fire(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	panic("sweetpanic_test");
++}
++
++static void
++sweet_panic_test_start(void)
++{
++	uint32_t seconds = 0;
++	PE_parse_boot_argn("sweetpanic_test", &seconds, sizeof(seconds));
++	if (!seconds) {
++		return;
++	}
++	thread_call_t call = thread_call_allocate(sweet_panic_test_fire, NULL);
++	if (!call) {
++		printf("SWEET PANIC TEST: not armed: thread_call allocation failed\n");
++		return;
++	}
++	uint64_t interval;
++	nanoseconds_to_absolutetime((uint64_t)seconds * NSEC_PER_SEC, &interval);
++	printf("SWEET PANIC TEST: armed, panic in %u s\n", seconds);
++	thread_call_enter_delayed(call, mach_absolute_time() + interval);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, sweet_panic_test_start);
++#endif
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -43,6 +43,7 @@
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/sweet_reset.c	standard
+ osfmk/arm64/sweet_wdt.c	standard
++osfmk/arm64/sweet_panic_test.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
