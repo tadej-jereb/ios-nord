@@ -27,7 +27,9 @@ on:
         description: "xnu MACHINE_CONFIG"
         default: SWEET
       runner:
-        description: "runs-on label: macos-15 (arm64), macos-15-intel (x86 pool, when arm64 is congested), self-hosted"
+        description: "Build runner pool"
+        type: choice
+        options: [macos-15, macos-15-intel, xnu-vm]
         default: macos-15
       keep_going:
         description: "make -k (collect every compile error in one run)"
@@ -61,15 +63,10 @@ env:
 
 jobs:
   build:
-    # macOS 14 ships Xcode 15.x: its `iig` still matches the xnu-8796 IORPC ABI.
-    # Xcode 16's iig emits IORPC.kernelContent, which this xnu does not have.
-    runs-on: ${{ inputs.runner || 'macos-15' }}
+    # Pushes keep using the hosted pool; opt into the VM by dispatch.
+    runs-on: ${{ inputs.runner == 'xnu-vm' && fromJSON('["self-hosted", "xnu-vm"]') || inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     env:
-      # CCACHE_DIR / CCACHE_WRAP also hang off ${{ runner.temp }}, but the
-      # `runner` context is not available in jobs.<job_id>.env (actionlint:
-      # only github, inputs, matrix, needs, secrets, strategy, vars), so those
-      # two are set per step where they are used.
       CCACHE_MAXSIZE: 2G
       CCACHE_COMPRESS: "1"
       # content, not mtime: a newer runner image ships a different Xcode at the
@@ -80,6 +77,17 @@ jobs:
       CCACHE_SLOPPINESS: file_stat_matches,include_file_ctime,include_file_mtime,time_macros,locale,clang_index_store
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure cache directory
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if [ "$RUNNER_KIND" = self-hosted ]; then
+            echo "CCACHE_DIR=$HOME/ccache" >> "$GITHUB_ENV"
+            echo "CCACHE_MAXSIZE=20G" >> "$GITHUB_ENV"
+          else
+            echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          fi
 
       - name: Validate patch hunk counts
         # git apply trusts the declared counts: a header that undercounts its
@@ -102,13 +110,17 @@ jobs:
           CCACHE_WRAP: ${{ runner.temp }}/ccache-bin
         run: |
           set -euo pipefail
-          git init -q dxb
-          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
-          git -C dxb checkout -q FETCH_HEAD
+          if [ "${{ runner.environment }}" = self-hosted ]; then
+            bash tooling/macvm/prepare-sources.sh
+          else
+            git init -q dxb
+            git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+            git -C dxb checkout -q FETCH_HEAD
+            git clone -q --depth 1 --branch "$XNU_TAG" "$XNU_REPO" dxb/xnu
+          fi
           test "$(git -C dxb rev-parse HEAD)" = "$DXB_SHA"
           # get_xnu() in build.sh skips its own clone when this exists, so the
           # tree it builds is exactly the one the series was verified against.
-          git clone -q --depth 1 --branch "$XNU_TAG" "$XNU_REPO" dxb/xnu
           test "$(git -C dxb/xnu rev-parse HEAD)" = "$(git -C dxb/xnu rev-parse "$XNU_TAG^{commit}")"
           git -C dxb/xnu log --oneline -1
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
@@ -137,9 +149,9 @@ jobs:
             [ "$verb" = copy ] || continue
             echo "::group::stage $file"
             MACHINE_CONFIG="$MACHINE_CONFIG" MACOS_VERSION="$MACOS_VERSION" \
-              bash "../../xnu-avicii/patches/$file"
+              bash "$GITHUB_WORKSPACE/xnu-avicii/patches/$file"
             echo "::endgroup::"
-          done < ../../xnu-avicii/series
+          done < "$GITHUB_WORKSPACE/xnu-avicii/series"
 
       - name: Apply the series
         # --check first, per file, so the failing patch is named. `set -e` at
@@ -152,7 +164,7 @@ jobs:
             case "$verb" in ''|'#'*) continue;; esac
             [ "$verb" = apply ] || continue
             n=$((n + 1))
-            p="../../xnu-avicii/patches/$file"
+            p="$GITHUB_WORKSPACE/xnu-avicii/patches/$file"
             if ! out=$(git apply --check --whitespace=nowarn "$p" 2>&1); then
               echo "::error::does not apply: $file (entry $n)"
               echo "$out"
@@ -160,7 +172,7 @@ jobs:
             fi
             git apply --whitespace=nowarn "$p"
             echo "applied $n: $file"
-          done < ../../xnu-avicii/series
+          done < "$GITHUB_WORKSPACE/xnu-avicii/series"
           echo "$n patches applied in series order"
           # build.sh globs ../patches for a 13.5 build: it would re-run the same
           # stage scripts and re-apply the upstream .patch files this series
@@ -180,19 +192,29 @@ jobs:
       - name: Deps
         if: env.MODE == 'build'
         env:
-          CCACHE_DIR: ${{ runner.temp }}/ccache
           CCACHE_WRAP: ${{ runner.temp }}/ccache-bin
         run: |
           set -euo pipefail
-          brew install jq gum bash cmake ninja ccache
+          if [ "${{ runner.environment }}" != self-hosted ]; then
+            brew install jq gum bash cmake ninja ccache
+          fi
           # build.sh only checks that xcodes exists (Xcode is preinstalled)
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
+          if [ "${{ runner.environment }}" != self-hosted ]; then
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+            sudo chmod +x /usr/local/bin/xcodes
+          fi
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          if [ "${{ runner.environment }}" = self-hosted ]; then
+            XC=$(xcode-select -p)
+            XC=${XC%/Contents/Developer}
+          else
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
+          if [ "${{ runner.environment }}" != self-hosted ]; then
+            sudo xcode-select -s "$XC"
+          fi
           xcodebuild -version
           xcrun --find iig
           # ccache shims. Resolve the real Xcode compilers once, here, and bake
@@ -223,6 +245,7 @@ jobs:
         # The key carries the run id, so every run writes its own entry (a hit on
         # the key itself would mean no save). restore-keys matches the prefix,
         # which is what actually warms the build from an earlier run's cache.
+        if: runner.environment != 'self-hosted'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ccache
@@ -233,8 +256,6 @@ jobs:
       - name: ccache stats before
         # Deliberately not gated on inputs.mode: a dispatch or push must always
         # show what the cache contributed.
-        env:
-          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
           mkdir -p "$CCACHE_DIR"
           if ! command -v ccache >/dev/null; then
@@ -250,13 +271,16 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
           # build.sh execs make; ccache in the CC shim reads this from the
           # inherited environment, so it must match the restored cache dir.
-          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
           set -o pipefail
+          if [ "${{ runner.environment }}" = self-hosted ] && [ ! -d /Library/Developer/KDKs/KDK_13.5_22G74.kdk ]; then
+            echo "::error::Run tooling/macvm/provision.sh interactively to install the target KDK first"
+            exit 1
+          fi
           # lldbmacros' Python relative imports break on the runner's python3, so
           # `make install` aborts *after* the kernel linked. Tolerate exactly that:
           # fail only when no valid Mach-O came out.
-          bash build.sh 2>&1 | tee ../build.log || {
+          bash build.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log" || {
             cfg_lc=$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')
             k=build/xnu.obj/${KERNEL_CONFIG}_ARM64_SWEET/kernel${cfg_lc:+.$cfg_lc}.sweet
             if [ -f "$k" ] && file "$k" | grep -q 'Mach-O'; then
@@ -268,8 +292,6 @@ jobs:
 
       - name: ccache stats after
         if: always()
-        env:
-          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
           if ! command -v ccache >/dev/null; then
             echo "ccache not installed (MODE=$MODE)"; exit 0
