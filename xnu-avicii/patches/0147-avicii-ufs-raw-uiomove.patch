@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7a90e7c..38ddb6b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -688,19 +688,112 @@ sweet_ufs_psize(__unused dev_t dev)
+ 	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
++/*
++ * 0147: raw character-device I/O through kernel staging and uiomove().
++ * physio() hands the user's virtual address to sweet_ufs_strategy(), whose
++ * buf_map() returns it unchanged for a non-cluster buffer; the memcpy there then
++ * touched user memory from kernel context while holding sweet_ufs_lock, which
++ * faults (PAN) and wedged the kernel (2026-11-16: dd on /dev/rufsroot0 -> watchdog).
++ * The block device (file system buffers, kernel addresses) still uses the strategy.
++ * Lock order: sweet_raw_lock, then sweet_ufs_lock; user copies happen with only
++ * sweet_raw_lock held, never the disk lock.
++ */
++#define SWEET_RAW_CHUNK (256u << 10)
++static LCK_MTX_DECLARE(sweet_raw_lock, &sweet_ufs_grp);
++static uint8_t sweet_raw_stage[SWEET_RAW_CHUNK] __attribute__((aligned(64)));
++
+ static int
+-sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	int error = 0;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_raw_lock);
++	while (!error && uio_resid(uio) > 0) {
++		off_t o = uio_offset(uio);
++		if (o < 0) {
++			error = EINVAL;
++			break;
++		}
++		if ((uint64_t)o >= part_bytes) {
++			break;  /* EOF */
++		}
++		uint64_t pos = (uint64_t)o;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN(MIN((uint64_t)uio_resid(uio), part_bytes - pos),
++		    (uint64_t)SWEET_RAW_CHUNK);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		error = ufs_read_blocks(su.first_block + pos / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy(sweet_raw_stage, (const char *)(su.dma + DMA_BOUNCE) + skip, want);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!error) {
++			error = uiomove(sweet_raw_stage, (int)want, uio);
++		}
++	}
++	lck_mtx_unlock(&sweet_raw_lock);
++	return error;
+ }
+ 
+ static int
+-sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	int error = 0;
++	bool wrote = false;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
+ 	if (!su.writable) {
+ 		return EROFS;
+ 	}
+-	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++	lck_mtx_lock(&sweet_raw_lock);
++	while (!error && uio_resid(uio) > 0) {
++		off_t o = uio_offset(uio);
++		if (o < 0) {
++			error = EINVAL;
++			break;
++		}
++		if ((uint64_t)o >= part_bytes) {
++			error = wrote ? 0 : ENOSPC;
++			break;
++		}
++		uint64_t pos = (uint64_t)o;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN(MIN((uint64_t)uio_resid(uio), part_bytes - pos),
++		    (uint64_t)SWEET_RAW_CHUNK);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint64_t lba = su.first_block + pos / UFS_BLOCK;
++
++		error = uiomove(sweet_raw_stage, (int)want, uio);
++		if (error) {
++			break;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		su_fua_bp = false;
++		/* Partial device blocks at either end: read, merge, write back. */
++		if (skip || (want % UFS_BLOCK)) {
++			error = ufs_read_blocks(lba, blocks);
++		}
++		if (!error) {
++			memcpy((char *)(su.dma + DMA_BOUNCE) + skip, sweet_raw_stage, want);
++			error = ufs_write_blocks(lba, blocks);
++		}
++		if (!error && su.syncwrites) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		wrote = wrote || !error;
++	}
++	lck_mtx_unlock(&sweet_raw_lock);
++	return error;
+ }
+ 
+ static const struct bdevsw sweet_ufs_bdevsw = {

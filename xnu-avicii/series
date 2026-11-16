@@ -141,3 +141,4 @@ apply 0143-avicii-panic-text-to-log.patch
 apply 0144-avicii-log-timestamps.patch
 apply 0145-avicii-panic-string-printf.patch
 apply 0146-avicii-publish-iortc-no-30s-wait.patch
+apply 0147-avicii-ufs-raw-uiomove.patch
