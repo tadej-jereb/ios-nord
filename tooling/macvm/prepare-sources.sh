@@ -8,7 +8,9 @@ mkdir -p "$root/dxb"
 git -C "$root/dxb" init -q
 git -C "$root/dxb" fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
 git -C "$root/dxb" reset --hard FETCH_HEAD
-git -C "$root/dxb" clean -fdx -e xnu/ -e build/ -e .cache/
+# Anchored: unanchored "build/" also kept build/ dirs deep inside venv/, leaving
+# a half-deleted venv that dxb then refuses to recreate.
+git -C "$root/dxb" clean -fdx -e /xnu/ -e /build/ -e /.cache/
 if [[ ! -d "$root/dxb/xnu/.git" ]]; then
     git clone -q --depth 1 --branch "$XNU_TAG" "$XNU_REPO" "$root/dxb/xnu"
 fi
