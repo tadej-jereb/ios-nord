@@ -70,7 +70,8 @@ cluster split for the ADT is 6 little + 2 big, **not** 4+4.
 | `mem-offline` | `0x1 0x40000000 0x0 0x40000000`, `0x1 0xc0000000 0x0 0x80000000`, `0x2 0xc0000000 0x1 0x40000000` | three carve-out shapes ⇒ **two RAM SKUs exist** (see §6) | `lito.dtsi:31-35` |
 | PS_HOLD | `0xc264000` | 4 bytes, `qcom,pshold`; second reg `0x1fd3000` = `tcsr-boot-misc-detect` | `lito.dtsi:1326-1328` |
 | IMEM base | `0x146ab000`, 4 KiB | `qcom,msm-imem`; `ranges` maps children to this base | `lito.dtsi:716-719` |
-| IMEM restart reason | `0x146ab65c` (`0x146ab000` + `0x65c`) | 4 bytes; write `'b'`-style magic here for "boot to recovery"-class reasons | `lito.dtsi:718,728-730` |
+| IMEM restart reason | `0x146ab65c` (`0x146ab000` + `0x65c`) | 4 bytes; `0x77665500` = bootloader (shim-proven, `avicii/shim/shim.c:18`). **Not enough alone from the kernel:** a 0133 reset with only this word booted `boot_a` normally (`logs/phone/20261116-0133-reboot-test/ring-post.txt`) | `lito.dtsi:718,728-730` |
+| PON reboot reason | PM8150 SID 0 periph `0x08`, `SOFT_RB_SPARE` reg `0x8f`, bits 7:1; `2` = bootloader, `1` = recovery (UNVERIFIED on avicii); subtype reg `0x05` (4/5 = gen2) | ABL reads it at reset. Linux `qcom-pon` reason shift 1 (`refs/ry-diffusion-Bergamota/docs/REBOOT_MODE.md:10-14`); proven on PM8150 by raphael 0114 (`refs/marnov999-raphael-ios-gpu/NOTES.md:365-366`). Used by patch 0134 | `avicii.dtsi:341-342` |
 | IMEM other | `mem_dump_table@0x10`, `dload_type@0x1c`, `boot_stats@0x6b0`, `kaslr_offset@0x6d0`, `pil@0x94c` | needed if the shim logs boot stats | `lito.dtsi:723,733,738,743,748` |
 | Apps RSC | `0x18200000`, three 64 KiB drv blocks (`drv-0/1/2`) | `qcom,rpmh-rsc`, `qcom,drv-id = <2>` | `lito.dtsi:2148-2156` |
 | Apps RSC TCS | `0x18200d00` (`0x18200000` + `tcs-offset 0xd00`) | TCS layout `ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1` — all RPMh clocks and regulator votes go through here | `lito.dtsi:2148,2158-2162` |

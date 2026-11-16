@@ -1,0 +1,198 @@
+diff --git a/osfmk/arm64/sweet_reset.c b/osfmk/arm64/sweet_reset.c
+index e9b9901..7787192 100644
+--- a/osfmk/arm64/sweet_reset.c
++++ b/osfmk/arm64/sweet_reset.c
+@@ -18,6 +18,21 @@
+  *   IMEM 0x146ab000, restart_reason @0x65c   lito.dtsi:716-719,728-730
+  *   PS_HOLD 0xc264000                        lito.dtsi:1326-1328
+  *   0x77665500 = bootloader                  proven by the shim (SHIM_BOOT.md "A fallback to fastboot")
++ *
++ * 0134: the IMEM word alone is not enough once the kernel runs. A 0133 `reboot`
++ * did reset the SoC, but ABL booted boot_a normally (logs/phone/20261116-0133-reboot-test).
++ * ABL takes the reason from the PMIC: PM8150 PON (SID 0, peripheral 0x08)
++ * SOFT_RB_SPARE (0x8f) bits 7:1 = 2 (bootloader) / 1 (recovery), as Linux
++ * qcom-pon reboot-mode writes it. Proven on PM8150 by raphael 0114
++ * (refs/marnov999-raphael-ios-gpu/NOTES.md:365-366, "SOFT_RB_SPARE 0 -> 4 ...
++ * landed in FASTBOOT by itself"). Written over the SPMI v5 arbiter
++ * (lito.dtsi:1804-1815): core 0xc440000, chnls 0xc600000 (+0x10000 per APID),
++ * obsrvr 0xe600000 (+0x80 per APID), cnfg 0xc40a000. Lock-free and bounded,
++ * so the panic path can use it.
++ *
++ *   sweetarmfb=N      1 (default with sweetreset=1): set the fastboot reason at
++ *                     boot, so ANY later reset (watchdog, keys, a hang cleared by
++ *                     the owner) comes up in fastboot too. 0 = only at reset time.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -36,10 +51,129 @@
+ #define SWEET_RR_RECOVERY       0x77665502U     /* UNVERIFIED: msm-poweroff convention */
+ #define PSCI_0_2_SYSTEM_RESET   0x84000009ULL
+ 
++#define SWEET_SPMI_CORE_PA      0x0c440000UL
++#define SWEET_SPMI_CHNLS_PA     0x0c600000UL
++#define SWEET_SPMI_OBS_PA       0x0e600000UL
++#define SWEET_SPMI_CFG_PA       0x0c40a000UL
++#define SWEET_PON_PPID          0x008u          /* SID 0, peripheral 0x08: avicii.dtsi:341-342 */
++#define SWEET_PON_SUBTYPE       0x05u
++#define SWEET_PON_SOFT_RB_SPARE 0x8fu
++#define SWEET_PON_RB_BOOTLOADER 2u
++#define SWEET_PON_RB_RECOVERY   1u
++#define SWEET_SPMI_POLL         200000u         /* MMIO polls; one SPMI command takes microseconds */
++
+ static uint32_t sweet_reset_mode = 1;
+ static uint32_t sweet_panic_wait_s = 3;
+ static vm_offset_t sweet_imem_va;
+ static vm_offset_t sweet_pshold_va;
++static uint32_t sweet_armfb = 1;
++static vm_offset_t sweet_spmi_core, sweet_spmi_cfg, sweet_spmi_obs, sweet_pon_ch;
++static uint32_t sweet_pon_apid = 0xffffu;
++
++static inline uint32_t
++sweet_rd32(vm_offset_t va)
++{
++	uint32_t v = *(volatile uint32_t *)va;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* Find PON's APID (owner EE 0 preferred) and map its write channel. 0 or -1. */
++static int
++sweet_pon_find(void)
++{
++	uint32_t n;
++
++	if (sweet_pon_apid != 0xffffu) {
++		return 0;
++	}
++	sweet_spmi_core = ml_io_map(SWEET_SPMI_CORE_PA, 0x2000);
++	sweet_spmi_cfg = ml_io_map(SWEET_SPMI_CFG_PA, 0x1000);
++	sweet_spmi_obs = ml_io_map(SWEET_SPMI_OBS_PA, 0x10000);
++	if (!sweet_spmi_core || !sweet_spmi_cfg || !sweet_spmi_obs) {
++		return -1;
++	}
++	n = sweet_rd32(sweet_spmi_core + 4) & 0x7ffu;
++	for (uint32_t i = 0; i < n && i < 512u; i++) {
++		uint32_t map = sweet_rd32(sweet_spmi_core + 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != SWEET_PON_PPID) {
++			continue;
++		}
++		if (sweet_pon_apid == 0xffffu ||
++		    (sweet_rd32(sweet_spmi_cfg + 0x700u + 4u * i) & 7u) == 0u) {
++			sweet_pon_apid = i;
++		}
++	}
++	if (sweet_pon_apid == 0xffffu) {
++		return -1;
++	}
++	sweet_pon_ch = ml_io_map(SWEET_SPMI_CHNLS_PA + 0x10000UL * sweet_pon_apid, 0x1000);
++	return sweet_pon_ch ? 0 : -1;
++}
++
++/* One PON register through the observer (EXT_READL). 0 or -1. */
++static int
++sweet_pon_rd(uint8_t reg, uint8_t *out)
++{
++	vm_offset_t ch = sweet_spmi_obs + 0x80u * sweet_pon_apid;
++
++	*(volatile uint32_t *)ch = (1u << 27) | ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (uint32_t i = 0; i < SWEET_SPMI_POLL; i++) {
++		uint32_t st = sweet_rd32(ch + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return -1;
++			}
++			*out = (uint8_t)sweet_rd32(ch + 0x18u);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* One PON register through its own channel (EXT_WRITEL, 1 byte). 0 or -1. */
++static int
++sweet_pon_wr(uint8_t reg, uint8_t val)
++{
++	*(volatile uint32_t *)(sweet_pon_ch + 0x10u) = val;    /* WDATA0 */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	*(volatile uint32_t *)sweet_pon_ch = ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (uint32_t i = 0; i < SWEET_SPMI_POLL; i++) {
++		uint32_t st = sweet_rd32(sweet_pon_ch + 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -1 : 0;
++		}
++	}
++	return -1;
++}
++
++/* SOFT_RB_SPARE bits 7:1 = reason (bit 0 kept). Returns the read-back, or -1. */
++static int
++sweet_pon_set_reason(uint32_t reason, uint8_t *old_out)
++{
++	uint8_t old = 0, val, rb = 0;
++
++	if (sweet_pon_apid == 0xffffu || sweet_pon_rd(SWEET_PON_SOFT_RB_SPARE, &old) != 0) {
++		return -1;
++	}
++	val = (uint8_t)((old & 0x01u) | (reason << 1));
++	if (sweet_pon_wr(SWEET_PON_SOFT_RB_SPARE, val) != 0 ||
++	    sweet_pon_rd(SWEET_PON_SOFT_RB_SPARE, &rb) != 0) {
++		return -1;
++	}
++	if (old_out) {
++		*old_out = old;
++	}
++	return rb;
++}
++
++static uint32_t
++sweet_pon_reason_for(uint32_t mode)
++{
++	return mode == 1 ? SWEET_PON_RB_BOOTLOADER : mode == 2 ? SWEET_PON_RB_RECOVERY : 0;
++}
+ 
+ static const char *
+ sweet_reset_mode_name(uint32_t m)
+@@ -69,6 +203,27 @@ sweet_reset_startup(void)
+ 	printf("SWEET RESET: mode %u (%s), panic wait %u s, imem %s, pshold %s\n",
+ 	    sweet_reset_mode, sweet_reset_mode_name(sweet_reset_mode), sweet_panic_wait_s,
+ 	    sweet_imem_va ? "mapped" : "unmapped", sweet_pshold_va ? "mapped" : "unmapped");
++	if (sweet_reset_mode == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetarmfb", &sweet_armfb, sizeof(sweet_armfb));
++	{
++		uint8_t sub = 0, old = 0;
++		if (sweet_pon_find() != 0 || sweet_pon_rd(SWEET_PON_SUBTYPE, &sub) != 0) {
++			printf("SWEET RESET: PMIC PON not found: reset reason is IMEM only\n");
++			return;
++		}
++		printf("SWEET RESET: PON apid %u (owner ee %u), subtype %#x\n", sweet_pon_apid,
++		    sweet_rd32(sweet_spmi_cfg + 0x700u + 4u * sweet_pon_apid) & 7u, sub);
++		if (sweet_armfb && sweet_reset_mode != 3) {
++			uint32_t want = sweet_pon_reason_for(sweet_reset_mode);
++			int rb = sweet_pon_set_reason(want, &old);
++			int ok = rb >= 0 && ((uint32_t)rb >> 1) == want;
++			printf("SWEET RESET: armed at boot: SOFT_RB_SPARE %#x -> read back %#x: %s %s\n",
++			    old, rb, ok ? "any reset now lands in" : "NOT set, still",
++			    ok ? sweet_reset_mode_name(sweet_reset_mode) : "IMEM only");
++		}
++	}
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_reset_startup);
+ 
+@@ -81,7 +236,12 @@ sweet_reset(const char *why)
+ 	if (sweet_reset_mode == 0) {
+ 		return;
+ 	}
+-	printf("SWEET RESET: %s -> %s\n", why, sweet_reset_mode_name(sweet_reset_mode));
++	{
++		uint8_t old = 0;
++		int rb = sweet_pon_set_reason(sweet_pon_reason_for(sweet_reset_mode), &old);
++		printf("SWEET RESET: %s -> %s (PON %#x -> %#x)\n", why,
++		    sweet_reset_mode_name(sweet_reset_mode), old, rb);
++	}
+ 	if (sweet_imem_va != 0 && sweet_reset_mode != 3) {
+ 		*(volatile uint32_t *)(sweet_imem_va + SWEET_IMEM_RR_OFF) =
+ 		    sweet_reset_mode == 2 ? SWEET_RR_RECOVERY : SWEET_RR_BOOTLOADER;
