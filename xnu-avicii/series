@@ -138,3 +138,4 @@ apply 0140-avicii-usb-power-up.patch
 apply 0141-avicii-usb-guard-pipe-clock.patch
 apply 0142-avicii-log-over-ssh-and-flush-at-reset.patch
 apply 0143-avicii-panic-text-to-log.patch
+apply 0144-avicii-log-timestamps.patch

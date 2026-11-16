@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index bedd91b..7a90e7c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -31,6 +31,8 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/startup.h>
++#include <mach/mach_time.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+@@ -847,6 +849,25 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
++static void sweet_log_append_raw(const char *c, int size);
++
++static void
++sweet_log_append_raw(const char *c, int size)
++{
++	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++	}
++}
++
++/*
++ * 0144: boot-arg sweetlogts=1 prefixes every ring line with "[sss.mmm] ",
++ * seconds since the timebase started, to find where boot time goes. The
++ * divisor is CNTFRQ_EL0 (architectural), so it works before rtclock init.
++ * Lines from different CPUs can interleave; stamps are for profiling only.
++ */
++TUNABLE(uint32_t, sweet_log_ts, "sweetlogts", 0);
++static bool sweet_log_bol = true;
+ 
+ void
+ sweet_log_append(const char *c, int size)
+@@ -854,10 +875,31 @@ sweet_log_append(const char *c, int size)
+ 	if (size <= 0) {
+ 		return;
+ 	}
+-	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	if (!sweet_log_ts) {
++		sweet_log_append_raw(c, size);
++		return;
++	}
++	int from = 0;
+ 	for (int i = 0; i < size; i++) {
+-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		if (sweet_log_bol) {
++			uint64_t f, t = mach_absolute_time();
++			char stamp[20];
++			__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(f));
++			if (f == 0) {
++				f = 1;
++			}
++			sweet_log_append_raw(c + from, i - from);
++			from = i;
++			int n = snprintf(stamp, sizeof(stamp), "[%3llu.%03llu] ",
++			    t / f, (t % f) * 1000 / f);
++			sweet_log_append_raw(stamp, MIN(n, (int)sizeof(stamp) - 1));
++			sweet_log_bol = false;
++		}
++		if (c[i] == '\n') {
++			sweet_log_bol = true;
++		}
+ 	}
++	sweet_log_append_raw(c + from, size - from);
+ }
+ 
+ /*
