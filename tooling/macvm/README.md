@@ -20,7 +20,7 @@ gh api -X POST repos/tadej-jereb/ios-nord/actions/runners/registration-token --j
 ```
 
 3. In the VM admin user's SSH session, download the provisioning branch and run it.
-Gate: this installs Homebrew packages, accepts the installed Xcode's license,
+Gate: this installs pinned release binaries (jq, gum, ninja, ccache, cmake; sha256 checked) into /usr/local/bin, builds bash 5.2.37 from GNU source, accepts the installed Xcode's license,
 runs first-launch setup, installs the macOS **13.5 / 22G74 target KDK**, and
 registers a launchd agent for this user. It creates `~/actions-runner`, `~/ccache`
 and `~/xnu-ci`. Enter sudo credentials when asked; do not run the script with sudo.
@@ -41,8 +41,8 @@ Rerunning `bash ~/ios-nord-runner/tooling/macvm/provision.sh` needs no token if
 `.runner` already exists. It does not replace an existing registration. GitHub
 adds `self-hosted`, `macOS`, `X64`; the script adds `xnu-vm`. The latest osx-x64
 runner archive is checked against GitHub's SHA256 release-asset digest. ccache
-uses `~/ccache` with a 20G limit, also saved in the runner's `.env`. The Homebrew
-PATH is saved in `.path` for launchd. The service is a user LaunchAgent; keep this
+uses `~/ccache` with a 20G limit, also saved in the runner's `.env`. `/usr/local/bin`
+is put on the runner's PATH via `.path` for launchd (Homebrew refuses Intel macOS). The service is a user LaunchAgent; keep this
 admin user logged in (a headless VM may need a console login after reboot).
 Service commands follow [GitHub's macOS service instructions](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/configure-the-application).
 

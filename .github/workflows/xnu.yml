@@ -29,8 +29,8 @@ on:
       runner:
         description: "Build runner pool"
         type: choice
-        options: [macos-15, macos-15-intel, xnu-vm]
-        default: macos-15
+        options: [xnu-vm, macos-15-intel, macos-15]
+        default: xnu-vm
       keep_going:
         description: "make -k (collect every compile error in one run)"
         default: "true"
@@ -63,8 +63,9 @@ env:
 
 jobs:
   build:
-    # Pushes keep using the hosted pool; opt into the VM by dispatch.
-    runs-on: ${{ inputs.runner == 'xnu-vm' && fromJSON('["self-hosted", "xnu-vm"]') || inputs.runner || 'macos-15' }}
+    # Pushes build on the local VM runner (cold 3 min vs ~12 min hosted, no queue).
+    # If the VM is down, dispatch with runner=macos-15-intel.
+    runs-on: ${{ (inputs.runner || 'xnu-vm') == 'xnu-vm' && fromJSON('["self-hosted", "xnu-vm"]') || inputs.runner }}
     timeout-minutes: 120
     env:
       CCACHE_MAXSIZE: 2G
