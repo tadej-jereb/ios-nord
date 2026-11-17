@@ -1,0 +1,402 @@
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 50d4a09..f9866f1 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -202,4 +202,45 @@ out:
+ 	lck_mtx_unlock(&sweet_smmu_lock);
+ 	return err;
+ }
++/*
++ * Read-only: what the apps_smmu says about one stream ID (patch 0152, D1 display probe). No register is
++ * written. Logs every SMR whose ID/mask matches `sid` with its S2CR (type 0 translate, 1 bypass,
++ * 2 fault; CBNDX) and, for a translating S2CR, the context bank's SCTLR/TTBR0/TCR/MAIR0/FSR. Layout
++ * as sweet_smmu_map_sid() above and refs/marnov999-raphael-ios-gpu 0120 (SMR [14:0] id, [30:16]
++ * mask, [31] valid; S2CR [17:16] type, [7:0] cbndx).
++ */
++void sweet_smmu_probe_sid(unsigned sid);
++void
++sweet_smmu_probe_sid(unsigned sid)
++{
++	vm_offset_t g0 = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!g0) {
++		printf("SWEET MDP: smmu map failed\n");
++		return;
++	}
++	uint32_t id0 = rd(g0, 0x20), id1 = rd(g0, 0x24);
++	unsigned pgs = (id1 >> 31) ? 16 : 12, ncb = id1 & 0xff, nsm = id0 & 0xff, hits = 0;
++	vm_offset_t cbs = g0 + ((vm_offset_t)(1u << (((id1 >> 28) & 7) + 1)) << pgs);
++	printf("SWEET MDP: smmu cr0 %#x id0 %#x id1 %#x (%u smr, %u cb, pgshift %u)\n", rd(g0, 0), id0, id1, nsm, ncb, pgs);
++	for (unsigned i = 0; i < nsm && i < 128; i++) {
++		uint32_t smr = rd(g0, 0x800 + 4 * i), s2cr = rd(g0, 0xc00 + 4 * i);
++		uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++		if (!(smr & (1u << 31)) || ((sid ^ id) & ~mask) != 0) {
++			continue;
++		}
++		hits++;
++		unsigned type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		printf("SWEET MDP: smmu sid %#x: smr %u %#x (id %#x mask %#x) s2cr %#x type %u (%s) cbndx %u\n", sid, i, smr, id, mask,
++		    s2cr, type, type == 0 ? "translate" : type == 1 ? "bypass" : type == 2 ? "fault" : "?", cb);
++		if (type == 0 && cb < ncb) {
++			vm_offset_t c = cbs + ((vm_offset_t)cb << pgs);
++			printf("SWEET MDP: smmu cb %u: sctlr %#x ttbr0 %#llx tcr %#x mair0 %#x fsr %#x cbar %#x\n", cb, rd(c, 0x0),
++			    (unsigned long long)(*(volatile uint64_t *)(c + 0x20)), rd(c, 0x30), rd(c, 0x38), rd(c, 0x58),
++			    rd(g0 + (1u << pgs), 4 * cb));
++		}
++	}
++	if (hits == 0) {
++		printf("SWEET MDP: smmu sid %#x: no valid SMR matches\n", sid);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b36fbd0..a2245e5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -91,6 +91,45 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * D1 display probe (0152, docs/perf-research/D-display.md): read-only. Block base/size and block
++ * offsets from the live dts qcom,mdss_mdp (mdp_phys 0xae00000 size 0x84208; sde-ctl-off 0x2000;
++ * sde-mixer-off 0x45000; sde-intf-off 0x6b000 0x6b800 (INTF1 = DSI0, type "dsi"); sde-sspp-off
++ * 0x5000 0x7000 0x25000 0x27000 0x29000 (vig vig dma dma dma); sde-sspp-qseed-off 0xa00;
++ * smmu_sde_unsec iommus 0xb40 mask 0x402) and the vendor driver techpack/display/msm/sde/
++ * sde_hw_sspp.c, sde_hw_ctl.c, sde_hw_intf.c (register offsets). SSPP +0x04 SRC_IMG_SIZE and the
++ * QSEED3 +0x00/+0x04 version and op mode come from the beryllium 0126 prior art only: UNVERIFIED
++ * against the vendor source.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" void sweet_smmu_probe_sid(unsigned sid);     /* bsd/dev/sweet_smmu.c: read-only */
++#define SWEET_MDP_PA            0x0ae00000u     /* dts mdp_phys */
++#define SWEET_MDP_SIZE          0x85000u        /* dts mdp_phys size 0x84208, page rounded */
++#define SWEET_MDP_CTL0          0x02000u        /* dts sde-ctl-off[0] */
++#define SWEET_MDP_LM0           0x45000u        /* dts sde-mixer-off[0] */
++#define SWEET_MDP_INTF1         0x6b800u        /* dts sde-intf-off[1], type dsi */
++#define SWEET_MDP_QSEED         0x00a00u        /* dts sde-sspp-qseed-off */
++#define SWEET_MDP_SID           0xb40u          /* dts smmu_sde_unsec iommus */
++#define SWEET_MDP_PROBE2_S      30              /* second probe: seconds after start */
++#define SWEET_FB_SEEN_MAX       8
++
++static const struct {
++	const char *name;
++	uint32_t off;
++	bool vig;
++} sweet_mdp_sspp[] = {
++	{ "VIG0", 0x05000, true }, { "VIG1", 0x07000, true },
++	{ "DMA0", 0x25000, false }, { "DMA1", 0x27000, false }, { "DMA2", 0x29000, false },
++};
++
++static inline uint32_t
++mdp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -119,12 +158,26 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* 0152, boot-arg sweetfb_stats=1: frame statistics */
++	bool          fStats;
++	uint64_t      fStatsSince;    /* abs time the current one-second window began */
++	uint32_t      fStSwaps, fStSkipped;   /* under fLock */
++	uint32_t      fStShown, fStCopies;    /* vsync thread only */
++	uint64_t      fStCopySum, fStCopyMax; /* abs time, vsync thread only */
++	/* 0152, boot-arg sweetfb_probe=1: read-only display engine probe */
++	bool          fProbe, fProbe2Done;
++	uint64_t      fProbe2At;      /* abs time of the second probe */
++	vm_offset_t   fMdp;
++	uint32_t      fSeen[SWEET_FB_SEEN_MAX];     /* surface ids already walked */
++	uint32_t      fSeenN;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void mdpProbe(const char *when);
++	void surfaceWalk(SweetSurface *s, uint32_t layer);
+ };
+ 
+ /*
+@@ -212,6 +265,18 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	{
++		int v = 0;
++		fStats = PE_parse_boot_argn("sweetfb_stats", &v, sizeof(v)) && v != 0;
++		v = 0;
++		fProbe = PE_parse_boot_argn("sweetfb_probe", &v, sizeof(v)) && v != 0;
++		fStatsSince = mach_absolute_time();
++		if (fProbe) {
++			uint64_t d = 0;
++			nanoseconds_to_absolutetime((uint64_t)SWEET_MDP_PROBE2_S * 1000000000ull, &d);
++			fProbe2At = fStatsSince + d;
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -261,6 +326,9 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
++	if (fProbe) {
++		mdpProbe("start");
++	}
+ 	IOLog("SWEET FB: start done\n");
+ 	return true;
+ }
+@@ -277,6 +345,35 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		0, 0,
+ 	};
+ 
++	if (fb->fProbe && !fb->fProbe2Done && now >= fb->fProbe2At) {
++		fb->fProbe2Done = true;
++		fb->mdpProbe("30 s");
++	}
++	if (fb->fStats) {
++		static uint64_t sec_abs;
++		if (sec_abs == 0) {
++			nanoseconds_to_absolutetime(1000000000ull, &sec_abs);
++		}
++		if (now - fb->fStatsSince >= sec_abs) {
++			uint32_t swaps, skipped;
++			uint64_t win_ns = 0, avg_ns = 0, max_ns = 0;
++			IOLockLock(fb->fLock);
++			swaps = fb->fStSwaps;
++			skipped = fb->fStSkipped;
++			fb->fStSwaps = fb->fStSkipped = 0;
++			IOLockUnlock(fb->fLock);
++			absolutetime_to_nanoseconds(now - fb->fStatsSince, &win_ns);
++			if (fb->fStCopies != 0) {
++				absolutetime_to_nanoseconds(fb->fStCopySum / fb->fStCopies, &avg_ns);
++			}
++			absolutetime_to_nanoseconds(fb->fStCopyMax, &max_ns);
++			IOLog("SWEET FPS: %u swaps, %u shown, %u skipped, copy avg %llu us max %llu us, in %llu ms\n",
++			    swaps, fb->fStShown, skipped, avg_ns / 1000, max_ns / 1000, win_ns / 1000000ull);
++			fb->fStShown = fb->fStCopies = 0;
++			fb->fStCopySum = fb->fStCopyMax = 0;
++			fb->fStatsSince = now;
++		}
++	}
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+@@ -312,6 +409,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		fb->fStShown++;
+ 		fb->present(rec);
+ 		/* The frame's pixels are in the panel now: its surface is free again (0130). */
+ 		IOLockLock(fb->fLock);
+@@ -417,6 +515,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	sweet_fb_bind_presenter();
+ 	IOLockLock(fLock);
++	if (fStats) {
++		fStSwaps++;
++		if (fDirty) {
++			fStSkipped++;   /* the previous swap was never shown */
++		}
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fPendingID = get32(rec, 0x50);
+ 	fDirty = true;
+@@ -427,6 +531,144 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * 0152 (D1): the physical layout of a surface iOS swaps in: first PA, whether every page follows the
++ * last, and how many discontinuities there are (decides the zero-copy buffer design, D3). Logged once per
++ * surface id (at most SWEET_FB_SEEN_MAX). Reads only. Not under fLock.
++ */
++void
++AppleCLCD::surfaceWalk(SweetSurface *s, uint32_t layer)
++{
++	uint32_t n;
++	for (n = 0; n < fSeenN; n++) {
++		if (fSeen[n] == s->id) {
++			return;
++		}
++	}
++	if (fSeenN >= SWEET_FB_SEEN_MAX) {
++		return;
++	}
++	fSeen[fSeenN++] = s->id;
++	if (s->memory == NULL) {
++		IOLog("SWEET MDP: surface %u layer %u: no memory descriptor\n", s->id, layer);
++		return;
++	}
++	IOByteCount off = s->wrapped ? s->wrapDelta : 0, end = off + s->allocSize;
++	uint64_t first = 0, prev_end = 0, maxseg = 0;
++	uint32_t segs = 0, breaks = 0, iter = 0;
++	while (off < end && iter++ < 16384) {
++		IOByteCount len = 0;
++		addr64_t p = s->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		if (p == 0 || len == 0) {
++			break;
++		}
++		if (len > end - off) {
++			len = end - off;
++		}
++		if (segs == 0) {
++			first = p;
++		} else if (p != prev_end) {
++			breaks++;
++		}
++		if (segs < 4) {
++			IOLog("SWEET MDP: surface %u seg %u pa 0x%llx len 0x%llx\n", s->id, segs, (uint64_t)p, (uint64_t)len);
++		}
++		if (len > maxseg) {
++			maxseg = len;
++		}
++		prev_end = (uint64_t)p + len;
++		segs++;
++		off += len;
++	}
++	IOLog("SWEET MDP: surface %u layer %u %ux%u bpr %u size %u wrapped %d: first pa 0x%llx end 0x%llx, "
++	    "%u segments, %u discontinuities, max segment 0x%llx, %s%s%s (walked %llu of %u bytes)\n",
++	    s->id, layer, s->width, s->height, s->bytesPerRow, s->allocSize, s->wrapped ? 1 : 0,
++	    first, prev_end, segs, breaks, maxseg, breaks == 0 && segs != 0 ? "CONTIGUOUS" : "NOT contiguous",
++	    first > 0xffffffffull ? ", first pa above 4 GiB" : ", first pa below 4 GiB",
++	    prev_end > 0x100000000ull ? ", end above 4 GiB" : "",
++	    (uint64_t)(off - (s->wrapped ? s->wrapDelta : 0)), s->allocSize);
++}
++
++/*
++ * 0152 (D1): read-only probe of the display engine's state. No register is written (MDP, DSI or SMMU).
++ * Run once at start and once SWEET_MDP_PROBE2_S s later (after iOS is presenting).
++ */
++void
++AppleCLCD::mdpProbe(const char *when)
++{
++	if (fMdp == 0) {
++		fMdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
++	}
++	if (fMdp == 0) {
++		IOLog("SWEET MDP: map failed\n");
++		return;
++	}
++	IOLog("SWEET MDP: probe (%s): mdp 0x%x size 0x%x, boot fb pa 0x%llx %ux%u stride %u\n", when,
++	    SWEET_MDP_PA, SWEET_MDP_SIZE, fPhys, fWidth, fHeight, fRowBytes);
++	for (uint32_t i = 0; i < sizeof(sweet_mdp_sspp) / sizeof(sweet_mdp_sspp[0]); i++) {
++		vm_offset_t p = fMdp + sweet_mdp_sspp[i].off;
++		uint32_t src = mdp_rd(p, 0x14);
++		IOLog("SWEET MDP: %s src_size 0x%08x img_size 0x%08x src_xy 0x%08x out_size 0x%08x out_xy 0x%08x "
++		    "src0_addr 0x%08x ystride0 0x%08x fmt 0x%08x op 0x%08x%s\n", sweet_mdp_sspp[i].name,
++		    mdp_rd(p, 0x00), mdp_rd(p, 0x04), mdp_rd(p, 0x08), mdp_rd(p, 0x0c), mdp_rd(p, 0x10), src,
++		    mdp_rd(p, 0x24), mdp_rd(p, 0x30), mdp_rd(p, 0x38),
++		    src == (uint32_t)fPhys ? "  <- boot framebuffer" : "");
++		if (sweet_mdp_sspp[i].vig) {
++			vm_offset_t q = p + SWEET_MDP_QSEED;
++			IOLog("SWEET MDP: %s qseed3 ver 0x%08x op 0x%08x src_size 0x%08x dst_size 0x%08x phase_step y_h 0x%08x y_v 0x%08x\n",
++			    sweet_mdp_sspp[i].name, mdp_rd(q, 0x00), mdp_rd(q, 0x04), mdp_rd(q, 0x40), mdp_rd(q, 0x48),
++			    mdp_rd(q, 0x10), mdp_rd(q, 0x14));
++		}
++	}
++	vm_offset_t ctl = fMdp + SWEET_MDP_CTL0;
++	IOLog("SWEET MDP: CTL0 layer LM0..3 0x%08x 0x%08x 0x%08x 0x%08x ext LM0 0x%08x ext2 LM0 0x%08x ext3 LM0 0x%08x\n",
++	    mdp_rd(ctl, 0x00), mdp_rd(ctl, 0x04), mdp_rd(ctl, 0x08), mdp_rd(ctl, 0x0c),
++	    mdp_rd(ctl, 0x40), mdp_rd(ctl, 0x70), mdp_rd(ctl, 0xa0));
++	IOLog("SWEET MDP: CTL0 top 0x%08x flush 0x%08x start 0x%08x status 0x%08x intf_active 0x%08x intf_flush 0x%08x; "
++	    "LM0 out_size 0x%08x +8 0x%08x\n",
++	    mdp_rd(ctl, 0x14), mdp_rd(ctl, 0x18), mdp_rd(ctl, 0x1c), mdp_rd(ctl, 0x64), mdp_rd(ctl, 0xf4),
++	    mdp_rd(ctl, 0x110), mdp_rd(fMdp + SWEET_MDP_LM0, 0x04), mdp_rd(fMdp + SWEET_MDP_LM0, 0x08));
++	vm_offset_t it = fMdp + SWEET_MDP_INTF1;
++	uint32_t f0 = mdp_rd(it, 0xac);
++	IODelay(50000);
++	uint32_t f1 = mdp_rd(it, 0xac);
++	IOLog("SWEET MDP: INTF1 timing_en 0x%08x config 0x%08x config2 0x%08x panel_fmt 0x%08x cmd_trigger_en 0x%08x "
++	    "frame_line_count_en 0x%08x frame_count %u -> %u in 50 ms line_count 0x%08x\n",
++	    mdp_rd(it, 0x00), mdp_rd(it, 0x04), mdp_rd(it, 0x60), mdp_rd(it, 0x90), mdp_rd(it, 0x84),
++	    mdp_rd(it, 0xa8), f0, f1, mdp_rd(it, 0xb0));
++	IOLog("SWEET MDP: INTF1 tear mdp_vsync_sel 0x%08x tear_check_en 0x%08x sync_config_vsync 0x%08x sync_height 0x%08x "
++	    "wrcount 0x%08x vsync_init 0x%08x int_count 0x%08x\n",
++	    mdp_rd(it, 0x280), mdp_rd(it, 0x284), mdp_rd(it, 0x288), mdp_rd(it, 0x28c),
++	    mdp_rd(it, 0x290), mdp_rd(it, 0x294), mdp_rd(it, 0x298));
++	IOLog("SWEET MDP: INTF1 tear sync_thresh 0x%08x start_pos 0x%08x rd_ptr_irq 0x%08x wr_ptr_irq 0x%08x "
++	    "out_line_count 0x%08x line_count 0x%08x autorefresh_cfg 0x%08x (enable bit31, frames [15:0])\n",
++	    mdp_rd(it, 0x29c), mdp_rd(it, 0x2a0), mdp_rd(it, 0x2a4), mdp_rd(it, 0x2a8),
++	    mdp_rd(it, 0x2ac), mdp_rd(it, 0x2b0), mdp_rd(it, 0x2b4));
++	/* The surface iOS is swapping in right now, if it has swapped */
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	bool have;
++	IOLockLock(fLock);
++	have = fPendingID != 0;
++	if (have) {
++		memcpy(rec, fPending, sizeof(rec));
++	}
++	IOLockUnlock(fLock);
++	if (have) {
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			uint32_t id = get32(rec, 0x54 + 4 * layer);
++			SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++			if (s != NULL && s != fSurface) {
++				fSeenN = 0;     /* force the walk to print again at each probe */
++				surfaceWalk(s, layer);
++			}
++			OSSafeReleaseNULL(s);
++		}
++	} else {
++		IOLog("SWEET MDP: no swap yet (%s)\n", when);
++	}
++	sweet_smmu_probe_sid(SWEET_MDP_SID);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -458,6 +700,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	uint64_t copy_abs = 0;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -470,6 +713,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
++		if (s != NULL && fProbe) {
++			surfaceWalk(s, layer);
++		}
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+@@ -525,14 +771,25 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			uint64_t t0 = fStats ? mach_absolute_time() : 0;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			if (fStats) {
++				copy_abs += mach_absolute_time() - t0;
++			}
+ 		}
+ 		s->release();
+ 	}
++	if (fStats && copy_abs != 0) {
++		fStCopies++;
++		fStCopySum += copy_abs;
++		if (copy_abs > fStCopyMax) {
++			fStCopyMax = copy_abs;
++		}
++	}
+ }
+ 
+ bool
