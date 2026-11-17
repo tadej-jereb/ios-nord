@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6a15a35..b36fbd0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -239,6 +239,22 @@ AppleCLCD::start(IOService *provider)
+ 			accel->setProperty("IOGLESDefaultUseMetal", kOSBooleanFalse);
+ 			IOLog("SWEET FB: IOAcceleratorES names IOGLESBundleName SweetGLES (sweetgles=%u)\n", gles);
+ 		}
++		/*
++		 * Metal (plan step 7). Metal's MTLRegisterDevices() reads MetalPluginName off every
++		 * IOAcceleratorES, loads /System/Library/Extensions/<name>.bundle, takes the class
++		 * MetalPluginClassName (else the bundle's principal class), requires an _MTLDevice
++		 * subclass and registers [[cls alloc] initWithAcceleratorPort:] when it is not nil
++		 * (20H392 Metal 0x181a3c7c8, 0x181b14510; docs/metal-research/7-system-wide.md section 4).
++		 * AviciiMetal.bundle refuses every process but its allow-list (default backboardd) and
++		 * a missing bundle means no device, as today. sweetmetal=0 (the default) publishes nothing.
++		 */
++		uint32_t metal = 0;
++		(void)PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++		if (metal == 1) {
++			accel->setProperty("MetalPluginName", "AviciiMetal");
++			accel->setProperty("MetalPluginClassName", "AviciiMetalDevice");
++			IOLog("SWEET FB: IOAcceleratorES names MetalPluginName AviciiMetal (sweetmetal=1)\n");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+ 			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");

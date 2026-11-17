@@ -145,3 +145,4 @@ apply 0147-avicii-ufs-raw-uiomove.patch
 apply 0148-avicii-wall-clock-bootarg.patch
 apply 0149-avicii-ufs-hardening.patch
 apply 0150-avicii-gpu-dead-code.patch
+apply 0151-avicii-metal-plugin-name.patch
