@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index c447592..61728ae 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -22,6 +22,7 @@
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
++#include <arm/memory_types.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #include <pexpert/pexpert.h>
+@@ -214,6 +215,85 @@ rung_w2(void)
+ }
+ 
+ extern bool sweet_smem_mpss_empty(void);
++extern bool sweet_smem_mpss_state(uint32_t *state);
++
++/*
++ * This rung supports the verified Nord firmware placement. The MDT was
++ * authenticated first. Its preferred addresses already match the reserved
++ * physical window, so no relocation is needed.
++ */
++static bool
++modem_load_verified_layout(void)
++{
++	if (strcmp(modem_part, "modem_a") != 0 || mdt.min_addr != MODEM_REGION_PA ||
++	    mdt.max_addr != MODEM_REGION_PA + MODEM_REGION_SIZE) {
++		MLOG("step W4 stop: firmware layout differs from the verified modem_a image");
++		return false;
++	}
++	for (uint32_t i = 0; i < mdt.phnum; i++) {
++		const struct mdt_seg *seg = &mdt.seg[i];
++		if (!seg->load) {
++			continue;
++		}
++		struct mfw_file file;
++		if (seg->filesz && (mdt_open_seg(i, &file) || file.size != seg->filesz)) {
++			MLOG("step W4 stop: segment %u missing or wrong size", i);
++			return false;
++		}
++		vm_offset_t pa = trunc_page_64(seg->paddr);
++		vm_size_t offset = seg->paddr - pa;
++		vm_size_t mapped = round_page_64(offset + (uint64_t)seg->memsz);
++		if (pa < MODEM_REGION_PA || mapped > MODEM_REGION_PA + MODEM_REGION_SIZE - pa) {
++			MLOG("step W4 stop: segment %u mapping would leave the reserved window", i);
++			return false;
++		}
++		vm_offset_t va = ml_io_map_unmappable(pa, mapped, VM_WIMG_WCOMB);
++		if (!va) {
++			MLOG("step W4 stop: segment %u could not map", i);
++			return false;
++		}
++		MLOG("step W4 load: segment %u, %u file bytes, %u memory bytes",
++		    i, seg->filesz, seg->memsz);
++		uint8_t *dst = (uint8_t *)(va + offset);
++		int error = seg->filesz ? mfw_read(&file, 0, dst, seg->filesz) : 0;
++		if (!error && seg->memsz > seg->filesz) {
++			bzero(dst + seg->filesz, seg->memsz - seg->filesz);
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		ml_io_unmap(va, mapped);
++		if (error) {
++			MLOG("step W4 stop: segment %u read failed: %d", i, error);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++modem_wait_ready(void)
++{
++	uint32_t state, last = 0;
++	bool seen = false;
++	for (unsigned i = 0; i < 250; i++) {
++		if (sweet_smem_mpss_state(&state)) {
++			if (!seen || state != last) {
++				MLOG("step W4 slave-kernel: %#x", state);
++				seen = true;
++				last = state;
++			}
++			if (state & 1u) {
++				MLOG("step W4 FAIL: modem signaled fatal");
++				return;
++			}
++			if (state & 2u) {
++				MLOG("step W4 PASS: modem signaled READY");
++				return;
++			}
++		}
++		sweet_modem_sleep_ms(20);
++	}
++	MLOG("step W4 timeout: READY absent, slave-kernel %s %#x", seen ? "last" : "unavailable", last);
++}
+ 
+ /* PIL service and argument descriptors follow the Qualcomm SCM PAS ABI. */
+ static void
+@@ -257,6 +337,18 @@ rung_w3(void)
+ 		MLOG("step W3 mem_setup: transport %#llx result %#llx", status, result);
+ 	}
+ 	bool prepared = status == 0 && result == 0;
++	if (prepared && sweet_modem_level >= 4) {
++		if (modem_load_verified_layout()) {
++			MLOG("step W4 auth_and_reset: starting stock MPSS firmware");
++			status = sweet_modem_scm(SCM_FN(2, 5), 1, MODEM_PAS_ID, 0, 0, 0, &result);
++			MLOG("step W4 auth_and_reset: transport %#llx result %#llx", status, result);
++			if (!status && !result) {
++				modem_wait_ready();
++				goto release;
++			}
++		}
++		prepared = false;
++	}
+ 	status = sweet_modem_scm(SCM_FN(2, 6), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+ 	MLOG("step W3 shutdown: transport %#llx result %#llx", status, result);
+ 	if (status || result) {
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+index 7215770..9738942 100644
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -25,6 +25,7 @@
+ /* bsd/dev/sweet_smem.h is a userland-safe header; keep the tree include-free */
+ void sweet_smem_dump(void);
+ bool sweet_smem_mpss_empty(void);
++bool sweet_smem_mpss_state(uint32_t *state);
+ static volatile uint8_t *mpss_part;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -172,6 +173,62 @@ sweet_smem_mpss_empty(void)
+ 	       smem_rd32(mpss_part, 16) == smem_rd32(mpss_part, 8);
+ }
+ 
++/* SMP2P v1, topaz 0113. lito.dtsi:2895-2905 names fatal and ready. */
++bool
++sweet_smem_mpss_state(uint32_t *state)
++{
++	volatile uint8_t *part = mpss_part;
++	if (!part) {
++		return false;
++	}
++	uint32_t end = smem_rd32(part, 12);
++	if (end > smem_rd32(part, 8) || end > SMEM_SIZE - (size_t)(part - smem_base)) {
++		return false;
++	}
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	for (uint32_t pos = sizeof(struct smem_part_hdr); pos + sizeof(struct smem_priv_entry) <= end;) {
++		if (smem_rd16(part, pos) != SMEM_CANARY) {
++			return false;
++		}
++		uint16_t item = smem_rd16(part, pos + 2);
++		uint32_t size = smem_rd32(part, pos + 4);
++		uint16_t pad_data = smem_rd16(part, pos + 8);
++		uint32_t data = pos + sizeof(struct smem_priv_entry) + smem_rd16(part, pos + 10);
++		if (data > end || size > end - data || pad_data > size || (data & 3u)) {
++			return false;
++		}
++		if (item == SMEM_ITEM_SMP2P_IN) {
++			volatile uint8_t *header = part + data;
++			uint32_t usable = size - pad_data;
++			if (usable < 20 || !smem_magic(header, 0, "$SMP") || header[4] != 1 ||
++			    smem_rd16(header, 8) != HOST_MPSS || smem_rd16(header, 10) != HOST_APPS) {
++				return false;
++			}
++			uint16_t valid = smem_rd16(header, 14);
++			if (valid > smem_rd16(header, 12) || valid > (usable - 20) / 20) {
++				return false;
++			}
++			__asm__ volatile("dmb oshld" ::: "memory");
++			for (uint16_t i = 0; i < valid; i++) {
++				volatile uint8_t *entry = header + 20 + 20 * i;
++				char name[17];
++				for (unsigned j = 0; j < 16; j++) {
++					name[j] = (char)entry[j];
++				}
++				name[16] = 0;
++				if (strcmp(name, "slave-kernel") == 0) {
++					*state = smem_rd32(entry, 16);
++					return true;
++				}
++			}
++			return false;
++		}
++		pos = data + size;
++	}
++	return false;
++}
++
+ void
+ sweet_smem_dump(void)
+ {
