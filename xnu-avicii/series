@@ -155,3 +155,4 @@ apply 0157-avicii-wifi-w1-hook.patch
 apply 0158-avicii-wifi-w2-ufs-read-part.patch
 apply 0159-avicii-wifi-w2-modem-fw-fat.patch
 apply 0162-avicii-wifi-modem-pas-prepare.patch
+apply 0163-avicii-wifi-use-vendor-pas-init.patch

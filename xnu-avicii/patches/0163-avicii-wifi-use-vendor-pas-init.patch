@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 81f7073..c447592 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -225,8 +225,10 @@ rung_w3(void)
+ 
+ 	status = sweet_modem_scm(SCM_FN(2, 7), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+ 	MLOG("step W3 supported: transport %#llx result %#llx", status, result);
+-	if (status || result != 1 || !sweet_smem_mpss_empty()) {
+-		MLOG("step W3 stop: PAS unsupported or MPSS partition not empty");
++	/* lito subsys-pil-tz.c: pil_init_image_trusted submits the signed MDT directly.
++	 * Only INIT_IMAGE validates the metadata. The legacy query returns zero on this Nord. */
++	if (status || !sweet_smem_mpss_empty()) {
++		MLOG("step W3 stop: SCM transport failed or MPSS partition not empty");
+ 		return;
+ 	}
+ 	uint8_t *meta = sweet_modem_alloc_contig(length, &pa);
