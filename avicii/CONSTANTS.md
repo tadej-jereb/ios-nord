@@ -190,6 +190,8 @@ placeholder is all there is.
 | WLAN FW carve-out | `pil_wlan_fw_region` @ `0x8ba00000`, `0x200000` | `no-map`; referenced as `qcom,wlan-msa-fixed-region` | `lito.dtsi:414-418,3774` |
 | WLAN CE IRQs | SPI 132, 81, 415, 416, 417, 86, 94, 96, 82, 119, 120, 87 (CE0-CE11) | | `lito.dtsi:3761-3773` |
 | IPA core | `qcom,ipa@1e00000`, IPAv4.7 (`qcom,ipa-hw-ver = <18>`) | | `lito.dtsi:3649-3658` |
+| MPSS PAS peripheral ID | 4 | Signed modem firmware | `lito.dtsi:2861-2880` |
+| ICNSS supply resource IDs in vendor order | `ldoa1`, `ldoa14`, `ldoc2`, `ldoc10`, `ldoc11` | Command database availability requires a live lookup | `lito.dtsi:3778-3782`, `refs/lito-dts/lito-regulators.dtsi:95,371,588,732,750` |
 | MPSS/ADSP carve-outs | `pil_ipa_fw` `0x8bc00000`, `pil_ipa_gsi` `0x8bc10000`, `modem_wlan` `0x8c000000`/`0xf800000` | | `lito.dtsi:420-433,444-447` |
 
 ## 9. Values that exist ONLY as a live read — guessing them breaks the port silently

@@ -21,8 +21,9 @@ carve-out. It found `image/wlanmdsp.mbn` (4,097,376 bytes). A full read of
 `modem.b27` matched `mcopy` byte for byte.
 
 The full patch series applies and the touched XNU sources pass the local
-syntax check. Phone verification still needs a RAM boot and a W2 pass in the
-kernel log.
+syntax check. The November 18 RAM boot passed W2 on the Nord. The device reported 33 of
+33 loadable segments and 4,097,376 bytes of WLAN firmware. The log is in
+`logs/phone/20261118-wifi-w2/kernel.txt`.
 
 ## PAS metadata for the next rung
 

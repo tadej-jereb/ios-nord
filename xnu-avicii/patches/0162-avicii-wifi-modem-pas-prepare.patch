@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 0acb427..81f7073 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -78,6 +78,7 @@ sweet_modem_alloc_contig(size_t size, uint64_t *pa)
+ 	}
+ 	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	if (!pn) {
++		kmem_free(kernel_map, va, size);
+ 		return NULL;
+ 	}
+ 	*pa = ((uint64_t)pn << PAGE_SHIFT);
+@@ -212,6 +213,61 @@ rung_w2(void)
+ 	return true;
+ }
+ 
++extern bool sweet_smem_mpss_empty(void);
++
++/* PIL service and argument descriptors follow the Qualcomm SCM PAS ABI. */
++static void
++rung_w3(void)
++{
++	uint64_t result, status, pa;
++	uint32_t length = mdt.hdr_size + mdt.hash_size;
++	struct mfw_file hash;
++
++	status = sweet_modem_scm(SCM_FN(2, 7), 1, MODEM_PAS_ID, 0, 0, 0, &result);
++	MLOG("step W3 supported: transport %#llx result %#llx", status, result);
++	if (status || result != 1 || !sweet_smem_mpss_empty()) {
++		MLOG("step W3 stop: PAS unsupported or MPSS partition not empty");
++		return;
++	}
++	uint8_t *meta = sweet_modem_alloc_contig(length, &pa);
++	if (!meta) {
++		MLOG("step W3 stop: allocating metadata failed");
++		return;
++	}
++	memcpy(meta, mdt.raw, mdt.hdr_size);
++	if (mdt.hash_in_mdt) {
++		memcpy(meta + mdt.hdr_size, mdt.raw + mdt.hash_off, mdt.hash_size);
++	} else if (mdt_open_seg(mdt.hash_index, &hash) ||
++	    mfw_read(&hash, 0, meta + mdt.hdr_size, mdt.hash_size)) {
++		MLOG("step W3 stop: reading hash failed");
++		goto release;
++	}
++	sweet_modem_to_memory(meta, length);
++	MLOG("step W3 init_image: submitting %u bytes of signed metadata", length);
++	status = sweet_modem_scm(SCM_FN(2, 1), 0x82, MODEM_PAS_ID, pa, 0, 0, &result);
++	MLOG("step W3 init_image: transport %#llx result %#llx", status, result);
++	if (status || result) {
++		goto release;
++	}
++	if (mdt.relocatable) {
++		status = sweet_modem_scm(SCM_FN(2, 2), 3, MODEM_PAS_ID, MODEM_REGION_PA,
++		    round_page_64((uint64_t)mdt.max_addr - mdt.min_addr), 0, &result);
++		MLOG("step W3 mem_setup: transport %#llx result %#llx", status, result);
++	}
++	bool prepared = status == 0 && result == 0;
++	status = sweet_modem_scm(SCM_FN(2, 6), 1, MODEM_PAS_ID, 0, 0, 0, &result);
++	MLOG("step W3 shutdown: transport %#llx result %#llx", status, result);
++	if (status || result) {
++		MLOG("step W3 stop: holding metadata until reboot");
++		return;
++	}
++	if (prepared) {
++		MLOG("step W3 PASS: signed modem metadata accepted");
++	}
++release:
++	kmem_free(kernel_map, (vm_offset_t)meta, round_page(length));
++}
++
+ /* ---------------------------------------------------------------- thread */
+ 
+ static void
+@@ -240,8 +296,8 @@ sweet_modem_thread(__unused void *arg, __unused wait_result_t wr)
+ 		goto out;
+ 	}
+ 	MLOG("step W2 PASS: firmware readable and inside the carve-out; no hardware was touched");
+-	if (sweet_modem_level < 3) {
+-		goto out;
++	if (sweet_modem_level >= 3) {
++		rung_w3();
+ 	}
+ out:
+ 	mdt_free(&mdt);
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+index 02a1104..7215770 100644
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -24,6 +24,8 @@
+ 
+ /* bsd/dev/sweet_smem.h is a userland-safe header; keep the tree include-free */
+ void sweet_smem_dump(void);
++bool sweet_smem_mpss_empty(void);
++static volatile uint8_t *mpss_part;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -102,7 +104,7 @@ sweet_smem_dump_items(void)
+ 		uint16_t h0 = smem_rd16(smem_base, e + 12);
+ 		uint16_t h1 = smem_rd16(smem_base, e + 14);
+ 
+-		if (off == 0 || size == 0 || off >= SMEM_SIZE) {
++		if (off == 0 || off >= SMEM_SIZE || size < sizeof(struct smem_part_hdr) || size > SMEM_SIZE - off) {
+ 			continue;
+ 		}
+ 		printf("SWEET SMEM: part[%u] +%#x size %#x flags %#x hosts %u/%u\n",
+@@ -130,6 +132,9 @@ sweet_smem_dump_items(void)
+ 		printf("SWEET SMEM: bad free pointer %#x > size %#x\n", pfree, psize);
+ 		return;
+ 	}
++	if (pfree == sizeof(struct smem_part_hdr) && smem_rd32(part, 16) == psize) {
++		mpss_part = part;
++	}
+ 	uint32_t pos = sizeof(struct smem_part_hdr), idx = 0;
+ 	while (pos + sizeof(struct smem_priv_entry) <= pfree) {
+ 		uint16_t canary = smem_rd16(part, pos);
+@@ -160,6 +165,13 @@ sweet_smem_dump_items(void)
+ 	printf("SWEET SMEM: apps<->mpss items walked %u, read-only, no hwlock\n", idx);
+ }
+ 
++bool
++sweet_smem_mpss_empty(void)
++{
++	return mpss_part && smem_rd32(mpss_part, 12) == sizeof(struct smem_part_hdr) &&
++	       smem_rd32(mpss_part, 16) == smem_rd32(mpss_part, 8);
++}
++
+ void
+ sweet_smem_dump(void)
+ {
+diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
+index 1300598..da14d4c 100644
+--- a/bsd/dev/sweet_wifi.c
++++ b/bsd/dev/sweet_wifi.c
+@@ -74,20 +74,9 @@ static const uint32_t wifi_ce_spi[WIFI_CE_COUNT] = {
+ 	0x5eu, 0x60u, 0x52u, 0x77u, 0x78u, 0x57u,
+ };
+ 
+-/*
+- * The five icnss rails in driver order (snoc.c:48-54, docs/WLAN_MAP.md §2.9):
+- * vdd-0.8-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0, vdd-3.3-ch1. Only the
+- * first two have a proven cmd-db name; the rest are listed once per plausible
+- * pm8150a suffix. smpa2/smpa3 are sanity names -- the kernel already votes
+- * smpa4 (touch IO), so a cmd-db that cannot resolve an SMPS name is broken.
+- */
++/* lito.dtsi:3778-3782 supply phandles and lito-regulators.dtsi resource names. */
+ static const char * const wifi_rails[] = {
+-	"ldoa1a",                                       /* 0.8-cx-mx, first rail */
+-	"ldoa14a",                                      /* 1.8-xo */
+-	"ldoa2a", "ldoa10a", "ldoa11a",                 /* 1.3-rfa, 3.3-ch0, 3.3-ch1 */
+-	"ldo2a", "ldo10a", "ldo11a",                    /* same, no 'a' infix */
+-	"ldoa2c", "ldoa10c", "ldoa11c",                 /* same, 'c' suffix */
+-	"smpa2", "smpa3",                               /* sanity */
++	"ldoa1", "ldoa14", "ldoc2", "ldoc10", "ldoc11",
+ };
+ 
+ void
