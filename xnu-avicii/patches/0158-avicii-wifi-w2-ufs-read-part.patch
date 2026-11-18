@@ -1,0 +1,181 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ff68bde..1d98c07 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -483,6 +483,176 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * Wi-Fi W2 (docs/wifi/W2-modem.md): read-only access to the other GPT partitions on LUNs 0-5
++ * -- the modem firmware in modem_a and the modem's EFS copies. Port of topaz 0115
++ * (sweet_ufs_read_part). Nothing here writes: there is no write path, the partition names
++ * are a fixed allow-list, and the userdata partition state (su.first_block/nblocks/lun) is
++ * restored before the lock is dropped. avicii: modem_a = sde4, modemst1/2 = sdf2/3,
++ * fsg/fsc = sdf4/5 (logs/dumps/run-20261112-195027/30-by-name.txt), i.e. LUN 4 and 5 if sdX
++ * counts from LUN 0 (UNVERIFIED; the scan does not depend on it, it reads every GPT).
++ */
++static const char * const ufs_ro_parts[] = {
++	"modem_a", "modem_b", "modemst1", "modemst2", "fsg", "fsc",
++};
++#define UFS_RO_LUNS     6u
++static struct { char name[16]; uint8_t lun; uint64_t first, nblocks; } ufs_ro_cache[8];
++static unsigned ufs_ro_cached;
++
++static bool
++ufs_ro_allowed(const char *want)
++{
++	for (unsigned i = 0; i < sizeof(ufs_ro_parts) / sizeof(ufs_ro_parts[0]); i++) {
++		if (strcmp(want, ufs_ro_parts[i]) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* caller holds sweet_ufs_lock; su.lun is changed and restored by the caller */
++static int
++ufs_ro_lookup(const char *want, unsigned *slot)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++
++	for (unsigned i = 0; i < ufs_ro_cached; i++) {
++		if (strcmp(ufs_ro_cache[i].name, want) == 0) {
++			*slot = i;
++			return 0;
++		}
++	}
++	if (ufs_ro_cached == sizeof(ufs_ro_cache) / sizeof(ufs_ro_cache[0])) {
++		return ENOSPC;
++	}
++	for (uint8_t lun = 0; lun < UFS_RO_LUNS; lun++) {
++		static const uint8_t tur[6] = { 0x00 };
++		uint64_t entry_lba, last_usable;
++		uint32_t nent, esz;
++
++		su.lun = lun;
++		/* the first command to a LU after the bootloader can report a unit attention */
++		for (int i = 0; i < 3 && ufs_scsi(tur, sizeof(tur), 0, false); i++) {
++		}
++		if (ufs_read_blocks(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
++			continue;
++		}
++		memcpy(&entry_lba, b + 72, 8);
++		memcpy(&nent, b + 80, 4);
++		memcpy(&esz, b + 84, 4);
++		memcpy(&last_usable, b + 48, 8);
++		if (esz != 128 || nent == 0 || (uint64_t)nent * esz > BOUNCE_SIZE ||
++		    ufs_read_blocks(entry_lba, (uint32_t)(((uint64_t)nent * esz + UFS_BLOCK - 1) / UFS_BLOCK)) != 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = b + (uint64_t)i * esz;
++			char name[17];
++			unsigned c;
++			uint64_t first, last;
++
++			for (c = 0; c < 16; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			if (strcmp(name, want) != 0 || last < first || last > last_usable ||
++			    last - first >= UINT64_MAX / UFS_BLOCK) {
++				continue;
++			}
++			unsigned k = ufs_ro_cached++;
++			strlcpy(ufs_ro_cache[k].name, want, sizeof(ufs_ro_cache[k].name));
++			ufs_ro_cache[k].lun = lun;
++			ufs_ro_cache[k].first = first;
++			ufs_ro_cache[k].nblocks = last - first + 1;
++			printf("SWEET UFS: partition %s: LUN %u first block 0x%llx, 0x%llx blocks (read-only)\n",
++			    want, lun, first, last - first + 1);
++			*slot = k;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++/*
++ * Read len bytes at byte offset off of one of the allow-listed partitions. EAGAIN until the
++ * root device is up. dst is kernel memory.
++ */
++int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++int sweet_ufs_part_size(const char *want, uint64_t *bytes);
++
++int
++sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
++{
++	unsigned slot = 0;
++	int error;
++
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	if (!ufs_ro_allowed(want)) {
++		return EPERM;
++	}
++	for (uint64_t done = 0; done < len;) {
++		uint8_t saved;
++		uint64_t pos = off + done, bytes;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want_b = (uint32_t)MIN(len - done, (uint64_t)(BOUNCE_SIZE - skip));
++		uint32_t blocks = (skip + want_b + UFS_BLOCK - 1) / UFS_BLOCK;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		saved = su.lun;
++		error = ufs_ro_lookup(want, &slot);
++		bytes = error ? 0 : ufs_ro_cache[slot].nblocks * UFS_BLOCK;
++		if (!error && (off > bytes || len > bytes - off)) {
++			error = EINVAL;
++		}
++		if (!error) {
++			su.lun = ufs_ro_cache[slot].lun;
++			error = ufs_read_blocks(ufs_ro_cache[slot].first + pos / UFS_BLOCK, blocks);
++		}
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(su.dma + DMA_BOUNCE) + skip, want_b);
++		}
++		su.lun = saved;
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (error) {
++			return error;
++		}
++		done += want_b;
++	}
++	return 0;
++}
++
++int
++sweet_ufs_part_size(const char *want, uint64_t *bytes)
++{
++	unsigned slot = 0;
++	int error;
++	uint8_t saved;
++
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	if (!ufs_ro_allowed(want)) {
++		return EPERM;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	saved = su.lun;
++	error = ufs_ro_lookup(want, &slot);
++	if (!error) {
++		*bytes = ufs_ro_cache[slot].nblocks * UFS_BLOCK;
++	}
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {

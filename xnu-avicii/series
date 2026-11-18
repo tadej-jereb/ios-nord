@@ -152,3 +152,5 @@ apply 0154-avicii-touch-inject.patch
 apply 0155-avicii-wifi-w1-smem-dump.patch
 apply 0156-avicii-wifi-w1-probes.patch
 apply 0157-avicii-wifi-w1-hook.patch
+apply 0158-avicii-wifi-w2-ufs-read-part.patch
+apply 0159-avicii-wifi-w2-modem-fw-fat.patch

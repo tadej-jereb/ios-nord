@@ -1,0 +1,1032 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 3eae5f7..0424420 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,8 @@ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_smem.c			standard
+ bsd/dev/sweet_wifi.c			standard
++bsd/dev/sweet_modem.c			standard
++bsd/dev/sweet_modem_fw.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+new file mode 100644
+index 0000000..362bd69
+--- /dev/null
++++ b/bsd/dev/sweet_modem.c
+@@ -0,0 +1,268 @@
++/*
++ * SWEET avicii: modem (MPSS) bring-up for Wi-Fi, ladder W2-W6 (docs/WLAN_ORDER.md, docs/wifi/W2-modem.md).
++ * Boot-arg sweetwifi=<N> (monotonic; N >= 2 runs rung 2 and every rung below it; 0/absent: nothing runs
++ * here, sweet_modem_start() returns before it starts a thread):
++ *   W2  read modem.mdt and the segment files from the stock modem partition (FAT), check them
++ *       against the live-FDT carve-out. No TrustZone call, no hardware access.
++ *   W3  TrustZone PAS (pas-id 4): is_supported, init_image (metadata), mem_setup, then shutdown.
++ *   W4  copy the segments, auth_and_reset, SMP2P, wait for the modem's READY bit.
++ *   W5  GLINK over SMEM + QRTR: log every NEW_SERVER (WLFW 0x45 only after W6).
++ *   W6  the host services the modem needs to finish booting: pd-mapper, tftp, rmtfs.
++ * Port of topaz 0113/0115-0119/0121 (TopazModem.cpp); every constant that differs is from the live
++ * FDT (logs/dumps/run-20261112-195027/10-fdt.dtb) or lito.dtsi and is cited at its definition.
++ * Boot-args: sweetwifidelay=<s> (default 15) waits so USB/SSH are up first; sweetmodempart=<name>
++ * (default modem_a).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++#include <dev/sweet_modem.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_ufs_part_size(const char *want, uint64_t *bytes);
++extern int sweet_rpmh_res_probe(const char *res);
++extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++
++uint32_t sweet_modem_level;
++static char modem_part[16] = "modem_a";
++
++/* ---------------------------------------------------------------- helpers */
++
++void
++sweet_modem_sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++uint64_t
++sweet_modem_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++void
++sweet_modem_to_memory(void *va, size_t size)
++{
++	for (uintptr_t line = (uintptr_t)va & ~(uintptr_t)63; line < (uintptr_t)va + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* physically contiguous, wired, zeroed kernel memory; its physical address in *pa */
++void *
++sweet_modem_alloc_contig(size_t size, uint64_t *pa)
++{
++	vm_offset_t va = 0;
++	ppnum_t pn;
++
++	size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
++	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		return NULL;
++	}
++	*pa = ((uint64_t)pn << PAGE_SHIFT);
++	return (void *)va;
++}
++
++/*
++ * One SIP SCM call (the same convention bsd/dev/sweet_gpu.c's gpu_scm_pas uses on this phone: x0 = 1 is
++ * "interrupted, resume with the token in x6", -12 is "busy"). a5 is the 4th argument register x5.
++ * Returns x0; x1 (the call's result word) goes to *x1_out.
++ */
++uint64_t
++sweet_modem_scm(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t *x1_out)
++{
++	uint64_t cmd = fn, token = 0, r1 = 0;
++
++	for (unsigned resumed = 0, busy = 0; resumed < 200000u && busy < 20u;) {
++		register uint64_t x0 __asm__("x0") = cmd;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a2;
++		register uint64_t x3 __asm__("x3") = a3;
++		register uint64_t x4 __asm__("x4") = a4;
++		register uint64_t x5 __asm__("x5") = a5;
++		register uint64_t x6 __asm__("x6") = token;
++		__asm__ volatile ("smc #0"
++                    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++                    :
++                    : "memory", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
++		r1 = x1;
++		token = x6;
++		if (x0 == 1ull) {
++			cmd = 1ull;
++			resumed++;
++			continue;
++		}
++		if ((int64_t)x0 == -12) {
++			sweet_modem_sleep_ms(30);
++			cmd = fn;
++			token = 0;
++			busy++;
++			continue;
++		}
++		*x1_out = r1;
++		return x0;
++	}
++	*x1_out = r1;
++	return ~0ull;
++}
++
++/* ---------------------------------------------------------------- rung W2: the firmware files */
++
++static struct mdt_info mdt;
++
++static bool
++rung_w2(void)
++{
++	int error;
++	uint32_t present = 0, loadable = 0, bad = 0;
++	struct mfw_file f;
++
++	if ((error = mfw_mount(modem_part)) != 0) {
++		MLOG("step W2.1 fat: mount of %s failed: %d", modem_part, error);
++		return false;
++	}
++	MLOG("step W2.1 fat: %s: %s", modem_part, mfw_describe());
++	if (mdt_load_file("image/", &mdt) != 0) {
++		return false;
++	}
++	MLOG("step W2.2 mdt: image/modem.mdt %u bytes, %u phdrs, hash segment %u (%u bytes, %s), "
++	    "load range %#x..%#x, %s", mdt.raw_size, mdt.phnum, mdt.hash_index, mdt.hash_size,
++	    mdt.hash_in_mdt ? "inside the mdt" : "split: own modem.bNN file", mdt.min_addr, mdt.max_addr,
++	    mdt.relocatable ? "relocatable" : "fixed addresses");
++	for (uint32_t i = 0; i < mdt.phnum; i++) {
++		const struct mdt_seg *s = &mdt.seg[i];
++		MLOG("step W2.2 seg %2u paddr %#010x filesz %#x memsz %#x flags %#x%s", i, s->paddr, s->filesz,
++		    s->memsz, s->flags, s->load ? "" : (i == mdt.hash_index ? " (hash)" : " (not loaded)"));
++	}
++	/* the carve-out: modem_wlan_region@8c000000 (live FDT), the pil-tz memory-region of qcom,mss@4080000 */
++	if (mdt.relocatable) {
++		if ((uint64_t)mdt.max_addr - mdt.min_addr > MODEM_REGION_SIZE) {
++			MLOG("step W2.3 window: relocatable image needs %#llx, region is %#llx",
++			    (uint64_t)mdt.max_addr - mdt.min_addr, MODEM_REGION_SIZE);
++			return false;
++		}
++	} else if (mdt.min_addr < MODEM_REGION_PA || mdt.max_addr > MODEM_REGION_PA + MODEM_REGION_SIZE) {
++		MLOG("step W2.3 window: image %#x..%#x is outside the carve-out %#llx..%#llx: nothing will be "
++		    "loaded (a layout the live FDT does not describe)", mdt.min_addr, mdt.max_addr,
++		    MODEM_REGION_PA, MODEM_REGION_PA + MODEM_REGION_SIZE);
++		return false;
++	}
++	MLOG("step W2.3 window: %#x..%#x fits modem_wlan_region %#llx+%#llx", mdt.min_addr, mdt.max_addr,
++	    MODEM_REGION_PA, MODEM_REGION_SIZE);
++	for (uint32_t i = 0; i < mdt.phnum; i++) {
++		const struct mdt_seg *s = &mdt.seg[i];
++		if (!s->load) {
++			continue;
++		}
++		loadable++;
++		if (s->memsz < s->filesz) {
++			MLOG("step W2.4 files: seg %u memsz %#x < filesz %#x", i, s->memsz, s->filesz);
++			bad++;
++			continue;
++		}
++		if (s->filesz == 0) {
++			present++;
++			continue;
++		}
++		error = mdt_open_seg(i, &f);
++		if (error != 0 || f.size != s->filesz) {
++			MLOG("step W2.4 files: image/modem.b%02u %s (want %#x bytes)", i,
++			    error != 0 ? "unreadable" : "has the wrong size", s->filesz);
++			bad++;
++		} else {
++			present++;
++		}
++	}
++	if (!mdt.hash_in_mdt) {
++		if (mdt_open_seg(mdt.hash_index, &f) != 0 || f.size < mdt.hash_size) {
++			MLOG("step W2.4 files: hash file image/modem.b%02u missing or short", mdt.hash_index);
++			bad++;
++		}
++	}
++	MLOG("step W2.4 files: %u of %u loadable segment files present, %u problem(s)", present, loadable, bad);
++	if (bad != 0) {
++		return false;
++	}
++	if (mfw_lookup("image/wlanmdsp.mbn", &f) == 0) {
++		MLOG("step W2.5 wlan firmware: image/wlanmdsp.mbn %u bytes (served to the modem by W6 tftp)", f.size);
++	} else {
++		MLOG("step W2.5 wlan firmware: image/wlanmdsp.mbn NOT found: W6/W7 need another source");
++	}
++	return true;
++}
++
++/* ---------------------------------------------------------------- thread */
++
++static void
++sweet_modem_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t delay_s = 15;
++	uint64_t bytes = 0;
++	int error = EAGAIN;
++
++	PE_parse_boot_argn("sweetwifidelay", &delay_s, sizeof(delay_s));
++	MLOG("step W%u: modem bring-up thread, partition %s, starting in %u s", sweet_modem_level, modem_part, delay_s);
++	sweet_modem_sleep_ms(delay_s * 1000u);
++	for (int i = 0; i < 120 && error == EAGAIN; i++) {
++		error = sweet_ufs_part_size(modem_part, &bytes);
++		if (error == EAGAIN) {
++			sweet_modem_sleep_ms(500);
++		}
++	}
++	if (error != 0) {
++		MLOG("step W2 FAIL: partition %s not readable (%d); nothing was touched", modem_part, error);
++		goto out;
++	}
++	MLOG("step W2.0 partition %s: %llu MiB, read-only", modem_part, bytes >> 20);
++	if (!rung_w2()) {
++		MLOG("step W2 FAIL: firmware not usable; nothing was touched");
++		goto out;
++	}
++	MLOG("step W2 PASS: firmware readable and inside the carve-out; no hardware was touched");
++	if (sweet_modem_level < 3) {
++		goto out;
++	}
++out:
++	mdt_free(&mdt);
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_modem_start(void)
++{
++	thread_t thread;
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetwifi", &on, sizeof(on)) || on < 2) {
++		return;
++	}
++	sweet_modem_level = on;
++	PE_parse_boot_argn("sweetmodempart", modem_part, sizeof(modem_part));
++	if (kernel_thread_start(sweet_modem_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		MLOG("step W2 FAIL: kernel_thread_start failed; nothing was touched");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_modem.h b/bsd/dev/sweet_modem.h
+new file mode 100644
+index 0000000..f15b3ee
+--- /dev/null
++++ b/bsd/dev/sweet_modem.h
+@@ -0,0 +1,111 @@
++/*
++ * SWEET avicii modem bring-up (Wi-Fi ladder W2-W6, docs/wifi/W2-modem.md). Internal interface
++ * between sweet_modem.c (thread, PAS), sweet_modem_fw.c (modem_a FAT reader), sweet_modem_ipc.c
++ * (SMEM, SMP2P, IPCC), sweet_glink.c (GLINK + QRTR) and sweet_modem_svc.c (host services).
++ * One boot-arg, sweetwifi=<N>: N >= W runs rung W and every rung below it.
++ */
++#ifndef SWEET_MODEM_H
++#define SWEET_MODEM_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++/* every line of the modem bring-up starts like this; the owner greps "SWEET WIFI: step" */
++#define MLOG(fmt, ...)      printf("SWEET WIFI: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- boot-arg level of the running rung (sweet_modem.c) ---- */
++extern uint32_t sweet_modem_level;
++
++/* ---- live FDT / lito.dtsi constants (docs/wifi/W2-modem.md §constants) ---- */
++/* qcom,mss@4080000: qcom,pas-id <4>, memory-region -> modem_wlan_region@8c000000 */
++#define MODEM_PAS_ID            4u
++#define MODEM_REGION_PA         0x8c000000ull
++#define MODEM_REGION_SIZE       0x0f800000ull
++/* smem_region@80900000 (lito.dtsi:363-366) */
++#define MODEM_SMEM_PA           0x80900000ull
++#define MODEM_SMEM_SIZE         0x00200000u
++/* qcom,rmtfs_sharedmem@0, client-id 1: reg <0x0 0x280000> (live FDT) */
++#define MODEM_RMTFS_SIZE        0x00280000u
++
++/* ---- sweet_modem_fw.c: read-only FAT view of the modem partition ---- */
++struct mfw_file {
++	uint32_t first;                 /* first cluster */
++	uint32_t size;                  /* bytes */
++	uint32_t cur_idx, cur_cl;       /* read cursor: cluster index and its cluster number */
++};
++int  mfw_mount(const char *part);                       /* 0 or errno; idempotent */
++int  mfw_lookup(const char *path, struct mfw_file *f);  /* "image/modem.mdt", case-insensitive */
++int  mfw_read(struct mfw_file *f, uint64_t off, void *dst, uint32_t len);
++const char *mfw_part(void);
++const char *mfw_describe(void);                         /* "FAT16 bps 512 spc 8 ..." for the log */
++
++/* ---- ELF32 / MDT ---- */
++struct mdt_seg {
++	uint32_t index;                 /* phdr index = the modem.bNN number */
++	uint32_t paddr, filesz, memsz, flags;
++	bool load;
++};
++#define MDT_MAX_PHDR    64u
++struct mdt_info {
++	uint8_t *raw;                   /* the whole modem.mdt */
++	uint32_t raw_size;
++	uint32_t phnum, hash_index;
++	uint32_t hdr_size;              /* ELF header + phdrs */
++	uint32_t hash_off, hash_size;   /* hash segment, in raw when hash_in_mdt */
++	bool hash_in_mdt, relocatable;
++	uint32_t min_addr, max_addr;    /* over loadable segments */
++	struct mdt_seg seg[MDT_MAX_PHDR];
++};
++int  mdt_load_file(const char *dir_prefix, struct mdt_info *m);   /* reads and parses image/modem.mdt */
++void mdt_free(struct mdt_info *m);
++/* read segment file image/modem.bNN fully into dst (kernel memory) or in pieces */
++int  mdt_open_seg(uint32_t index, struct mfw_file *f);
++
++/* ---- sweet_modem.c ---- */
++void sweet_modem_start(void);                           /* hook at the end of sweet_ufs_init() */
++void *sweet_modem_alloc_contig(size_t size, uint64_t *pa);  /* wired, zeroed, physically contiguous */
++void sweet_modem_to_memory(void *va, size_t size);      /* dc civac + dsb */
++uint64_t sweet_modem_scm(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4,
++    uint64_t a5, uint64_t *x1_out);
++#define SCM_FN(svc, cmd)    (0x42000000ull | ((uint64_t)(svc) << 8) | (uint64_t)(cmd))
++void sweet_modem_sleep_ms(uint32_t ms);
++uint64_t sweet_modem_ms(void);
++
++/* ---- sweet_modem_ipc.c: SMEM + SMP2P + IPCC (level 4) ---- */
++int  mipc_init(void);                                   /* maps SMEM, TCSR mutex, IPCC */
++void *mipc_smem_get(uint16_t item, uint32_t *size);     /* item in the apps<->mpss partition */
++void *mipc_smem_alloc(uint16_t item, uint32_t size);    /* under hwlock 3; NULL on failure */
++bool mipc_modem_cold(void);                             /* no smp2p in-item yet */
++void mipc_kick_smp2p(void);                             /* IPCC (client 2, signal 2) */
++void mipc_kick_glink(void);                             /* IPCC (client 2, signal 0) */
++int  mipc_smp2p_create_out(void);                       /* item 428 with master-kernel, ipa */
++void mipc_smp2p_poll(void);                             /* ssr ack + IPA answer */
++bool mipc_slave_kernel(uint32_t *v);                    /* the modem's slave-kernel word */
++bool mipc_in_entry(const char *name, uint32_t *v);      /* any entry of the in-item */
++const char *mipc_crash_reason(void);                    /* SMEM item 421 or NULL */
++void mipc_summary(void);
++
++/* ---- sweet_glink.c: GLINK over SMEM + QRTR (level 5) ---- */
++int  glink_start(void);
++void glink_poll(uint32_t ms);
++void glink_summary(void);
++bool glink_ready(void);
++bool qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
++    const void *payload, uint32_t len);
++extern uint32_t qrtr_modem_node;
++#define QRTR_NODE_APPS      1u
++#define QRTR_PORT_CTRL      0xFFFFFFFEu
++#define QRTR_TYPE_DATA      1u
++#define QRTR_TYPE_HELLO     2u
++#define QRTR_TYPE_NEW_SERVER 4u
++#define QRTR_TYPE_RESUME_TX 7u
++struct qrtr_ctrl { uint32_t cmd, a, b, c, d; } __attribute__((packed));
++/* set by sweet_modem_svc.c (level 6); NULL at level 5 */
++extern bool (*qrtr_data_hook)(uint32_t src_node, uint32_t src_port, uint32_t dst_port,
++    const uint8_t *data, uint32_t len);
++extern void (*qrtr_hello_hook)(void);
++
++/* ---- sweet_modem_svc.c: pd-mapper, tftp, rmtfs (level 6) ---- */
++void msvc_init(void);
++void msvc_summary(void);
++#endif
+diff --git a/bsd/dev/sweet_modem_fw.c b/bsd/dev/sweet_modem_fw.c
+new file mode 100644
+index 0000000..374f3a8
+--- /dev/null
++++ b/bsd/dev/sweet_modem_fw.c
+@@ -0,0 +1,602 @@
++/*
++ * SWEET avicii: the modem firmware, read-only, straight from the stock modem partition
++ * (Wi-Fi ladder W2, docs/wifi/W2-modem.md). The partition is the Qualcomm NON-HLOS FAT image
++ * (WLAN_MAP.md §2.1: "the WLAN file is inside its FAT image"; topaz 0115 read the same kind of
++ * image from modem_a with a host-built extent table). Here the FAT is walked in the kernel, so
++ * no firmware version is baked in: FAT16/FAT32, long names included (the modem's tftp requests
++ * need them), 8.3 aliases, directory chains. Nothing is ever written.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <dev/sweet_modem.h>
++
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++extern int sweet_ufs_part_size(const char *want, uint64_t *bytes);
++extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++
++#define FAT_BLOCK       4096u
++
++static struct {
++	bool mounted;
++	char part[16];
++	uint32_t type;                  /* 16 or 32 */
++	uint32_t bps, spc, csize, nclusters, rootclus, rootent;
++	uint64_t fat_off, root_off, data_off, part_bytes;
++	uint8_t *fatbuf;                /* one FAT_BLOCK of the FAT */
++	uint64_t fatbuf_at;
++	uint8_t *dirbuf;                /* one cluster */
++	char desc[96];
++} fat;
++
++static int
++fat_read(uint64_t off, void *dst, uint32_t len)
++{
++	return sweet_ufs_read_part(fat.part, off, dst, len);
++}
++
++static inline uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8;
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return le16(p) | le16(p + 2) << 16;
++}
++
++const char *
++mfw_part(void)
++{
++	return fat.part;
++}
++
++const char *
++mfw_describe(void)
++{
++	return fat.desc;
++}
++
++int
++mfw_mount(const char *part)
++{
++	uint8_t bs[512];
++	uint32_t rsvd, nfats, fatsz, total, rootsec;
++	int error;
++
++	if (fat.mounted) {
++		return 0;
++	}
++	strlcpy(fat.part, part, sizeof(fat.part));
++	if ((error = sweet_ufs_part_size(part, &fat.part_bytes)) != 0 ||
++	    (error = fat_read(0, bs, sizeof(bs))) != 0) {
++		return error;
++	}
++	if (bs[510] != 0x55 || bs[511] != 0xaa) {
++		MLOG("step W2.1 fat: %s has no boot-sector signature (%02x%02x); not a FAT volume", part, bs[510], bs[511]);
++		return ENXIO;
++	}
++	fat.bps = le16(bs + 11);
++	fat.spc = bs[13];
++	rsvd = le16(bs + 14);
++	nfats = bs[16];
++	fat.rootent = le16(bs + 17);
++	total = le16(bs + 19) ? le16(bs + 19) : le32(bs + 32);
++	fatsz = le16(bs + 22) ? le16(bs + 22) : le32(bs + 36);
++	fat.rootclus = le32(bs + 44);
++	if ((fat.bps != 512 && fat.bps != 1024 && fat.bps != 2048 && fat.bps != 4096) ||
++	    fat.spc == 0 || (fat.spc & (fat.spc - 1)) || nfats == 0 || fatsz == 0 || total == 0 ||
++	    (uint64_t)fat.bps * fat.spc > 65536) {
++		MLOG("step W2.1 fat: %s implausible BPB (bps %u spc %u fats %u fatsz %u total %u)",
++		    part, fat.bps, fat.spc, nfats, fatsz, total);
++		return ENXIO;
++	}
++	fat.csize = fat.bps * fat.spc;
++	rootsec = (fat.rootent * 32 + fat.bps - 1) / fat.bps;
++	uint64_t datasec = rsvd + (uint64_t)nfats * fatsz + rootsec;
++	if (total <= datasec) {
++		return ENXIO;
++	}
++	fat.nclusters = (total - datasec) / fat.spc;
++	fat.type = fat.nclusters < 4085 ? 12 : fat.nclusters < 65525 ? 16 : 32;
++	if (fat.type == 12) {
++		MLOG("step W2.1 fat: %s is FAT12, not supported", part);
++		return ENOTSUP;
++	}
++	if (fat.type == 16 && fat.rootent == 0) {
++		return ENXIO;
++	}
++	fat.fat_off = (uint64_t)rsvd * fat.bps;
++	fat.root_off = (datasec - rootsec) * fat.bps;
++	fat.data_off = (uint64_t)datasec * fat.bps;
++	if (((uint64_t)fat.nclusters + 2) * (fat.type / 8) > (uint64_t)fatsz * fat.bps) {
++		return ENXIO;
++	}
++	if ((uint64_t)total * fat.bps > fat.part_bytes) {
++		MLOG("step W2.1 fat: volume (%llu bytes) is larger than the partition (%llu)",
++		    (uint64_t)total * fat.bps, fat.part_bytes);
++		return ENXIO;
++	}
++	fat.fatbuf = kalloc_data(FAT_BLOCK, Z_WAITOK | Z_ZERO);
++	fat.dirbuf = kalloc_data(fat.csize > FAT_BLOCK ? fat.csize : FAT_BLOCK, Z_WAITOK | Z_ZERO);
++	if (!fat.fatbuf || !fat.dirbuf) {
++		return ENOMEM;
++	}
++	fat.fatbuf_at = ~0ull;
++	scnprintf(fat.desc, sizeof(fat.desc), "FAT%u bps %u spc %u clusters %u root %s data at %#llx",
++	    fat.type, fat.bps, fat.spc, fat.nclusters, fat.type == 16 ? "fixed" : "chain", fat.data_off);
++	fat.mounted = true;
++	return 0;
++}
++
++/* next cluster of the chain; 0 at the end of it, ~0 on a bad entry or a read error */
++static uint32_t
++fat_next(uint32_t cl)
++{
++	uint64_t off = fat.fat_off + (uint64_t)cl * (fat.type / 8), blk = off & ~(uint64_t)(FAT_BLOCK - 1);
++	uint32_t v;
++
++	if (cl < 2 || cl >= fat.nclusters + 2) {
++		return ~0u;
++	}
++	if (blk != fat.fatbuf_at) {
++		uint32_t n = FAT_BLOCK;
++		if (blk + n > fat.part_bytes) {
++			return ~0u;
++		}
++		if (fat_read(blk, fat.fatbuf, n) != 0) {
++			return ~0u;
++		}
++		fat.fatbuf_at = blk;
++	}
++	v = fat.type == 16 ? le16(fat.fatbuf + (off - blk)) : le32(fat.fatbuf + (off - blk)) & 0x0fffffffu;
++	if (v >= (fat.type == 16 ? 0xfff8u : 0x0ffffff8u)) {
++		return 0;
++	}
++	if (v < 2 || v >= fat.nclusters + 2) {
++		return ~0u;
++	}
++	return v;
++}
++
++static uint64_t
++fat_cluster_off(uint32_t cl)
++{
++	return fat.data_off + (uint64_t)(cl - 2) * fat.csize;
++}
++
++/* ---- directory walk ---- */
++
++struct mfw_ent {
++	uint32_t first, size;
++	bool dir;
++};
++
++static uint8_t
++sfn_sum(const uint8_t *n)
++{
++	uint8_t s = 0;
++	for (int i = 0; i < 11; i++) {
++		s = (uint8_t)(((s & 1) ? 0x80 : 0) + (s >> 1) + n[i]);
++	}
++	return s;
++}
++
++static char
++lc(char c)
++{
++	return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
++}
++
++static bool
++name_eq(const char *a, const char *b)
++{
++	for (;; a++, b++) {
++		if (lc(*a) != lc(*b)) {
++			return false;
++		}
++		if (*a == 0) {
++			return true;
++		}
++	}
++}
++
++/* cb returns nonzero to stop; walk returns 0 (end of directory), 1 (stopped), or errno | 0x10000 */
++typedef int (*mfw_cb)(void *ctx, const char *name, const struct mfw_ent *e);
++
++static int
++dir_chunk(const uint8_t *buf, uint32_t len, char *lfn, uint32_t *lfn_len, uint8_t *lfn_sum, bool *lfn_ok,
++    mfw_cb cb, void *ctx, bool *end)
++{
++	for (uint32_t o = 0; o + 32 <= len; o += 32) {
++		const uint8_t *e = buf + o;
++		uint8_t attr = e[11];
++
++		if (e[0] == 0) {
++			*end = true;
++			return 0;
++		}
++		if (e[0] == 0xe5) {
++			*lfn_ok = false;
++			continue;
++		}
++		if (attr == 0x0f) {
++			uint32_t seq = e[0] & 0x1f;
++			static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
++			if (e[0] & 0x40) {
++				bzero(lfn, 256);
++				*lfn_ok = true;
++				*lfn_sum = e[13];
++				*lfn_len = 0;
++			}
++			if (!*lfn_ok || seq == 0 || seq > 20 || e[13] != *lfn_sum) {
++				*lfn_ok = false;
++				continue;
++			}
++			for (uint32_t k = 0; k < 13; k++) {
++				uint32_t ch = le16(e + pos[k]), at = (seq - 1) * 13 + k;
++				if (at >= 255) {
++					break;
++				}
++				if (ch == 0 || ch == 0xffff) {
++					if (at + 1 > *lfn_len) {
++						*lfn_len = at;
++					}
++					break;
++				}
++				lfn[at] = ch < 0x80 ? (char)ch : '?';
++				if (at + 1 > *lfn_len) {
++					*lfn_len = at + 1;
++				}
++			}
++			continue;
++		}
++		if (attr & 0x08) {              /* volume label */
++			*lfn_ok = false;
++			continue;
++		}
++		char sfn[13];
++		uint32_t n = 0;
++		for (int k = 0; k < 8 && e[k] != ' '; k++) {
++			sfn[n++] = lc((char)(e[0] == 0x05 && k == 0 ? 0xe5 : e[k]));
++		}
++		if (e[8] != ' ') {
++			sfn[n++] = '.';
++			for (int k = 8; k < 11 && e[k] != ' '; k++) {
++				sfn[n++] = lc((char)e[k]);
++			}
++		}
++		sfn[n] = 0;
++		if (!(sfn[0] == '.' && (sfn[1] == 0 || (sfn[1] == '.' && sfn[2] == 0)))) {
++			struct mfw_ent ent;
++			ent.first = le16(e + 26) | (fat.type == 32 ? le16(e + 20) << 16 : 0);
++			ent.size = le32(e + 28);
++			ent.dir = (attr & 0x10) != 0;
++			const char *name = sfn;
++			if (*lfn_ok && sfn_sum(e) == *lfn_sum) {
++				lfn[*lfn_len] = 0;
++				name = lfn;
++			}
++			if (cb(ctx, name, &ent)) {
++				return 1;
++			}
++		}
++		*lfn_ok = false;
++	}
++	return 0;
++}
++
++static int
++mfw_walk(uint32_t dir, mfw_cb cb, void *ctx)
++{
++	char *lfn = kalloc_data(256, Z_WAITOK | Z_ZERO);
++	uint32_t lfn_len = 0;
++	uint8_t lfn_sum = 0;
++	bool lfn_ok = false, end = false;
++	int rc = 0;
++
++	if (!lfn) {
++		return ENOMEM | 0x10000;
++	}
++	if (dir == 0) {
++		if (fat.type == 16) {           /* the fixed root directory */
++			uint64_t total = (uint64_t)fat.rootent * 32;
++			for (uint64_t at = 0; at < total && !end && !rc; at += FAT_BLOCK) {
++				uint32_t n = (uint32_t)MIN((uint64_t)FAT_BLOCK, total - at);
++				int err = fat_read(fat.root_off + at, fat.dirbuf, (n + 511) & ~511u);
++				if (err) {
++					rc = err | 0x10000;
++					break;
++				}
++				rc = dir_chunk(fat.dirbuf, n, lfn, &lfn_len, &lfn_sum, &lfn_ok, cb, ctx, &end);
++			}
++			kfree_data(lfn, 256);
++			return rc;
++		}
++		dir = fat.rootclus;
++	}
++	for (uint32_t cl = dir, hops = 0; cl != 0 && !end && !rc; hops++) {
++		if (cl == ~0u || hops > fat.nclusters) {
++			rc = EIO | 0x10000;
++			break;
++		}
++		int err = fat_read(fat_cluster_off(cl), fat.dirbuf, fat.csize);
++		if (err) {
++			rc = err | 0x10000;
++			break;
++		}
++		rc = dir_chunk(fat.dirbuf, fat.csize, lfn, &lfn_len, &lfn_sum, &lfn_ok, cb, ctx, &end);
++		if (!rc && !end) {
++			cl = fat_next(cl);
++		}
++	}
++	kfree_data(lfn, 256);
++	return rc;
++}
++
++struct find_ctx {
++	const char *want;
++	struct mfw_ent ent;
++	bool found;
++};
++
++static int
++find_cb(void *ctx, const char *name, const struct mfw_ent *e)
++{
++	struct find_ctx *f = ctx;
++	if (name_eq(name, f->want)) {
++		f->ent = *e;
++		f->found = true;
++		return 1;
++	}
++	return 0;
++}
++
++/* "image/modem.mdt" -> file (or directory, size 0) */
++static int
++mfw_lookup_ent(const char *path, struct mfw_ent *out)
++{
++	uint32_t dir = 0;
++	char comp[64];
++	struct mfw_ent cur = { 0, 0, true };
++
++	if (!fat.mounted) {
++		return ENXIO;
++	}
++	while (*path == '/') {
++		path++;
++	}
++	while (*path) {
++		size_t n = 0;
++		struct find_ctx fc;
++		int rc;
++
++		while (path[n] && path[n] != '/') {
++			n++;
++		}
++		if (n == 0 || n >= sizeof(comp) || !cur.dir) {
++			return ENOENT;
++		}
++		memcpy(comp, path, n);
++		comp[n] = 0;
++		bzero(&fc, sizeof(fc));
++		fc.want = comp;
++		rc = mfw_walk(dir, find_cb, &fc);
++		if (rc > 1) {
++			return rc & 0xffff;
++		}
++		if (!fc.found) {
++			return ENOENT;
++		}
++		cur = fc.ent;
++		dir = cur.dir ? cur.first : 0;
++		path += n;
++		while (*path == '/') {
++			path++;
++		}
++	}
++	*out = cur;
++	return 0;
++}
++
++int
++mfw_lookup(const char *path, struct mfw_file *f)
++{
++	struct mfw_ent e;
++	int error = mfw_lookup_ent(path, &e);
++
++	if (error) {
++		return error;
++	}
++	if (e.dir) {
++		return EISDIR;
++	}
++	f->first = e.first;
++	f->size = e.size;
++	f->cur_idx = 0;
++	f->cur_cl = e.first;
++	return 0;
++}
++
++/* cluster number of cluster index idx of f, keeping the cursor; 0 = out of chain */
++static uint32_t
++file_cluster(struct mfw_file *f, uint32_t idx)
++{
++	if (f->first < 2) {
++		return 0;
++	}
++	if (idx < f->cur_idx || f->cur_cl < 2) {
++		f->cur_idx = 0;
++		f->cur_cl = f->first;
++	}
++	while (f->cur_idx < idx) {
++		uint32_t n = fat_next(f->cur_cl);
++		if (n == 0 || n == ~0u) {
++			return 0;
++		}
++		f->cur_cl = n;
++		f->cur_idx++;
++	}
++	return f->cur_cl;
++}
++
++int
++mfw_read(struct mfw_file *f, uint64_t off, void *dst, uint32_t len)
++{
++	uint32_t done = 0;
++
++	if (off > f->size || len > f->size - off) {
++		return EINVAL;
++	}
++	while (done < len) {
++		uint64_t pos = off + done;
++		uint32_t idx = (uint32_t)(pos / fat.csize), in = (uint32_t)(pos % fat.csize);
++		uint32_t cl = file_cluster(f, idx), run = 1;
++		uint32_t want = len - done;
++
++		if (cl == 0) {
++			return EIO;
++		}
++		/* extend over physically adjacent clusters, up to 256 KiB per device read */
++		while ((uint64_t)run * fat.csize - in < want && (uint64_t)run * fat.csize < 262144) {
++			uint32_t n = fat_next(f->cur_cl);
++			if (n != f->cur_cl + 1) {
++				break;
++			}
++			f->cur_cl = n;
++			f->cur_idx++;
++			run++;
++		}
++		uint32_t take = (uint32_t)MIN((uint64_t)want, (uint64_t)run * fat.csize - in);
++		int error = fat_read(fat_cluster_off(cl) + in, (uint8_t *)dst + done, take);
++		if (error) {
++			return error;
++		}
++		done += take;
++	}
++	return 0;
++}
++
++/* ---------------------------------------------------------------- MDT */
++
++struct elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++struct elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
++#define PT_LOAD             1u
++#define MDT_TYPE_MASK       (7u << 24)
++#define MDT_TYPE_HASH       (2u << 24)
++#define MDT_RELOCATABLE     (1u << 27)
++
++int
++mdt_open_seg(uint32_t index, struct mfw_file *f)
++{
++	char name[40];
++
++	scnprintf(name, sizeof(name), "image/modem.b%02u", index);
++	return mfw_lookup(name, f);
++}
++
++void
++mdt_free(struct mdt_info *m)
++{
++	if (m->raw) {
++		kfree_data(m->raw, m->raw_size);
++		m->raw = NULL;
++	}
++}
++
++int
++mdt_load_file(const char *prefix, struct mdt_info *m)
++{
++	struct mfw_file f;
++	char name[48];
++	int error;
++
++	(void)prefix;
++	bzero(m, sizeof(*m));
++	scnprintf(name, sizeof(name), "image/modem.mdt");
++	if ((error = mfw_lookup(name, &f)) != 0) {
++		MLOG("step W2.2 mdt: %s: lookup error %d", name, error);
++		return error;
++	}
++	if (f.size < sizeof(struct elf32_ehdr) || f.size > 0x100000) {
++		MLOG("step W2.2 mdt: %s: size %u not plausible", name, f.size);
++		return EINVAL;
++	}
++	m->raw = kalloc_data(f.size, Z_WAITOK | Z_ZERO);
++	m->raw_size = f.size;
++	if (!m->raw || (error = mfw_read(&f, 0, m->raw, f.size)) != 0) {
++		MLOG("step W2.2 mdt: read of %s failed (%d)", name, error ? error : ENOMEM);
++		mdt_free(m);
++		return error ? error : ENOMEM;
++	}
++	const struct elf32_ehdr *eh = (const struct elf32_ehdr *)m->raw;
++	if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_ident[4] != 1 || eh->e_phentsize != sizeof(struct elf32_phdr) ||
++	    eh->e_phnum == 0 || eh->e_phnum > MDT_MAX_PHDR ||
++	    (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > f.size) {
++		MLOG("step W2.2 mdt: %s: not an ELF32 with <= %u phdrs (phnum %u phoff %u)", name, MDT_MAX_PHDR,
++		    eh->e_phnum, eh->e_phoff);
++		mdt_free(m);
++		return EINVAL;
++	}
++	const struct elf32_phdr *ph = (const struct elf32_phdr *)(m->raw + eh->e_phoff);
++	m->phnum = eh->e_phnum;
++	m->hash_index = ~0u;
++	m->hdr_size = eh->e_phoff + eh->e_phnum * (uint32_t)sizeof(struct elf32_phdr);
++	m->min_addr = ~0u;
++	for (uint32_t i = 0; i < m->phnum; i++) {
++		struct mdt_seg *s = &m->seg[i];
++		s->index = i;
++		s->paddr = ph[i].p_paddr;
++		s->filesz = ph[i].p_filesz;
++		s->memsz = ph[i].p_memsz;
++		s->flags = ph[i].p_flags;
++		if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			m->hash_index = i;
++			m->hash_off = ph[i].p_offset;
++			m->hash_size = ph[i].p_filesz;
++		}
++		s->load = ph[i].p_type == PT_LOAD && ph[i].p_memsz != 0 && (ph[i].p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH;
++		if (s->load) {
++			if (s->memsz > UINT32_MAX - s->paddr) {
++				MLOG("step W2.2 mdt: segment %u wraps the address space", i);
++				mdt_free(m);
++				return EINVAL;
++			}
++			if (ph[i].p_flags & MDT_RELOCATABLE) {
++				m->relocatable = true;
++			}
++			if (s->paddr < m->min_addr) {
++				m->min_addr = s->paddr;
++			}
++			if (s->paddr + s->memsz > m->max_addr) {
++				m->max_addr = s->paddr + s->memsz;
++			}
++		}
++	}
++	if (m->min_addr == ~0u) {
++		MLOG("step W2.2 mdt: no loadable segments");
++		mdt_free(m);
++		return EINVAL;
++	}
++	if (m->hash_index == ~0u || m->hash_size == 0 || m->hash_size > 0x10000) {
++		MLOG("step W2.2 mdt: no usable hash segment (index %d size %u)", (int)m->hash_index, m->hash_size);
++		mdt_free(m);
++		return EINVAL;
++	}
++	m->hash_in_mdt = (uint64_t)m->hash_off + m->hash_size <= f.size;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 1d98c07..0c8f528 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1000,6 +1000,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_rpmh_bcm_boot(void);
+ extern void sweet_wifi_init(void);   /* bsd/dev/sweet_wifi.c, W1 probe (boot-arg sweetwifi) */
++extern void sweet_modem_start(void); /* bsd/dev/sweet_modem.c, W2-W6 modem bring-up thread (sweetwifi>=2) */
+ 
+ static int
+ sweet_ufs_init(void)
+@@ -1090,6 +1091,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_gpu_init();         /* nothing unless boot-arg sweetgpu (bsd/dev/sweet_gpu.c) */
++	sweet_modem_start();      /* nothing unless boot-arg sweetwifi>=2: modem firmware/PAS thread */
+ 	return 0;
+ }
+ 
