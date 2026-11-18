@@ -147,3 +147,4 @@ apply 0149-avicii-ufs-hardening.patch
 apply 0150-avicii-gpu-dead-code.patch
 apply 0151-avicii-metal-plugin-name.patch
 apply 0152-avicii-display-probe.patch
+apply 0153-avicii-gpu-runtime-speed.patch

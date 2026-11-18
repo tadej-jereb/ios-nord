@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index fed5e7f..2e33959 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -995,6 +995,7 @@ static const struct { uint32_t khz, level; } g_speeds[] = {
+ };
+ #define GPU_LEVELS (sizeof(g_speeds) / sizeof(g_speeds[0]))
+ static uint32_t g_gpu_khz;
++static uint32_t g_gpu_speed_idx = 1;   /* the index voted at stage 8 (sweetgpu_speed), 1 = 275 MHz */
+ 
+ struct hfi_perf_table {
+ 	uint32_t header, gpu_levels, gmu_levels;
+@@ -1050,6 +1051,7 @@ gmu_core_power(void)
+ 		speed = 1;
+ 	}
+ 	vote[2] = speed;
++	g_gpu_speed_idx = speed;
+ 	g_gpu_khz = g_speeds[speed].khz;
+ 	gpu_log("SWEET GMU: [HFI] votes gx %#x %#x .. %#x, gmu %#x %#x; bus SH0 %#x MC0 %#x ACV %#x CN0 %#x; speed %u MHz\n",
+ 	    perf.gpu[0].vote, perf.gpu[1].vote, perf.gpu[GPU_LEVELS - 1u].vote, perf.gmu[0].vote, perf.gmu[1].vote,
+@@ -2400,6 +2402,9 @@ static uint32_t g_fence;            /* the last submission's number (redwood gpu
+ #define GPU_TIMES_OFF      0x400u   /* 64 slots of { begin, end } u64 */
+ #define GPU_TIMES          64u
+ #define A6XX_CP_ALWAYS_ON_COUNTER 0x400u   /* (RBBM_PERFCTR_CP_0; the name kept for the ring code) */
++/* a submission longer than this many core cycles is not one (UNVERIFIED bound, my choice: 40e9 = 64 s at 625 MHz) */
++#define GPU_TIME_MAX 40000000000ull
++static uint32_t g_gpu_bad;          /* timing pairs skipped by gpu_times (reported and cleared with the DRM line) */
+ static uint32_t g_timed;            /* the last fence whose times are added up */
+ static uint64_t g_gpu_busy_ticks;   /* ... all of them, in GPU cycles (the clock governor's: dvfs_thread) */
+ static uint64_t g_gpu_ticks;
+@@ -2442,11 +2447,19 @@ gpu_times(void)
+ 	}
+ 	while (g_timed != done) {
+ 		uint32_t slot = ++g_timed % GPU_TIMES;
+-		if (g_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
+-			g_gpu_ticks += times[2 * slot + 1] - times[2 * slot];
+-			g_gpu_busy_ticks += times[2 * slot + 1] - times[2 * slot];
+-			g_gpu_timed++;
++		uint64_t b = times[2 * slot], e = times[2 * slot + 1];
++		if (g_timed == 0) {
++			continue;
++		}
++		/* 0153: skip a pair that is not a real submission: end before begin (wrapped / not yet written), begin never
++		 * written (0), or longer than GPU_TIME_MAX cycles (a stale half of a slot; seen as 1e15 us on the phone). */
++		if (e <= b || b == 0 || e - b > GPU_TIME_MAX) {
++			g_gpu_bad++;
++			continue;
+ 		}
++		g_gpu_ticks += e - b;
++		g_gpu_busy_ticks += e - b;
++		g_gpu_timed++;
+ 	}
+ }
+ 
+@@ -3493,9 +3506,10 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
+ 			uint64_t mhz = g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : g_gpu_nlevels - 1u] : 180u;
+ 			printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all, %llu Mcycles), level %u "
+-			    "(%llu MHz); last slot %u begin %#llx end %#llx\n",
++			    "(%llu MHz); last slot %u begin %#llx end %#llx; %u bad pairs skipped\n",
+ 			    g_gpu_timed ? g_gpu_ticks / mhz / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks / mhz / 1000,
+-			    g_gpu_ticks / 1000000u, g_gpu_level, mhz, last, tm[2 * last], tm[2 * last + 1]);
++			    g_gpu_ticks / 1000000u, g_gpu_level, mhz, last, tm[2 * last], tm[2 * last + 1], g_gpu_bad);
++			g_gpu_bad = 0;
+ 		}
+ 		g_gpu_ticks = 0;
+ 		g_gpu_timed = 0;
+@@ -4098,10 +4112,28 @@ gpu_kgsl_publish(void)
+ 	for (uint32_t i = 0; i < g_gpu_nlevels; i++) {
+ 		g_gpu_mhz[i] = g_speeds[GPU_LEVELS - 1u - i].khz / 1000u;
+ 	}
+-	g_gpu_level = (uint32_t)GPU_LEVELS - 1u - 1u;   /* stage 8 voted index 1 (sweetgpu_speed), the slowest */
++	g_gpu_level = (uint32_t)GPU_LEVELS - 1u - g_gpu_speed_idx;   /* what stage 8 really voted (sweetgpu_speed) */
+ 	gpu_wr(g_core, GPU_W(0x8d0), 0);                /* CP_PERFCTR_CP_SEL_0: RBBM_PERFCTR_CP_0 counts core cycles */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	g_kgsl_ready = 1;
++	/*
++	 * 0153 (J-gpu-clock.md 3b/7b): the vendor only ever raises the clock at run time, with GX up and oob_gpu held
++	 * (kgsl_pwrctrl.c:597-657 -> kgsl_gmu.c:506-527). Send the same GX_BW_PERF_VOTE again now that START is done.
++	 * Same message as gpu_set_level(): { hdr, ack block, freq index, bw 0xff } (kgsl_hfi.h:388-393).
++	 */
++	{
++		uint32_t revote = 0, vote[4] = { 0, 1, g_gpu_speed_idx, 0xffu };
++		(void)PE_parse_boot_argn("sweetgpu_revote", &revote, sizeof(revote));
++		if (revote != 0 || g_gpu_speed_idx > 1u) {
++			if (hfi_send("the speed again, at run time", HFI_GX_BW_PERF_VOTE, vote, 4)) {
++				gpu_log("SWEET GPU: level %u (%u MHz) at start\n", g_gpu_level, g_gpu_mhz[g_gpu_level]);
++			} else {
++				gpu_log("SWEET GPU: the run-time vote of level %u failed\n", g_gpu_level);
++			}
++		} else {
++			gpu_log("SWEET GPU: level %u (%u MHz) at start (voted at bring-up)\n", g_gpu_level, g_gpu_mhz[g_gpu_level]);
++		}
++	}
+ 	gpu_log("SWEET GPU: [KGSL] ring at word %u, result page %#llx (gpu %#llx), buffers from %#llx\n", g_wptr,
+ 	    (unsigned long long)pa, (unsigned long long)g_res_gpu, (unsigned long long)g_gpuva_next);
+ 	return 0;
