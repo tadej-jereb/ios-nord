@@ -34,3 +34,18 @@ retains its original offset of `0x1000`, which points past the end of the
 packed MDT when the hash size is included. W2 therefore checks the matching
 `modem.b01` file. The PAS loader can use the packed MDT bytes directly for
 this firmware layout.
+
+## W3 hardware result
+
+On November 18, kernel `855f013` passed W3 on the Nord. INIT_IMAGE accepted
+the signed metadata, MEM_SETUP accepted the modem region, and SHUTDOWN
+succeeded. The earlier capability query returned zero. OnePlus's
+`drivers/soc/qcom/subsys-pil-tz.c` uses the authenticated INIT_IMAGE call to
+initialize the image. The live command database resolved all five Wi-Fi supply
+names on this boot. The result is in `logs/phone/20261118-wifi-w3b/kernel.txt`.
+
+A host comparison with an independent FAT extraction matched all 86,211,077
+file-backed bytes across the 30 nonempty loadable segments. The other three
+loadable segments require zero-fill. The 33 segment memory ranges are
+disjoint, although many share a 16 KiB kernel page. The loader must preserve
+neighboring segments when initializing a partial page.
