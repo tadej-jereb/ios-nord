@@ -148,3 +148,7 @@ apply 0150-avicii-gpu-dead-code.patch
 apply 0151-avicii-metal-plugin-name.patch
 apply 0152-avicii-display-probe.patch
 apply 0153-avicii-gpu-runtime-speed.patch
+apply 0154-avicii-touch-inject.patch
+apply 0155-avicii-wifi-w1-smem-dump.patch
+apply 0156-avicii-wifi-w1-probes.patch
+apply 0157-avicii-wifi-w1-hook.patch

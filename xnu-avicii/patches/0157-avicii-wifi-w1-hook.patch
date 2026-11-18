@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9909c18..ff68bde 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -830,6 +830,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_rpmh_bcm_boot(void);
++extern void sweet_wifi_init(void);   /* bsd/dev/sweet_wifi.c, W1 probe (boot-arg sweetwifi) */
+ 
+ static int
+ sweet_ufs_init(void)
+@@ -843,6 +844,7 @@ sweet_ufs_init(void)
+ 	/* avicii: cores left at ABL's cpufreq levels; first SWEET hook in BSD init. */
+ 	sweet_cpufreq_init();
+ 	sweet_rpmh_bcm_boot();        /* sweetddr= / sweetllcc= (docs/perf-research/A) */
++	sweet_wifi_init();            /* sweetwifi=1: W1 read-only probe (docs/WLAN_ORDER.md) */
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||

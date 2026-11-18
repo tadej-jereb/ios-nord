@@ -1,0 +1,227 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8a7c42b..3eae5f7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,8 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_smem.c			standard
++bsd/dev/sweet_wifi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+new file mode 100644
+index 0000000..02a1104
+--- /dev/null
++++ b/bsd/dev/sweet_smem.c
+@@ -0,0 +1,184 @@
++/*
++ * SWEET avicii SMEM dump (OnePlus Nord / SM7250 "lito"): ladder rung W1 part 2
++ * (docs/WLAN_ORDER.md W1, docs/WLAN_MAP.md §2.6). Boot-arg sweetwifi=1 gates it
++ * together with sweet_wifi.c (patch 0136); with no argument nothing maps, reads
++ * or prints.
++ *
++ * Read-only port of the topaz SMEM structures (refs/topaz-patches
++ * 0113-topaz-modem-pas-boot.patch, struct smem_pt / smem_pt_entry /
++ * smem_part_hdr / smem_priv_entry): the partition table sits in the last 4 kB
++ * of the SMEM region ("$TOC"), a partition header is "$PRT" and its items are
++ * canary-0xA5A5 records. On avicii the region is 0x80900000 + 0x200000
++ * (lito.dtsi:363-366, live FDT run-20261112-195027 10-fdt.dtb) and the
++ * apps<->mpss partition is host pair (0, 1). Nothing is written: no hwlock is
++ * taken (the TCSR mutex lock is for writers), no SMEM word changes, no item is
++ * allocated. The purpose is to see what the running modem left behind -- in
++ * particular the smp2p items 428 (0x1ac, out) and 435 (0x1b3, in) with their
++ * "wlan" entry -- before any GLINK/SMP2P code exists (W2/W3).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <pexpert/pexpert.h>
++
++/* bsd/dev/sweet_smem.h is a userland-safe header; keep the tree include-free */
++void sweet_smem_dump(void);
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* smem_region@80900000, 2 MiB, no-map (live FDT; lito.dtsi:363-366) */
++#define SMEM_PA                 0x80900000u
++#define SMEM_SIZE               0x00200000u
++/* the partition table is the last 4 kB of the region (topaz 0113) */
++#define SMEM_TABLE_OFF          (SMEM_SIZE - 0x1000u)
++/* apps<->mpss partition host pair (APSS=0, MPSS=1) */
++#define HOST_APPS               0u
++#define HOST_MPSS               1u
++#define SMEM_ITEMS_MAX          64u            /* topaz 0113 sanity bound */
++#define SMEM_CANARY             0xA5A5u
++#define SMEM_ITEM_SMP2P_OUT     0x1acu         /* 428: qcom,smp2p-mpss out-item */
++#define SMEM_ITEM_SMP2P_IN      0x1b3u         /* 435: qcom,smp2p-mpss in-item */
++
++struct smem_pt_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint32_t cacheline, rsvd[7]; } __attribute__((packed));
++struct smem_pt { uint8_t magic[4]; uint32_t version, num_entries, rsvd[5]; } __attribute__((packed));
++struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, rsvd[3]; } __attribute__((packed));
++struct smem_priv_entry { uint16_t canary, item; uint32_t size; uint16_t pad_data, pad_hdr; uint32_t rsvd; } __attribute__((packed));
++
++static volatile uint8_t *smem_base;            /* the mapped region */
++
++static inline uint32_t
++smem_rd32(volatile uint8_t *p, uint32_t off)
++{
++	return *(volatile uint32_t *)(p + off);
++}
++
++static inline uint16_t
++smem_rd16(volatile uint8_t *p, uint32_t off)
++{
++	return *(volatile uint16_t *)(p + off);
++}
++
++static inline bool
++smem_magic(volatile uint8_t *p, uint32_t off, const char *want)
++{
++	uint32_t v = ((uint32_t)(uint8_t)want[0]) | ((uint32_t)(uint8_t)want[1] << 8) |
++	    ((uint32_t)(uint8_t)want[2] << 16) | ((uint32_t)(uint8_t)want[3] << 24);
++
++	return smem_rd32(p, off) == v;
++}
++
++/* is a byte printable -- for entry names inside a partition */
++static char
++smem_namec(uint8_t c)
++{
++	return (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++}
++
++static void
++sweet_smem_dump_items(void)
++{
++	volatile uint8_t *part = smem_base;     /* replaced by the partition hit */
++	uint32_t i, n;
++
++	if (!smem_magic(smem_base, SMEM_TABLE_OFF, "$TOC")) {
++		printf("SWEET SMEM: no $TOC table at +%#x -- SMEM empty or wrong layout\n",
++		    SMEM_TABLE_OFF);
++		return;
++	}
++	n = smem_rd32(smem_base, SMEM_TABLE_OFF + 8);
++	printf("SWEET SMEM: $TOC version %#x entries %u\n",
++	    smem_rd32(smem_base, SMEM_TABLE_OFF + 4), n);
++	if (n > SMEM_ITEMS_MAX) {
++		printf("SWEET SMEM: table entries %u > %u, refusing to walk\n",
++		    n, SMEM_ITEMS_MAX);
++		return;
++	}
++	for (i = 0; i < n; ++i) {
++		uint32_t e = SMEM_TABLE_OFF + sizeof(struct smem_pt) + i * sizeof(struct smem_pt_entry);
++		uint32_t off = smem_rd32(smem_base, e);
++		uint32_t size = smem_rd32(smem_base, e + 4);
++		uint32_t flags = smem_rd32(smem_base, e + 8);
++		uint16_t h0 = smem_rd16(smem_base, e + 12);
++		uint16_t h1 = smem_rd16(smem_base, e + 14);
++
++		if (off == 0 || size == 0 || off >= SMEM_SIZE) {
++			continue;
++		}
++		printf("SWEET SMEM: part[%u] +%#x size %#x flags %#x hosts %u/%u\n",
++		    i, off, size, flags, h0, h1);
++		/* pick the apps<->mpss partition for the item walk */
++		if (((h0 == HOST_APPS && h1 == HOST_MPSS) ||
++		    (h0 == HOST_MPSS && h1 == HOST_APPS)) && part == smem_base) {
++			part = smem_base + off;
++		}
++	}
++	if (part == smem_base) {
++		printf("SWEET SMEM: no apps<->mpss (%u,%u) partition in the table\n",
++		    HOST_APPS, HOST_MPSS);
++		return;
++	}
++	if (!smem_magic(part, 0, "$PRT")) {
++		printf("SWEET SMEM: apps<->mpss partition has no $PRT magic\n");
++		return;
++	}
++	uint32_t psize = smem_rd32(part, 8);
++	uint32_t pfree = smem_rd32(part, 12);
++	printf("SWEET SMEM: apps<->mpss $PRT hosts %u/%u size %#x free_uncached %#x\n",
++	    smem_rd16(part, 4), smem_rd16(part, 6), psize, pfree);
++	if (pfree > psize || pfree < sizeof(struct smem_part_hdr)) {
++		printf("SWEET SMEM: bad free pointer %#x > size %#x\n", pfree, psize);
++		return;
++	}
++	uint32_t pos = sizeof(struct smem_part_hdr), idx = 0;
++	while (pos + sizeof(struct smem_priv_entry) <= pfree) {
++		uint16_t canary = smem_rd16(part, pos);
++		uint16_t item = smem_rd16(part, pos + 2);
++		uint32_t size = smem_rd32(part, pos + 4);
++		uint16_t pad_data = smem_rd16(part, pos + 8);
++		uint16_t pad_hdr = smem_rd16(part, pos + 10);
++		if (canary != SMEM_CANARY) {
++			printf("SWEET SMEM: item walk stops at +%#x: canary %#x != %#x\n",
++			    pos, canary, SMEM_CANARY);
++			break;
++		}
++		/* first payload bytes as a name, when it is text */
++		char name[9];
++		uint32_t data = pos + sizeof(struct smem_priv_entry) + pad_hdr;
++		uint32_t ni;
++		for (ni = 0; ni < 8 && ni + 1 <= size - pad_data; ++ni) {
++			name[ni] = smem_namec(*(volatile uint8_t *)(part + data + ni));
++		}
++		name[ni] = 0;
++		printf("SWEET SMEM: item %5u size %7u pad %u/%u data +%#x \"%s\"%s%s\n",
++		    item, size, pad_hdr, pad_data, data, name,
++		    item == SMEM_ITEM_SMP2P_OUT ? "  <-- smp2p out" : "",
++		    item == SMEM_ITEM_SMP2P_IN ? "  <-- smp2p in (wlan)" : "");
++		++idx;
++		pos += sizeof(struct smem_priv_entry) + pad_hdr + size;
++	}
++	printf("SWEET SMEM: apps<->mpss items walked %u, read-only, no hwlock\n", idx);
++}
++
++void
++sweet_smem_dump(void)
++{
++	static bool done;
++	uint32_t on = 0;
++
++	if (done) {
++		return;
++	}
++	if (!PE_parse_boot_argn("sweetwifi", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	done = true;
++	smem_base = (volatile uint8_t *)ml_io_map(SMEM_PA, SMEM_SIZE);
++	if (!smem_base) {
++		printf("SWEET SMEM: map of %#x/%#x failed\n", SMEM_PA, SMEM_SIZE);
++		return;
++	}
++	printf("SWEET SMEM: mapped %#x/%#x (read-only dump)\n", SMEM_PA, SMEM_SIZE);
++	sweet_smem_dump_items();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_smem.h b/bsd/dev/sweet_smem.h
+new file mode 100644
+index 0000000..ab85e2f
+--- /dev/null
++++ b/bsd/dev/sweet_smem.h
+@@ -0,0 +1,18 @@
++/* Shared C interface for the read-only avicii SMEM dump (W1). */
++#ifndef SWEET_SMEM_H
++#define SWEET_SMEM_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Dump the SMEM partition table and the apps<->mpss host item list.
++ * Boot-arg gated: sweetwifi=<N>, N >= 1. With no argument it maps nothing,
++ * reads nothing and prints nothing. Read-only: no SMEM writes, no hwlock.
++ * Thread context, once per boot; later calls return immediately.
++ */
++void sweet_smem_dump(void);
++#ifdef __cplusplus
++}
++#endif
++#endif

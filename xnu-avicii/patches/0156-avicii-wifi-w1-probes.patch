@@ -1,0 +1,231 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 67397d4..535a24e 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -16,6 +16,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_res_probe(const char *res);
++int rh_lookup(const char *res, uint32_t *address);
+ int sweet_rpmh_bcm_vote(const char *res, uint32_t ib);
+ void sweet_rpmh_bcm_boot(void);
+ 
+@@ -71,6 +73,7 @@ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_valid;   /* rh_map() succeeded once: its prints are per-boot, not per-call */
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -120,6 +123,9 @@ rh_range(uint32_t off, uint32_t size)
+ static int
+ rh_map(void)
+ {
++	if (rh_valid) {
++		return 0;       /* mapped and validated: the prints above belong to the first call */
++	}
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+ 	}
+@@ -184,10 +190,15 @@ rh_map(void)
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+ 		return EINVAL;
+ 	}
++	rh_valid = true;
+ 	return 0;
+ }
+ 
+-static int
++/*
++ * Exported for sweet_wifi.c (patch 0136, W1): de-static'd so the Wi-Fi probe can ask which
++ * resource names this cmd-db carries before any rail policy exists.
++ */
++int
+ rh_lookup(const char *res, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+@@ -440,6 +451,32 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * Read-only cmd-db lookup for the Wi-Fi W1 probe (patch 0136, docs/WLAN_ORDER.md W1):
++ * map the database, ask for one resource name, print the cmd-db address. No TCS
++ * write, no vote, no rail touched. Returns 0 when the name resolves.
++ */
++int
++sweet_rpmh_res_probe(const char *res)
++{
++	if (!res) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	uint32_t address = 0;
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		printf("SWEET RPMH: probe %s -> addr %#x (lookup only, no vote)\n",
++		    res, address);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ /*
+  * DDR / LLCC / ACV bandwidth votes (docs/perf-research/A-ddr-bandwidth.md). The vendor's devbw/bwmon/
+  * memlat governors vote these BCMs on the APPS RSC; nothing in this kernel did, so DDR and LLCC stayed
+diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
+new file mode 100644
+index 0000000..1300598
+--- /dev/null
++++ b/bsd/dev/sweet_wifi.c
+@@ -0,0 +1,144 @@
++/*
++ * SWEET WCN3990 Wi-Fi (avicii / OnePlus Nord / SM7250 "lito"): ladder rung W1,
++ * the read-only probe. Boot-arg sweetwifi=1 (default 0: no argument, no work).
++ *
++ * Nothing here writes a WLAN register, enables a rail or takes an RPMh vote: the
++ * chip is unclocked and unpowered until W4 sequences its five PMIC rails
++ * (docs/WLAN_MAP.md §2.9). W1 prints the constants the later rungs will use --
++ * every one of them from the live FDT or cited in docs/WLAN_MAP.md -- asks the
++ * cmd-db which of the icnss rail names it knows (sweet_rpmh_res_probe(): a
++ * lookup, not a vote) and asks the apps_smmu what it already has for the WLAN
++ * stream (sweet_smmu_probe_sid(): no register written).
++ *
++ * Printed rather than hidden, because they are unproven:
++ *   - the cmd-db spelling of the pm8150a LDOs. lito.dtsi:3778-3782 names
++ *     phandles only (<&L1A> ... <&L10C>), so three suffix families are probed
++ *     and the log says which ones resolve. W4 picks from the answer.
++ *   - smp2p_wlan_1_in is referenced but never defined (lito.dtsi:3786-3790),
++ *     and no WLAN out-node exists in the live FDT; the ids below are the
++ *     smp2p-mpss pair, whose 'wlan' entry is the one the modem kicks.
++ *
++ * Sources: docs/WLAN_MAP.md §2 (per-item table), lito.dtsi line numbers at each
++ * constant, and the live FDT of run-20261112-195027 (10-fdt.dtb).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <pexpert/pexpert.h>
++
++void sweet_smmu_probe_sid(unsigned sid);
++int sweet_rpmh_res_probe(const char *res);
++void sweet_smem_dump(void);            /* bsd/dev/sweet_smem.c (patch 0135) */
++void sweet_wifi_init(void);
++extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++
++/* qcom,icnss@18800000: membase 0x800000, smmu_iova_ipa 0x10000 (lito.dtsi:3756-3774) */
++#define WIFI_ICNSS_PA        0x18800000u
++#define WIFI_ICNSS_SIZE      0x00800000u
++#define WIFI_IPAL_PA         0xb0000000u
++#define WIFI_IPAL_SIZE       0x00010000u
++#define WIFI_SID             0xc0u        /* iommus = <&apps_smmu 0xC0 0x1> */
++#define WIFI_SID_MASK        0x1u
++/* pil_wlan_fw_region@8ba00000: removed-dma-pool, no-map (lito.dtsi:414-419, :3774) */
++#define WIFI_MSA_PA          0x8ba00000u
++#define WIFI_MSA_SIZE        0x00200000u
++/* modem's wlan carve-out and its dma-addr-pool (live FDT; docs/WLAN_MAP.md §2.1) */
++#define WIFI_MODEM_WLAN_PA   0x8c000000u
++#define WIFI_MODEM_WLAN_SIZE 0x0f800000u
++#define WIFI_DMA_POOL_PA     0x20000000u
++#define WIFI_DMA_POOL_SIZE   0x40000000u
++/* smem_region@80900000 0x200000 (lito.dtsi:363-366) */
++#define WIFI_SMEM_PA         0x80900000u
++#define WIFI_SMEM_SIZE       0x00200000u
++/* syscon@1f40000, smem hwlocks = <&tcsr_mutex 3> (lito.dtsi:2607-2623) */
++#define WIFI_TCSR_PA         0x1f40000u
++#define WIFI_TCSR_HWLOCK     3u
++/* qcom,ipcc@408000 0x1000 (lito.dtsi:2232); doorbell pairs from the mboxes phandles */
++#define WIFI_IPCC_PA         0x408000u
++#define WIFI_IPCC_SIZE       0x00001000u
++#define WIFI_GLINK_CLIENT    2u          /* IPCC_CLIENT_MPSS, lito.dtsi:2633 */
++#define WIFI_GLINK_SIGNAL    0u          /* IPCC_MPROC_SIGNAL_GLINK_QMP */
++#define WIFI_GLINK_PID       1u          /* qcom,remote-pid = <1>: the modem, :2631 */
++#define WIFI_SMP2P_CLIENT    2u          /* same client, MPROC_SIGNAL_SMP2P */
++#define WIFI_SMP2P_SIGNAL    2u
++#define WIFI_SMP2P_SPI       0xe5u       /* GIC SPI; the GIC IRQ is SPI + 32 */
++/* smp2p-mpss item table: qcom,smem = <in out> is <0x1b3 0x1ac> here */
++#define WIFI_SMP2P_OUT       0x1acu      /* 428 */
++#define WIFI_SMP2P_IN        0x1b3u      /* 435 */
++#define WIFI_CE_COUNT        12u
++
++/* CE0..CE11, lito.dtsi:3762-3771 in DT order; GIC IRQ = SPI + 32 */
++static const uint32_t wifi_ce_spi[WIFI_CE_COUNT] = {
++	0x84u, 0x51u, 0x19fu, 0x1a0u, 0x1a1u, 0x56u,
++	0x5eu, 0x60u, 0x52u, 0x77u, 0x78u, 0x57u,
++};
++
++/*
++ * The five icnss rails in driver order (snoc.c:48-54, docs/WLAN_MAP.md §2.9):
++ * vdd-0.8-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0, vdd-3.3-ch1. Only the
++ * first two have a proven cmd-db name; the rest are listed once per plausible
++ * pm8150a suffix. smpa2/smpa3 are sanity names -- the kernel already votes
++ * smpa4 (touch IO), so a cmd-db that cannot resolve an SMPS name is broken.
++ */
++static const char * const wifi_rails[] = {
++	"ldoa1a",                                       /* 0.8-cx-mx, first rail */
++	"ldoa14a",                                      /* 1.8-xo */
++	"ldoa2a", "ldoa10a", "ldoa11a",                 /* 1.3-rfa, 3.3-ch0, 3.3-ch1 */
++	"ldo2a", "ldo10a", "ldo11a",                    /* same, no 'a' infix */
++	"ldoa2c", "ldoa10c", "ldoa11c",                 /* same, 'c' suffix */
++	"smpa2", "smpa3",                               /* sanity */
++};
++
++void
++sweet_wifi_init(void)
++{
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetwifi", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	printf("SWEET WIFI: W1 probe (sweetwifi=%u): constants, cmd-db rail names, SMP2P/IPCC, WLAN SID\n", on);
++
++	/* Resolved live-FDT map. No register in any of these blocks is touched. */
++	printf("SWEET WIFI: icnss %#x/%#x sid %#x mask %#x iova-ipa %#x/%#x\n",
++	    WIFI_ICNSS_PA, WIFI_ICNSS_SIZE, WIFI_SID, WIFI_SID_MASK, WIFI_IPAL_PA, WIFI_IPAL_SIZE);
++	printf("SWEET WIFI: msa %#x/%#x (pil_wlan_fw_region) modem-wlan %#x/%#x dma-pool %#x/%#x\n",
++	    WIFI_MSA_PA, WIFI_MSA_SIZE, WIFI_MODEM_WLAN_PA, WIFI_MODEM_WLAN_SIZE,
++	    WIFI_DMA_POOL_PA, WIFI_DMA_POOL_SIZE);
++	printf("SWEET WIFI: smem %#x/%#x tcsr-mutex %#x hwlock %u\n",
++	    WIFI_SMEM_PA, WIFI_SMEM_SIZE, WIFI_TCSR_PA, WIFI_TCSR_HWLOCK);
++	printf("SWEET WIFI: ipcc %#x/%#x glink client %u signal %u pid %u; smp2p client %u signal %u\n",
++	    WIFI_IPCC_PA, WIFI_IPCC_SIZE, WIFI_GLINK_CLIENT, WIFI_GLINK_SIGNAL, WIFI_GLINK_PID,
++	    WIFI_SMP2P_CLIENT, WIFI_SMP2P_SIGNAL);
++	printf("SWEET WIFI: smp2p-mpss smem out %#x in %#x entry \"wlan\" remote-pid %u; smp2p spi %#x irq %u\n",
++	    WIFI_SMP2P_OUT, WIFI_SMP2P_IN, WIFI_GLINK_PID, WIFI_SMP2P_SPI, WIFI_SMP2P_SPI + 32u);
++	printf("SWEET WIFI: no smp2p-wlan out-node and no smp2p_wlan_1_in definition in the live FDT\n");
++	for (unsigned i = 0; i < WIFI_CE_COUNT; ++i) {
++		printf("SWEET WIFI: ce%u spi %#x irq %u\n", i, wifi_ce_spi[i], wifi_ce_spi[i] + 32u);
++	}
++
++	/* Which rail names the cmd-db actually carries. Read-only; nothing is voted. */
++	unsigned found = 0, nrails = (unsigned)(sizeof(wifi_rails) / sizeof(wifi_rails[0]));
++	char names[64] = "";
++	size_t pos = 0;
++	for (unsigned i = 0; i < nrails; ++i) {
++		if (sweet_rpmh_res_probe(wifi_rails[i]) == 0) {
++			++found;
++			if (pos < sizeof(names) - 16) {
++				pos += (size_t)scnprintf(names + pos, sizeof(names) - pos, " %s",
++				    wifi_rails[i]);
++			}
++		}
++	}
++	printf("SWEET WIFI: cmd-db %u/%u rail candidate names resolve:%s; none voted\n",
++	    found, nrails, pos ? names : " (none)");
++
++	/* What the firmware left behind for the WLAN stream (type, cbndx, TTBR0, FSR). */
++	sweet_smmu_probe_sid(WIFI_SID);
++	/* What the running modem left in SMEM: the partition table and the
++	 * apps<->mpss items, including smp2p out/in 428/435 (bsd/dev/sweet_smem.c). */
++	sweet_smem_dump();
++	printf("SWEET WIFI: W1 probe done; no rail enabled, no register written\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

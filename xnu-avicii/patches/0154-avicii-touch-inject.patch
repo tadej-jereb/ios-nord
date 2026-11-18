@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 3e1d206..e173ffd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -1337,4 +1338,44 @@ sweet_touch_init(void)
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/*
++ * 0154: touches injected through the same path as the panel's own (sweet_hid_touch -> SweetHIDTouch::touch), so a
++ * script's swipe is the same HID event a finger makes. Userland hidtouch dispatched from a client and its swipes were
++ * ignored (taps worked). Only with boot-arg sweettouch_inject=1.
++ *   sysctl kern.sweet_touch_inject = 0x40000000 | down << 27 | finger << 24 | x << 12 | y   (panel pixels, finger 0..7)
++ */
++static int touch_inject_ok = -1;
++static int
++sysctl_sweet_touch_inject SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (touch_inject_ok < 0) {
++		int on = 0;
++		(void)PE_parse_boot_argn("sweettouch_inject", &on, sizeof(on));
++		touch_inject_ok = on != 0;
++		printf("SWEET HID: touch injection %s (sweettouch_inject=%d)\n", touch_inject_ok ? "on" : "off", on);
++	}
++	if (!touch_inject_ok) {
++		return EPERM;
++	}
++	if ((v & 0x40000000) == 0) {
++		return EINVAL;
++	}
++	int down = (v >> 27) & 1, finger = (v >> 24) & 7, x = (v >> 12) & 0xfff, y = v & 0xfff;
++	if (x > 1079 || y > 2399) {
++		return EINVAL;
++	}
++	if (touch_debug) {
++		printf("SWEET HID: inject %d %s %d,%d\n", finger, down ? "down" : "move/up", x, y);
++	}
++	sweet_hid_touch(finger, down, x, y);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_inject, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_touch_inject, "I", "inject a touch (0154; boot-arg sweettouch_inject=1)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
