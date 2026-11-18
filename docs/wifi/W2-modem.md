@@ -23,3 +23,13 @@ carve-out. It found `image/wlanmdsp.mbn` (4,097,376 bytes). A full read of
 The full patch series applies and the touched XNU sources pass the local
 syntax check. Phone verification still needs a RAM boot and a W2 pass in the
 kernel log.
+
+## PAS metadata for the next rung
+
+On this firmware backup, the MDT is already the 1,172-byte ELF header and
+program-header table followed by the 8,248-byte hash segment. The MDT matches
+`modem.b00` concatenated with `modem.b01` byte for byte. The hash program header
+retains its original offset of `0x1000`, which points past the end of the
+packed MDT when the hash size is included. W2 therefore checks the matching
+`modem.b01` file. The PAS loader can use the packed MDT bytes directly for
+this firmware layout.
