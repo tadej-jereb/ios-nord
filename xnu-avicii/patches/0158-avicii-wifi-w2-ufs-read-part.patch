@@ -2,21 +2,18 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index ff68bde..1d98c07 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -483,6 +483,176 @@ ufs_find_partition(const char *want)
+@@ -483,6 +483,173 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
 +/*
-+ * Wi-Fi W2 (docs/wifi/W2-modem.md): read-only access to the other GPT partitions on LUNs 0-5
-+ * -- the modem firmware in modem_a and the modem's EFS copies. Port of topaz 0115
-+ * (sweet_ufs_read_part). Nothing here writes: there is no write path, the partition names
-+ * are a fixed allow-list, and the userdata partition state (su.first_block/nblocks/lun) is
-+ * restored before the lock is dropped. avicii: modem_a = sde4, modemst1/2 = sdf2/3,
-+ * fsg/fsc = sdf4/5 (logs/dumps/run-20261112-195027/30-by-name.txt), i.e. LUN 4 and 5 if sdX
-+ * counts from LUN 0 (UNVERIFIED; the scan does not depend on it, it reads every GPT).
++ * Wi-Fi W2 (docs/wifi/W2-modem.md): read-only access to modem firmware.
++ * Scan GPTs on LUNs 0-5, without relying on the correspondence between
++ * Linux disk names and UFS LUN numbers. Only modem_a and modem_b may be
++ * opened. Restore the userdata LUN before releasing the UFS lock.
 + */
 +static const char * const ufs_ro_parts[] = {
-+	"modem_a", "modem_b", "modemst1", "modemst2", "fsg", "fsc",
++	"modem_a", "modem_b",
 +};
 +#define UFS_RO_LUNS     6u
 +static struct { char name[16]; uint8_t lun; uint64_t first, nblocks; } ufs_ro_cache[8];

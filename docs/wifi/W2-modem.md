@@ -6,7 +6,8 @@ inserts a read-only firmware check at `sweetwifi=2`. The expected phone log is
 `SWEET WIFI: step W2 PASS`.
 
 The check locates `modem_a` through the UFS GPTs, opens its FAT volume, and checks
-the MDT and matching segment files. The modem carve-out is documented in
+the MDT and matching segment files. Partition reads are limited to the two
+modem firmware slots. The modem carve-out is documented in
 [board constants](../../avicii/CONSTANTS.md#8-wlan--ipa). The later PAS and modem
 protocol steps still need hardware bring-up.
 
