@@ -1,4 +1,4 @@
-205360c3a2997075efcf7debbdc6d1fe3060059519a935cf2a615566c4ebbec5  series
+fddfc4ac28822cc0a38eb7c5a4dd25e30e083e45601335091c7d6aaa39f79a31  series
 c057dea49d5bcccbc7d317d60f91cc8062689fd26d3d739f709e279bddb56a1c  patches/0001-new-clang-drop-removed-auto-var-init-flag.patch
 19f7571eb90608ef66f1d8cf9dee5333d4fbbccbfeee9ea244b90cb4a4240727  patches/0002-new-clang-backport-UIO_STACKBUF.patch
 ff08f768b0e7d830efd1cab98b8cb18e66c60935c4b640e74146e5c1cbb5371c  patches/0003-sweet-framebuffer-serial-console.patch

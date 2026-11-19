@@ -1,0 +1,91 @@
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -235,5 +235,55 @@
+ 	return false;
+ }
+ 
++/*
++ * W4 diagnostic: report the apps<->mpss partition as the modem left it, so a
++ * missing READY can be told apart from a partition the firmware never wrote.
++ */
++void
++sweet_smem_mpss_diag(const char *tag)
++{
++	volatile uint8_t *part = mpss_part;
++	if (!part) {
++		printf("SWEET SMEM: %s: no mpss partition mapped\n", tag);
++		return;
++	}
++	if (!smem_magic(part, 0, "$PRT")) {
++		printf("SWEET SMEM: %s: no $PRT magic on the mpss partition\n", tag);
++		return;
++	}
++	uint32_t size = smem_rd32(part, 8);
++	uint32_t free_uncached = smem_rd32(part, 12);
++	printf("SWEET SMEM: %s: $PRT hosts %u/%u size %#x free %#x\n", tag,
++	    smem_rd16(part, 4), smem_rd16(part, 6), size, free_uncached);
++	if (free_uncached > size || free_uncached < sizeof(struct smem_part_hdr)) {
++		printf("SWEET SMEM: %s: unusable free pointer\n", tag);
++		return;
++	}
++	__asm__ volatile("dmb oshld" ::: "memory");
++	for (uint32_t pos = sizeof(struct smem_part_hdr), shown = 0;
++	    pos + sizeof(struct smem_priv_entry) <= free_uncached && shown < 8; shown++) {
++		uint16_t canary = smem_rd16(part, pos);
++		uint16_t item = smem_rd16(part, pos + 2);
++		uint32_t isize = smem_rd32(part, pos + 4);
++		uint16_t pad_data = smem_rd16(part, pos + 8);
++		uint16_t pad_hdr = smem_rd16(part, pos + 10);
++		uint32_t data = pos + sizeof(struct smem_priv_entry) + pad_hdr;
++		if (canary != SMEM_CANARY || data > free_uncached || isize > free_uncached - data) {
++			printf("SWEET SMEM: %s: walk stops at +%#x canary %#x\n", tag, pos, canary);
++			return;
++		}
++		uint32_t text = isize > pad_data ? isize - pad_data : 0;
++		char name[13];
++		uint32_t n = 0;
++		for (; n < 12 && n < text; n++) {
++			name[n] = smem_namec(*(volatile uint8_t *)(part + data + n));
++		}
++		name[n] = 0;
++		printf("SWEET SMEM: %s: item %u size %u \"%s\"%s\n", tag, item, isize, name,
++		    item == SMEM_ITEM_SMP2P_IN ? " <-- smp2p in" : "");
++		pos = data + isize;
++	}
++}
++
+ void
+ sweet_smem_dump(void)
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -212,6 +212,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern bool sweet_smem_mpss_state(uint32_t *state);
++extern void sweet_smem_mpss_diag(const char *tag);
+ 
+ /*
+  * This rung supports the verified Nord firmware placement. The MDT was
+@@ -287,7 +288,12 @@
+ {
+ 	uint32_t state, last = 0;
+ 	bool seen = false;
+-	for (unsigned i = 0; i < 250; i++) {
++	/* MPSS allocates the smp2p item late in its own boot, so watch the
++	 * partition while waiting instead of only the ready word */
++	for (unsigned i = 0; i <= 3000; i++) {
++		if (!seen && (i % 500u) == 0) {
++			sweet_smem_mpss_diag(i ? "wait" : "start");
++		}
+ 		if (sweet_smem_mpss_state(&state)) {
+ 			if (!seen || state != last) {
+ 				MLOG("step W4 slave-kernel: %#x", state);
+@@ -305,5 +311,6 @@
+ 		}
+ 		sweet_modem_sleep_ms(20);
+ 	}
++	sweet_smem_mpss_diag("timeout");
+ 	MLOG("step W4 timeout: READY absent, slave-kernel %s %#x", seen ? "last" : "unavailable", last);
+ }
