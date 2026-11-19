@@ -2,11 +2,12 @@ diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 index c447592..61728ae 100644
 --- a/bsd/dev/sweet_modem.c
 +++ b/bsd/dev/sweet_modem.c
-@@ -22,6 +22,7 @@
+@@ -22,6 +22,8 @@
  #include <kern/clock.h>
  #include <mach/mach_time.h>
  #include <machine/machine_routines.h>
 +#include <arm/memory_types.h>
++#include <arm/machine_routines.h>
  #include <vm/vm_kern.h>
  #include <vm/pmap.h>
  #include <pexpert/pexpert.h>
