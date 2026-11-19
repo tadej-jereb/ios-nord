@@ -196,7 +196,21 @@ jobs:
           CCACHE_WRAP: ${{ runner.temp }}/ccache-bin
         run: |
           set -euo pipefail
-          if [ "${{ runner.environment }}" != self-hosted ]; then
+          # Self-hosted (the macOS VM): the tools live in /usr/local/bin and there
+          # is no Homebrew, so put that dir first and only brew what is absent.
+          if [ "${{ runner.environment }}" = self-hosted ]; then
+            echo /usr/local/bin >> "$GITHUB_PATH"
+            export PATH="/usr/local/bin:$PATH"
+            missing=""
+            for t in jq gum bash cmake ninja ccache; do
+              command -v "$t" >/dev/null || missing="$missing $t"
+            done
+            if [ -n "$missing" ]; then
+              command -v brew >/dev/null || { echo "self-hosted deps missing:$missing (no brew)" >&2; exit 1; }
+              brew install $missing
+            fi
+            for t in jq gum bash cmake ninja ccache; do printf '%s -> %s\n' "$t" "$(command -v "$t")"; done
+          else
             brew install jq gum bash cmake ninja ccache
           fi
           # build.sh only checks that xcodes exists (Xcode is preinstalled)
