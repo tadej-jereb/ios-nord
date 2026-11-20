@@ -1,0 +1,435 @@
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index 37ac2cc..f91df29 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -30,9 +30,11 @@
+ #include <dev/sweet_modem.h>
+ #include <arm/memory_types.h>
+ #include <vm/pmap.h>                     /* VM_MEM_* behind VM_WIMG_WCOMB, as sweet_modem.c */
++#include <sys/sysctl.h>
+ 
+ extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ 
+ #define PORT_PDM            0x4001u
+ #define PORT_TFTP           0x4002u
+@@ -194,7 +196,7 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ #define RW_FILES  12u
+ 
+ struct tftp_sess {
+-	bool used, write, fat;
++	bool used, write, fat, rd;              /* rd: a /ramdumps/*.elf write kept in rd_buf (0172) */
+ 	uint32_t port, node, rport;
+ 	struct mfw_file f;                      /* modem_a file when fat */
+ 	int rw;                                 /* /readwrite file in RAM, -1 = none */
+@@ -250,6 +252,104 @@ rw_write(int r, uint64_t off, const uint8_t *src, uint32_t n)
+ 	return true;
+ }
+ 
++/*
++ * The modem's crash dumps (0172). On 0171 the WLAN PD crashed after every handshake and wrote
++ * /ramdumps/wlan_minidump.<date>.00.elf (~8 MB) over tftp; we dropped it. The first dump of the boot is kept in
++ * one fixed 16 MB buffer (allocated on the first write, never moved, so the sysctl can read it at any time),
++ * its crash strings go to the log, and `sysctl -b kern.sweetwlandump` returns the whole file.
++ */
++#define RD_MAX          (16u << 20)
++static uint8_t *rd_buf;
++static uint32_t rd_size, rd_scanned, rd_dropped;
++static char rd_name[96];
++
++static bool
++rd_open(const char *path)
++{
++	if (rd_name[0] != 0 && strcmp(rd_name, path) != 0) {
++		rd_dropped++;
++		return false;                           /* only the first dump of the boot */
++	}
++	if (rd_buf == NULL) {
++		rd_buf = kalloc_data(RD_MAX, Z_WAITOK | Z_ZERO);
++		if (rd_buf == NULL) {
++			MLOG("step W6 ramdump: no memory for %u MB", RD_MAX >> 20);
++			return false;
++		}
++		strlcpy(rd_name, path, sizeof(rd_name));
++	}
++	return true;
++}
++
++static void
++rd_write(uint64_t off, const uint8_t *src, uint32_t n)
++{
++	if (off >= RD_MAX || n > RD_MAX - off) {
++		return;
++	}
++	memcpy(rd_buf + off, src, n);
++	if (off + n > rd_size) {
++		rd_size = (uint32_t)(off + n);
++	}
++}
++
++static bool
++rd_interesting(const char *t, uint32_t n)
++{
++	static const char *const keys[] = {
++		"rror", "RROR", "xcept", "atal", "ATAL", "ssert", "rash", "anic", "bort", "dog", ".c:", ".c ", "fail", "FAIL",
++	};
++	for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
++		size_t kl = strlen(keys[k]);
++		for (uint32_t i = 0; i + kl <= n; i++) {
++			if (memcmp(t + i, keys[k], kl) == 0) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++/* print the printable runs (>= 12 chars) of the dump that look like an error: what killed the PD */
++static void
++rd_scan(const char *why)
++{
++	uint32_t printed = 0, run = 0;
++	char line[161];
++
++	if (rd_buf == NULL || rd_size == 0 || rd_size == rd_scanned) {
++		return;
++	}
++	MLOG("step W6 ramdump %s: %u B (%s), scan %s", rd_name, rd_size, rd_dropped ? "later dumps dropped" : "first",
++	    why);
++	for (uint32_t i = 0; i <= rd_size && printed < 40; i++) {
++		uint8_t c = i < rd_size ? rd_buf[i] : 0;
++		if (c >= 0x20 && c < 0x7f) {
++			run++;
++			continue;
++		}
++		if (run >= 12 && rd_interesting((const char *)rd_buf + i - run, run)) {
++			uint32_t n = MIN(run, (uint32_t)sizeof(line) - 1);
++			memcpy(line, rd_buf + i - run, n);
++			line[n] = 0;
++			MLOG("step W6 ramdump @%#x: %s", i - run, line);
++			printed++;
++		}
++		run = 0;
++	}
++	MLOG("step W6 ramdump: %u line(s); whole file: sysctl -b kern.sweetwlandump", printed);
++	rd_scanned = rd_size;
++}
++
++static int
++sysctl_sweetwlandump SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return rd_buf == NULL ? 0 : SYSCTL_OUT(req, rd_buf, rd_size);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetwlandump, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweetwlandump, "S", "the modem's first /ramdumps/*.elf of this boot (0172)");
++
+ static void
+ tftp_send(struct tftp_sess *s, const void *p, uint32_t len)
+ {
+@@ -428,9 +528,20 @@ tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 	if (strncmp(file, "/readwrite/", 11) == 0) {
+ 		s->rw = rw_find(file, s->write);
+ 	}
++	if (s->write && strncmp(file, "/ramdumps/", 10) == 0) {
++		size_t fl = strlen(file);
++		if (fl > 4 && strcmp(file + fl - 4, ".elf") == 0) {
++			s->rd = rd_open(file);
++		} else if (rd_size != 0) {
++			rd_scan("at the dump's .count write");     /* the modem writes .count after the dump */
++		}
++	}
+ 	if (s->write) {
+ 		tftp_writes++;
+-		MLOG("step W6 t=%u ms: tftp WRQ %s seek %u%s", s_ms, file, s->seek, s->rw < 0 ? " (no RAM slot, dropped)" : " (RAM only)");
++		if (!s->rd || s->seek == 0) {
++			MLOG("step W6 t=%u ms: tftp WRQ %s seek %u%s", s_ms, file, s->seek,
++			    s->rd ? " (ramdump, kept in RAM)" : s->rw < 0 ? " (no RAM slot, dropped)" : " (RAM only)");
++		}
+ 		if (s->rw >= 0 && s->seek == 0) {
+ 			rw_files[s->rw].size = 0;       /* a write from the start replaces the file */
+ 		}
+@@ -513,6 +624,8 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
+ 			uint32_t payload = len - 4;
+ 			if (s->rw >= 0 && blk >= 1) {
+ 				(void)rw_write(s->rw, s->seek + (uint64_t)(blk - 1) * s->blk, d + 4, payload);
++			} else if (s->rd && blk >= 1) {
++				rd_write(s->seek + (uint64_t)(blk - 1) * s->blk, d + 4, payload);
+ 			}
+ 			if ((blk % s->wsize) == 0 || payload < s->blk) {
+ 				uint8_t ack[4] = { 0, OP_ACK, (uint8_t)(blk >> 8), (uint8_t)blk };
+@@ -742,8 +855,25 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+  *  - board files read from modem_a image/ (backup listing: bdwlan.bNN / bdwlan.NNN / bdwlan.bin, 26328 B each);
+  *  - HOST_CAP is sent (no snoc-host-cap-skip-quirk on avicii); its encoding (u32 daemon_support) is topaz's,
+  *    UNVERIFIED against qmi_wlfw_v01.c, and a rejection is not fatal.
+- * NOT done here: the WCN3990's five PMIC rails (lito.dtsi:3778-3782). Without them the handshake can reach CAP
+- * and the board data, but FW_READY may never come; the log then says which step it stopped at.
++ *
++ * 0172, after 0171 on the phone (logs/phone/20261120-wifi-0171): every step answered ok, but the MSA hyp-assign
++ * was refused (-2/0x56) and the WLAN PD crashed ~10 ms after cal_report, 9 times, then the SoC reset. The stock
++ * driver (refs/lito-dts/vendor-icnss.c + vendor-icnss_qmi.c, LineageOS sm7250 @ fb4b437) does it differently, and
++ * that is now the default (sweetwlfw=0; sweetwlfw=1 = the 0171 ath10k flow above):
++ *  - IND_REGISTER with fw_ready 0x10, msa_ready 0x13, pin_connect_result 0x14, client_id 0x15, rejuvenate 0x19
++ *    (u32; quirk FW_REJUVENATE_ENABLE is on by default, icnss.c:63,70; icnss_qmi.c:264-276);
++ *  - MSA_INFO, then NO hyp-assign: icnss_assign_msa_perm() returns early unless the DT has qcom,hyp_enabled
++ *    (icnss.c:185, :3675-3676), and avicii's icnss node does not (lito.dtsi:3756-3793);
++ *  - MSA_READY, CAP; no HOST_CAP, no BDF_DOWNLOAD, no CAL_REPORT (icnss.c:1086-1132 sends none of them);
++ *  - then icnss_hw_power_on() (icnss.c:1128): the five rails in icnss_vreg_info order (:117-123) with the DT
++ *    config overriding the table (:2663-2730): vdd-cx-mx L1A config <0 0> = no voltage set, so the regulator's
++ *    qcom,init-voltage 352 mV (lito-regulators.dtsi:107); vdd-1.8-xo L14A 1800 mV, vdd-1.3-rfa L2C 1304 mV
++ *    (table); vdd-3.3-ch1 L11C and vdd-3.3-ch0 L10C <3000000 3312000> = 3000 mV (lito.dtsi:3783-3785). No load,
++ *    so the vendor leaves them in LPM; our RPMh helper votes HPM (more current, not less). cxo_ref_clk_pin is not
++ *    in avicii's DT and the clock is optional (icnss.c:127-129), so no clock;
++ *  - DYNAMIC_FEATURE_MASK 0x3B, TLV 0x10 u64 = 0x01 (icnss.c:61,72; icnss_qmi.c:938-985);
++ *  - a REJUVENATE indication (0x39) is answered with REJUVENATE_ACK (0x3A, no TLVs; icnss_qmi.c:869-903).
++ * After sweetwlfwrestarts (default 3) WLAN PD restarts we stop answering WLFW, so a crash loop cannot run on.
+  */
+ #define PORT_WLFWC          0x4004u             /* our QMI client port towards WLFW */
+ #define QMI_IND             4
+@@ -756,6 +886,10 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
++#define WLFW_PIN_CONNECT_IND 0x2C
++#define WLFW_REJUVENATE_IND 0x39
++#define WLFW_REJUVENATE_ACK 0x3A
++#define WLFW_FEATURE_MASK   0x3B
+ #define WLFW_MSA_BASE       0x8ba00000ull       /* lito.dtsi:414-419 pil_wlan_fw_region */
+ #define WLFW_MSA_SIZE       0x00200000ull
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID (topaz 0122:108) */
+@@ -771,6 +905,43 @@ static unsigned w_arrivals, w_cap_tries;
+ static uint64_t w_cap_retry_ms;
+ static struct mfw_file w_bdf;
+ static const char *w_step = "WLFW not seen";
++static uint32_t w_flow, w_rails = 1, w_max_restarts = 3;   /* sweetwlfw, sweetwlfwrails, sweetwlfwrestarts */
++static bool w_rails_done, w_gave_up;
++
++/* icnss_hw_power_on() for avicii: see the 0172 notes above for every value */
++static void
++w_rails_on(void)
++{
++	static const struct { const char *res, *name; unsigned mv; } r[] = {
++		{ "ldoa1",  "vdd-cx-mx (L1A)",    352 },
++		{ "ldoa14", "vdd-1.8-xo (L14A)",  1800 },
++		{ "ldoc2",  "vdd-1.3-rfa (L2C)",  1304 },
++		{ "ldoc11", "vdd-3.3-ch1 (L11C)", 3000 },
++		{ "ldoc10", "vdd-3.3-ch0 (L10C)", 3000 },
++	};
++	if (w_rails_done || !w_rails) {
++		if (!w_rails) {
++			MLOG("step W7: sweetwlfwrails=0: WCN3990 rails not voted");
++		}
++		return;
++	}
++	w_rails_done = true;
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		int error = EBUSY;
++		for (unsigned t = 0; t < 20 && error == EBUSY; t++) {
++			error = sweet_rpmh_vreg_enable(r[i].res, r[i].mv);
++			if (error == EBUSY) {
++				sweet_modem_sleep_ms(1);
++			}
++		}
++		MLOG("step W7 t=%u ms: rail %s %s %u mV: %s (%d)", s_ms, r[i].name, r[i].res, r[i].mv,
++		    error ? "FAILED" : "on", error);
++		if (error) {
++			MLOG("step W7: stopping the rail sequence at %s", r[i].res);
++			return;
++		}
++	}
++}
+ 
+ struct wmsg { uint8_t *b; uint32_t n; };
+ 
+@@ -965,15 +1136,17 @@ w_on_cap(const uint8_t *d, uint32_t len)
+ 
+ /* MSA_INFO response TLV 0x03: u8 count, then {u64 addr, u32 size, u8 secure} each (topaz 0122:316-339) */
+ static void
+-w_on_msa_info(const uint8_t *d, uint32_t len)
++w_on_msa_info(const uint8_t *d, uint32_t len, bool assign)
+ {
+ 	static const uint32_t vm[3] = { VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE };
+ 	uint16_t l = 0;
+ 	const uint8_t *v = qm_find(d, len, 0x03, &l);
+ 	uint32_t n = (v != NULL && l >= 1) ? v[0] : 0;
+ 
+-	MLOG("step W7: %u MSA region(s)", n);
+-	sweet_modem_sleep_ms(20);                   /* ath10k: give the modem time before the XPU update */
++	MLOG("step W7: %u MSA region(s)%s", n, assign ? "" : "; not assigned (no qcom,hyp_enabled, icnss.c:185)");
++	if (assign) {
++		sweet_modem_sleep_ms(20);               /* ath10k: give the modem time before the XPU update */
++	}
+ 	for (uint32_t i = 0; i < n && 1 + 13 * (i + 1) <= l; i++) {
+ 		const uint8_t *e = v + 1 + 13 * i;
+ 		uint64_t addr;
+@@ -986,7 +1159,9 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+ 			MLOG("step W7:  out of the MSA window %#llx+%#llx, skipped", WLFW_MSA_BASE, WLFW_MSA_SIZE);
+ 			continue;
+ 		}
+-		(void)scm_assign(addr, size, vm, e[12] ? 2 : 3, "MSA");
++		if (assign) {
++			(void)scm_assign(addr, size, vm, e[12] ? 2 : 3, "MSA");
++		}
+ 	}
+ }
+ 
+@@ -999,6 +1174,16 @@ wlfw_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port)
+ 		return;
+ 	}
+ 	s_ms = (uint32_t)sweet_modem_ms();
++	if (w_gave_up) {
++		return;
++	}
++	if (w_arrivals != 0 && w_arrivals > w_max_restarts) {
++		w_gave_up = true;
++		MLOG("step W7 t=%u ms: WLFW back on port %#x (restart %u, last step: %s): giving up, WLFW not answered "
++		    "(sweetwlfwrestarts=%u)", s_ms, port, w_arrivals, w_step, w_max_restarts);
++		w_step = "gave up after WLAN PD restarts";
++		return;
++	}
+ 	if (w_arrivals++ != 0) {
+ 		/* the WLAN PD restarted (new server port): start again (topaz 0124:24-35) */
+ 		MLOG("step W7 t=%u ms: WLFW back on port %#x (restart %u, last step: %s): handshake again", s_ms, port,
+@@ -1010,11 +1195,18 @@ wlfw_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port)
+ 	}
+ 	w_node = node;
+ 	w_port = port;
+-	MLOG("step W7 t=%u ms: WLFW inst %#x node %u port %#x: ind_register", s_ms, inst, node, port);
++	MLOG("step W7 t=%u ms: WLFW inst %#x node %u port %#x: ind_register (%s flow)", s_ms, inst, node, port,
++	    w_flow ? "ath10k/topaz" : "vendor icnss");
+ 	if (wm_new(&m, WLFW_IND_REGISTER)) {
+ 		wm_u8(&m, 0x10, 1);                     /* fw_ready_enable */
+ 		wm_u8(&m, 0x13, 1);                     /* msa_ready_enable */
++		if (w_flow == 0) {
++			wm_u8(&m, 0x14, 1);                 /* pin_connect_result_enable */
++		}
+ 		wm_u32(&m, 0x15, WLFW_CLIENT_ID);       /* client_id */
++		if (w_flow == 0) {
++			wm_u32(&m, 0x19, 1);                /* rejuvenate_enable */
++		}
+ 		wm_send(&m, "ind_register sent");
+ 	}
+ }
+@@ -1039,6 +1231,17 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			w_fw_ready = true;
+ 			w_step = "FW_READY";
+ 			MLOG("step W7 t=%u ms: *** WLAN FIRMWARE READY ***", s_ms);
++		} else if (msg == WLFW_PIN_CONNECT_IND) {
++			char hx[3 * 32 + 1];
++			uint32_t n = MIN(len - 7, 32u);
++			for (uint32_t i = 0; i < n; i++) {
++				snprintf(hx + 3 * i, 4, "%02x ", d[7 + i]);
++			}
++			hx[3 * n] = 0;
++			MLOG("step W7 t=%u ms: pin connect result: %s", s_ms, hx);
++		} else if (msg == WLFW_REJUVENATE_IND) {
++			MLOG("step W7 t=%u ms: rejuvenate indication: ack", s_ms);
++			w_simple(WLFW_REJUVENATE_ACK, "rejuvenate ack sent");
+ 		} else {
+ 			MLOG("step W7 t=%u ms: indication %#x", s_ms, msg);
+ 		}
+@@ -1056,7 +1259,14 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			memcpy(&st, v, 8);
+ 		}
+ 		MLOG("step W7 t=%u ms: ind_register %s err %u, fw_status %#llx", s_ms, ok ? "ok" : "FAILED", err, st);
+-		if (wm_new(&m, WLFW_HOST_CAP)) {
++		if (w_flow == 0) {
++			if (wm_new(&m, WLFW_MSA_INFO)) {        /* icnss.c:1102: straight to MSA_INFO */
++				uint64_t a = WLFW_MSA_BASE;
++				wm_tlv(&m, 0x01, &a, 8);
++				wm_u32(&m, 0x02, (uint32_t)WLFW_MSA_SIZE);
++				wm_send(&m, "msa_info sent");
++			}
++		} else if (wm_new(&m, WLFW_HOST_CAP)) {
+ 			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
+ 			wm_send(&m, "host_cap sent");
+ 		}
+@@ -1074,7 +1284,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 	case WLFW_MSA_INFO:
+ 		MLOG("step W7 t=%u ms: msa_info %s err %u", s_ms, ok ? "ok" : "FAILED", err);
+ 		if (ok) {
+-			w_on_msa_info(d, len);
++			w_on_msa_info(d, len, w_flow != 0);
+ 			w_simple(WLFW_MSA_READY, "msa_ready sent");
+ 		} else {
+ 			w_step = "msa_info FAILED";
+@@ -1102,9 +1312,28 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			}
+ 		}
+ 		w_cap_done = true;
++		if (w_flow == 0) {
++			w_rails_on();                       /* icnss.c:1128 icnss_hw_power_on() after CAP */
++			if (wm_new(&m, WLFW_FEATURE_MASK)) {
++				uint64_t mask = 0x01;           /* ICNSS_DEFAULT_FEATURE_MASK, icnss.c:61 */
++				wm_tlv(&m, 0x10, &mask, 8);
++				wm_send(&m, "feature mask sent");
++			}
++			break;
++		}
+ 		w_step = "waiting MSA_READY ind";
+ 		w_start_bdf();
+ 		break;
++	case WLFW_FEATURE_MASK:
++		MLOG("step W7 t=%u ms: dynamic feature mask %s err %u, waiting for FW_READY", s_ms, ok ? "ok" : "FAILED",
++		    err);
++		if (!w_fw_ready) {
++			w_step = "waiting FW_READY";
++		}
++		break;
++	case WLFW_REJUVENATE_ACK:
++		MLOG("step W7 t=%u ms: rejuvenate ack %s err %u", s_ms, ok ? "ok" : "FAILED", err);
++		break;
+ 	case WLFW_BDF_DOWNLOAD:
+ 		if (!ok) {
+ 			MLOG("step W7 t=%u ms: bdf segment %u FAILED err %u", s_ms, w_bdf_seg - 1, err);
+@@ -1252,6 +1481,11 @@ msvc_init(void)
+ 	qrtr_data_hook = svc_rx;
+ 	qrtr_hello_hook = svc_announce;
+ 	if (sweet_modem_level >= 7) {
++		PE_parse_boot_argn("sweetwlfw", &w_flow, sizeof(w_flow));
++		PE_parse_boot_argn("sweetwlfwrails", &w_rails, sizeof(w_rails));
++		PE_parse_boot_argn("sweetwlfwrestarts", &w_max_restarts, sizeof(w_max_restarts));
++		MLOG("step W7: WLFW client, %s flow, rails %s, at most %u WLAN PD restarts", w_flow ? "ath10k/topaz" :
++		    "vendor icnss", w_rails ? "on after CAP" : "off", w_max_restarts);
+ 		qrtr_server_hook = wlfw_server;
+ 	}
+ }
+@@ -1263,6 +1497,7 @@ msvc_summary(void)
+ 	    "%s); rmtfs reads %u, writes %u (dropped, never written to the phone), errors %u, buffer %#llx",
+ 	    pd_reqs, tftp_reqs, tftp_missing, tftp_not_ram, tftp_writes, tftp_ram ? "from RAM" : "from UFS",
+ 	    rmtfs_reads, rmtfs_writes, rmtfs_err, rmtfs_pa);
++	rd_scan("at the summary");
+ 	if (sweet_modem_level >= 7) {
+ 		MLOG("step W7 WLFW: %s; board data %s (%u segments, board %#x), MSA_READY ind %s, FW_READY %s", w_step,
+ 		    w_bdf_ok ? "sent" : "not sent", w_bdf_seg, w_board, w_msa_ind ? "seen" : "not seen",
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 535a24e..f9d65a3 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -418,6 +418,25 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 			printf("SWEET RPMH: %s expects %u..%u mV\n", res, lo, hi);
+ 			return EINVAL;
+ 		}
++	} else if (!strcmp(res, "ldoa1") || !strcmp(res, "ldoa14") || !strcmp(res, "ldoc2") ||
++	    !strcmp(res, "ldoc10")) {
++		/*
++		 * avicii WCN3990 rails (icnss lito.dtsi:3778-3782), ranges from lito-regulators.dtsi: L1A pm8150_l1
++		 * 352..952 mV (:101-107), L14A pm8150_l14 1616..1984 mV (:377-), L2C pm8150a_l2 1144..1328 mV (:594-),
++		 * L10C pm8150a_l10 3000..3312 mV (:738-). (L11C = "ldoc11", above.)
++		 */
++		unsigned lo = 3000, hi = 3312;
++		if (!strcmp(res, "ldoa1")) {
++			lo = 352; hi = 952;
++		} else if (!strcmp(res, "ldoa14")) {
++			lo = 1616; hi = 1984;
++		} else if (!strcmp(res, "ldoc2")) {
++			lo = 1144; hi = 1328;
++		}
++		if (mv < lo || mv > hi) {
++			printf("SWEET RPMH: %s expects %u..%u mV\n", res, lo, hi);
++			return EINVAL;
++		}
+ 	} else if (!strcmp(res, "smpa4")) {
+ 		/* Fixed 1.8 V rail; the DT has no usable range below/above it. */
+ 		if (mv != 1800) {
