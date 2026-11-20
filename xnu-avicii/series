@@ -159,3 +159,4 @@ apply 0163-avicii-wifi-use-vendor-pas-init.patch
 apply 0164-avicii-wifi-load-stock-modem.patch
 apply 0165-avicii-wifi-modem-ready-watch.patch
 apply 0166-avicii-wifi-smp2p-out-before-start.patch
+apply 0167-avicii-wifi-w5-glink-qrtr.patch

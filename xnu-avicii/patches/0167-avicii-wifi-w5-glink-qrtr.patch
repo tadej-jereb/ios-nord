@@ -1,0 +1,948 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0424420..3e222e5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_smem.c			standard
+ bsd/dev/sweet_wifi.c			standard
+ bsd/dev/sweet_modem.c			standard
+ bsd/dev/sweet_modem_fw.c		standard
++bsd/dev/sweet_glink.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+new file mode 100644
+index 0000000..db52665
+--- /dev/null
++++ b/bsd/dev/sweet_glink.c
+@@ -0,0 +1,672 @@
++/*
++ * SWEET avicii: GLINK over SMEM + QRTR to the modem, ladder rung W5 (sweetwifi>=5), after W4's READY.
++ *
++ * Port of topaz 0118 (refs/topaz-patches/0118-topaz-modem-glink-qrtr.patch, TopazModem.cpp GLINK/QRTR),
++ * checked against the vendor kernel of this phone (avicii/qcom_glink_smem.c, qcom_glink_native.c,
++ * LineageOS sm7250 fb4b4374):
++ *   SMEM items 478 descriptor (32 B), 479 our TX FIFO (16 KiB), 480 the modem's TX FIFO:
++ *       qcom_glink_smem.c:33-35,254-255,280-281; descriptor words tx tail, tx head, rx tail, rx head: :275-278;
++ *       on start rx tail = 0 and tx head = 0: :306-307. The modem makes 478 and 480 itself (W4 log 2026-11-20).
++ *   commands VERSION .. SIGNALS: qcom_glink_native.c:248-262; message = le16 cmd, le16 p1, le32 p2: :66-69;
++ *   VERSION 1 with INTENT_REUSE: :61, qcom_glink_smem.c:310; TX head rounded up to 8: qcom_glink_smem.c:197-200.
++ *   Doorbell: glink_modem mboxes <IPCC_CLIENT_MPSS IPCC_MPROC_SIGNAL_GLINK_QMP> = client 2 signal 0
++ *       (lito.dtsi:2633-2634, qcom,ipcc.h:10,21), via mipc_kick_glink() in sweet_smem.c.
++ *   Channel "IPCRTR" carries QRTR (lito.dtsi:2643-2648, intents <0x800 5 0x2000 3 0x4400 2>).
++ * Differences from topaz: IPCC instead of the APCS IPC bit; SMEM is a Device mapping here, so every FIFO
++ * access is a byte copy (no memcpy: unaligned or DC ZVA accesses fault on Device memory).
++ * Polled from the modem thread (no interrupts). Nothing here writes outside items 478/479.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include <dev/sweet_modem.h>
++
++extern void *mipc_smem_get(uint16_t item, uint32_t *size);
++extern void *mipc_smem_alloc(uint16_t item, uint32_t size);
++extern void mipc_kick_glink(void);
++
++#define SMEM_GLINK_DESC     478u
++#define SMEM_GLINK_FIFO_TX  479u
++#define SMEM_GLINK_FIFO_RX  480u
++#define GLINK_TX_SIZE       0x4000u
++#define GLINK_FEATURES      1u                  /* INTENT_REUSE */
++
++#define CMD_VERSION         0
++#define CMD_VERSION_ACK     1
++#define CMD_OPEN            2
++#define CMD_CLOSE           3
++#define CMD_OPEN_ACK        4
++#define CMD_INTENT          5
++#define CMD_RX_DONE         6
++#define CMD_RX_INTENT_REQ   7
++#define CMD_RX_INTENT_REQ_ACK 8
++#define CMD_TX_DATA         9
++#define CMD_CLOSE_ACK       11
++#define CMD_TX_DATA_CONT    12
++#define CMD_READ_NOTIF      13
++#define CMD_RX_DONE_W_REUSE 14
++#define CMD_SIGNALS         15
++
++#define CHAN_NAME           "IPCRTR"
++#define CHAN_LCID           1u
++#define OUR_INTENTS         8u
++#define OUR_INTENT_SIZE     0x4400u
++
++#define QRTR_NODE_BCAST     0xFFFFFFFFu
++#define QRTR_TYPE_BYE       3u
++#define QRTR_TYPE_DEL_SERVER 5u
++#define QMI_SVC_WLFW        0x45u
++
++struct glink_msg { uint16_t cmd, p1; uint32_t p2; } __attribute__((packed));
++struct glink_data_hdr { struct glink_msg m; uint32_t chunk, left; } __attribute__((packed));
++struct qrtr_hdr_v1 { uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port; } __attribute__((packed));
++struct qrtr_hdr_v2 { uint8_t version, type, flags, optlen; uint32_t size; uint16_t src_node, src_port, dst_node, dst_port; } __attribute__((packed));
++
++uint32_t qrtr_modem_node = QRTR_NODE_BCAST;
++bool (*qrtr_data_hook)(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
++void (*qrtr_hello_hook)(void);
++
++static volatile uint32_t *g_desc;               /* [0] tx tail [1] tx head [2] rx tail [3] rx head */
++static volatile uint8_t *g_tx, *g_rx;
++static uint32_t g_rx_len, g_features = GLINK_FEATURES, g_rcid, g_next_intent = 1;
++static bool g_remote_open, g_open_sent, g_open_acked, g_intents_sent, g_intent_req_sent, g_stopped;
++static struct { uint32_t id, size; bool used; } g_ri[128];
++static unsigned g_ri_count;
++static uint8_t *g_asm;                          /* OUR_INTENT_SIZE reassembly buffer */
++static uint32_t g_asm_len;
++static uint32_t q_ver = 1;
++static bool q_hello_sent, q_hello_rx;
++static struct { uint32_t svc, inst, node, port; } q_srv[64];
++static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
++static uint32_t g_ms;
++
++/* ---------------------------------------------------------------- FIFOs (byte copies, Device memory) */
++
++static void
++dev_copy_in(void *dst, volatile const uint8_t *src, uint32_t n)
++{
++	uint8_t *d = dst;
++	for (uint32_t i = 0; i < n; i++) {
++		d[i] = src[i];
++	}
++}
++
++static void
++dev_copy_out(volatile uint8_t *dst, const void *src, uint32_t n)
++{
++	const uint8_t *s = src;
++	for (uint32_t i = 0; i < n; i++) {
++		dst[i] = s[i];
++	}
++}
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t h = g_desc[3], t = g_desc[2];
++	if (h >= g_rx_len || t >= g_rx_len) {
++		return 0;
++	}
++	return h >= t ? h - t : g_rx_len - t + h;
++}
++
++static void
++rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = g_desc[2] + off;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	uint32_t n1 = MIN(n, g_rx_len - t);
++	dev_copy_in(dst, g_rx + t, n1);
++	if (n > n1) {
++		dev_copy_in((uint8_t *)dst + n1, g_rx, n - n1);
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	uint32_t t = g_desc[2] + n;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	__asm__ volatile("dmb sy" ::: "memory");
++	g_desc[2] = t;
++}
++
++static uint32_t
++tx_put(uint32_t head, const void *src, uint32_t n)
++{
++	uint32_t n1 = MIN(n, GLINK_TX_SIZE - head);
++	dev_copy_out(g_tx + head, src, n1);
++	if (n > n1) {
++		dev_copy_out(g_tx, (const uint8_t *)src + n1, n - n1);
++	}
++	head += n;
++	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
++}
++
++static bool
++tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t head = 0, tail = 0, avail = 0;
++	unsigned n;
++
++	for (n = 0; n < 100; n++) {
++		head = g_desc[1];
++		tail = g_desc[0];
++		if (head >= GLINK_TX_SIZE || tail >= GLINK_TX_SIZE) {
++			MLOG("step W5 glink: TX descriptor out of range (head %#x tail %#x)", head, tail);
++			return false;
++		}
++		avail = tail <= head ? GLINK_TX_SIZE - head + tail : tail - head;
++		avail = avail < 8 ? 0 : avail - 8;
++		if (avail >= ((hlen + dlen + 7) & ~7u)) {
++			break;
++		}
++		sweet_modem_sleep_ms(1);
++	}
++	if (n == 100) {
++		MLOG("step W5 glink: TX FIFO full (head %#x tail %#x)", head, tail);
++		return false;
++	}
++	head = tx_put(head, hdr, hlen);
++	if (dlen != 0) {
++		head = tx_put(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= GLINK_TX_SIZE) {
++		head -= GLINK_TX_SIZE;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	g_desc[1] = head;
++	mipc_kick_glink();
++	g_tx_msgs++;
++	return true;
++}
++
++static void
++send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++	tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static void
++send_open(void)
++{
++	struct { struct glink_msg m; char name[8]; } __attribute__((packed)) req;
++	bzero(&req, sizeof(req));
++	req.m.cmd = CMD_OPEN;
++	req.m.p1 = CHAN_LCID;
++	req.m.p2 = sizeof(CHAN_NAME);
++	memcpy(req.name, CHAN_NAME, sizeof(CHAN_NAME));
++	tx_write(&req, sizeof(req), NULL, 0);
++	g_open_sent = true;
++}
++
++static void
++advertise_intents(uint32_t count, uint32_t size)
++{
++	struct { struct glink_msg m; uint32_t pair[2 * OUR_INTENTS]; } __attribute__((packed)) m;
++	bzero(&m, sizeof(m));
++	count = MIN(count, OUR_INTENTS);
++	m.m.cmd = CMD_INTENT;
++	m.m.p1 = CHAN_LCID;
++	m.m.p2 = count;
++	for (uint32_t i = 0; i < count; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = g_next_intent++;
++	}
++	tx_write(&m, (uint32_t)sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
++static bool
++chan_up(void)
++{
++	return g_remote_open && g_open_acked;
++}
++
++static bool
++glink_try_send(const void *data, uint32_t len)
++{
++	unsigned i;
++	for (i = 0; i < g_ri_count; i++) {
++		if (!g_ri[i].used && g_ri[i].size >= len) {
++			break;
++		}
++	}
++	if (i == g_ri_count) {
++		if (!g_intent_req_sent) {
++			send_cmd(CMD_RX_INTENT_REQ, CHAN_LCID, len);
++			g_intent_req_sent = true;
++		}
++		return false;
++	}
++	struct glink_data_hdr h = { { CMD_TX_DATA, CHAN_LCID, g_ri[i].id }, len, 0 };
++	g_ri[i].used = true;
++	return tx_write(&h, sizeof(h), data, len);
++}
++
++/* packets wait here until the modem has a free RX intent for them */
++#define TXQ_LEN 64u
++static struct { void *p; uint32_t len; } g_txq[TXQ_LEN];
++static unsigned g_txq_head, g_txq_tail, g_txq_drops;
++
++static void
++txq_pump(void)
++{
++	while (g_txq_head != g_txq_tail && chan_up() &&
++	    glink_try_send(g_txq[g_txq_head % TXQ_LEN].p, g_txq[g_txq_head % TXQ_LEN].len)) {
++		kfree_data(g_txq[g_txq_head % TXQ_LEN].p, g_txq[g_txq_head % TXQ_LEN].len);
++		g_txq_head++;
++	}
++}
++
++static bool
++glink_send(const void *data, uint32_t len)
++{
++	void *p;
++	if (g_txq_tail - g_txq_head >= TXQ_LEN || (p = kalloc_data(len, Z_WAITOK)) == NULL) {
++		g_txq_drops++;
++		return false;
++	}
++	memcpy(p, data, len);
++	g_txq[g_txq_tail % TXQ_LEN].p = p;
++	g_txq[g_txq_tail % TXQ_LEN].len = len;
++	g_txq_tail++;
++	txq_pump();
++	return true;
++}
++
++/* ---------------------------------------------------------------- QRTR */
++
++bool
++qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
++{
++	uint8_t buf[sizeof(struct qrtr_hdr_v1) + 512];
++	uint32_t n;
++
++	if (len > 512) {
++		return false;
++	}
++	bzero(buf, sizeof(buf));
++	if (q_ver == 2) {
++		struct qrtr_hdr_v2 *h = (struct qrtr_hdr_v2 *)buf;
++		h->version = 2;
++		h->type = (uint8_t)type;
++		h->flags = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = (uint16_t)src_port;
++		h->dst_node = (uint16_t)dst_node;
++		h->dst_port = (uint16_t)dst_port;
++		n = sizeof(*h);
++	} else {
++		struct qrtr_hdr_v1 *h = (struct qrtr_hdr_v1 *)buf;
++		h->version = 1;
++		h->type = type;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = src_port;
++		h->confirm_rx = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->dst_node = dst_node;
++		h->dst_port = dst_port;
++		n = sizeof(*h);
++	}
++	memcpy(buf + n, payload, len);
++	return glink_send(buf, (n + len + 3) & ~3u);
++}
++
++static const char *
++svc_name(uint32_t svc)
++{
++	switch (svc) {
++	case 0x45: return "WLFW";
++	case 0x0E: return "rmtfs";
++	case 0x40: return "servreg-loc";
++	case 0x42: return "servreg-notif";
++	case 0x2B: return "ssctl";
++	case 0x31: return "ipa";
++	case 0x01: return "wds";
++	case 0x02: return "dms";
++	case 0x03: return "nas";
++	case 0x0B: return "uim";
++	case 0x1A: return "wda";
++	default:   return "";
++	}
++}
++
++static void
++qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t type, src_node, src_port, dst_port, size, hlen, confirm;
++	struct qrtr_ctrl c;
++
++	if (len >= sizeof(struct qrtr_hdr_v1) && p[0] == 1 && p[1] == 0 && p[2] == 0 && p[3] == 0) {
++		struct qrtr_hdr_v1 h;
++		memcpy(&h, p, sizeof(h));
++		type = h.type; src_node = h.src_node; src_port = h.src_port;
++		dst_port = h.dst_port; size = h.size; hlen = sizeof(h); confirm = h.confirm_rx;
++		q_ver = 1;
++	} else if (len >= sizeof(struct qrtr_hdr_v2) && p[0] == 2) {
++		struct qrtr_hdr_v2 h;
++		memcpy(&h, p, sizeof(h));
++		type = h.type; src_node = h.src_node; src_port = h.src_port;
++		dst_port = h.dst_port; size = h.size; hlen = sizeof(h) + h.optlen * 4u;
++		src_port = src_port == 0xFFFE ? QRTR_PORT_CTRL : src_port;
++		dst_port = dst_port == 0xFFFE ? QRTR_PORT_CTRL : dst_port;
++		confirm = h.flags & 1;
++		q_ver = 2;
++	} else {
++		MLOG("step W5 t=%u ms: qrtr: bad packet, %u bytes, first %02x", g_ms, len, len ? p[0] : 0);
++		return;
++	}
++	bzero(&c, sizeof(c));
++	if (hlen <= len) {
++		memcpy(&c, p + hlen, MIN(sizeof(c), len - hlen));
++	}
++
++	switch (type) {
++	case QRTR_TYPE_HELLO:
++		qrtr_modem_node = src_node;
++		q_hello_rx = true;
++		q_hello_sent = false;                   /* (re)answer with our HELLO */
++		MLOG("step W5 t=%u ms: qrtr v%u HELLO from node %u", g_ms, q_ver, src_node);
++		if (qrtr_hello_hook) {
++			qrtr_hello_hook();
++		}
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		if (q_srv_count < sizeof(q_srv) / sizeof(q_srv[0])) {
++			q_srv[q_srv_count].svc = c.a;
++			q_srv[q_srv_count].inst = c.b;
++			q_srv[q_srv_count].node = c.c;
++			q_srv[q_srv_count].port = c.d;
++			q_srv_count++;
++		}
++		MLOG("step W5 t=%u ms: NEW_SERVER %#x:%#x node %u port %#x %s", g_ms, c.a, c.b, c.c, c.d, svc_name(c.a));
++		if (c.a == QMI_SVC_WLFW) {
++			MLOG("step W5 t=%u ms: *** WLFW service 0x45 up ***", g_ms);
++		}
++		break;
++	case QRTR_TYPE_DEL_SERVER:
++		MLOG("step W5 t=%u ms: DEL_SERVER %#x:%#x", g_ms, c.a, c.b);
++		break;
++	case QRTR_TYPE_BYE:
++		MLOG("step W5 t=%u ms: qrtr BYE from node %u", g_ms, src_node);
++		break;
++	case QRTR_TYPE_DATA:
++		if (confirm) {
++			/* the full 20-byte control packet (Linux qrtr_send_resume_tx; topaz: 12 bytes stalls the modem) */
++			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
++			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
++		}
++		if (qrtr_data_hook && hlen + size <= len) {
++			qrtr_data_hook(src_node, src_port, dst_port, p + hlen, size);
++		}
++		break;
++	case QRTR_TYPE_RESUME_TX:
++		q_resumes++;
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---------------------------------------------------------------- GLINK RX */
++
++static bool
++rx_one(void)
++{
++	struct glink_msg m;
++	uint32_t avail = rx_avail(), n;
++
++	if (avail < sizeof(m)) {
++		return false;
++	}
++	rx_peek(0, &m, sizeof(m));
++	switch (m.cmd) {
++	case CMD_VERSION:
++		rx_advance(8);
++		MLOG("step W5 t=%u ms: glink VERSION %u features %#x", g_ms, m.p1, m.p2);
++		if (m.p1 != 0) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION_ACK, 1, g_features);
++		}
++		break;
++	case CMD_VERSION_ACK:
++		rx_advance(8);
++		MLOG("step W5 t=%u ms: glink VERSION_ACK %u features %#x", g_ms, m.p1, m.p2);
++		if (m.p1 != 0 && m.p2 != g_features) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION, 1, g_features);
++		}
++		break;
++	case CMD_OPEN: {
++		char name[33];
++		bzero(name, sizeof(name));
++		n = (8 + m.p2 + 7) & ~7u;
++		if (m.p2 > 64) {
++			MLOG("step W5 t=%u ms: glink OPEN with a %u-byte name, RX stopped", g_ms, m.p2);
++			g_stopped = true;
++			return false;
++		}
++		if (avail < n) {
++			return false;
++		}
++		rx_peek(8, name, MIN(m.p2, 32u));
++		rx_advance(n);
++		MLOG("step W5 t=%u ms: glink modem OPEN \"%s\" rcid %u", g_ms, name, m.p1);
++		if (strcmp(name, CHAN_NAME) == 0) {
++			g_rcid = m.p1;
++			g_remote_open = true;
++			send_cmd(CMD_OPEN_ACK, (uint16_t)g_rcid, 0);
++			if (!g_open_sent) {
++				send_open();
++			}
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rx_advance(8);
++		MLOG("step W5 t=%u ms: glink OPEN_ACK lcid %u", g_ms, m.p1);
++		if (m.p1 == CHAN_LCID) {
++			g_open_acked = true;
++		}
++		break;
++	case CMD_CLOSE:
++		rx_advance(8);
++		MLOG("step W5 t=%u ms: glink modem CLOSE rcid %u", g_ms, m.p1);
++		send_cmd(CMD_CLOSE_ACK, m.p1, 0);
++		if (m.p1 == g_rcid) {
++			g_remote_open = false;
++		}
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (m.p2 > 256) {
++			MLOG("step W5 t=%u ms: glink INTENT count %u, RX stopped", g_ms, m.p2);
++			g_stopped = true;
++			return false;
++		}
++		if (avail < n) {
++			return false;
++		}
++		for (uint32_t i = 0; i < m.p2; i++) {
++			uint32_t pair[2];
++			rx_peek(8 + 8 * i, pair, 8);
++			if (m.p1 == g_rcid && g_ri_count < sizeof(g_ri) / sizeof(g_ri[0])) {
++				g_ri[g_ri_count].size = pair[0];
++				g_ri[g_ri_count].id = pair[1];
++				g_ri[g_ri_count].used = false;
++				g_ri_count++;
++			}
++		}
++		rx_advance(n);
++		g_intent_req_sent = false;
++		break;
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		rx_advance(8);
++		for (unsigned i = 0; i < g_ri_count; i++) {
++			if (g_ri[i].id == m.p2) {
++				if (m.cmd == CMD_RX_DONE_W_REUSE) {
++					g_ri[i].used = false;
++				} else {
++					g_ri[i] = g_ri[--g_ri_count];
++				}
++				break;
++			}
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		rx_advance(8);
++		advertise_intents(1, MAX(m.p2, OUR_INTENT_SIZE));
++		send_cmd(CMD_RX_INTENT_REQ_ACK, CHAN_LCID, 1);
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++		rx_advance(8);
++		if (m.p2 == 0) {
++			g_intent_req_sent = false;      /* ask again on the next pump */
++		}
++		break;
++	case CMD_CLOSE_ACK:
++	case CMD_SIGNALS:
++		rx_advance(8);
++		break;
++	case CMD_READ_NOTIF:
++		rx_advance(8);
++		mipc_kick_glink();
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t hdr[2];
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(8, hdr, 8);                     /* chunk_size, left_size */
++		if (hdr[0] > g_rx_len) {
++			MLOG("step W5 t=%u ms: glink TX_DATA chunk %u > FIFO, RX stopped", g_ms, hdr[0]);
++			g_stopped = true;
++			return false;
++		}
++		n = (16 + hdr[0] + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		if (m.cmd == CMD_TX_DATA) {
++			g_asm_len = 0;
++		}
++		if (g_asm_len + hdr[0] <= OUR_INTENT_SIZE) {
++			rx_peek(16, g_asm + g_asm_len, hdr[0]);
++			g_asm_len += hdr[0];
++		}
++		rx_advance(n);
++		if (hdr[1] == 0) {
++			if (m.p1 == g_rcid) {
++				qrtr_rx(g_asm, g_asm_len);
++			}
++			if (g_features & 1) {
++				send_cmd(CMD_RX_DONE_W_REUSE, CHAN_LCID, m.p2);
++			} else {
++				send_cmd(CMD_RX_DONE, CHAN_LCID, m.p2);
++				advertise_intents(1, OUR_INTENT_SIZE);
++			}
++		}
++		break;
++	}
++	default:
++		MLOG("step W5 t=%u ms: glink unknown cmd %u (%#x %#x), RX stopped", g_ms, m.cmd, m.p1, m.p2);
++		g_stopped = true;
++		return false;
++	}
++	g_rx_msgs++;
++	return true;
++}
++
++/* ---------------------------------------------------------------- interface (sweet_modem.h) */
++
++int
++glink_start(void)
++{
++	bool desc_existed = mipc_smem_get(SMEM_GLINK_DESC, NULL) != NULL;
++	bool tx_existed = mipc_smem_get(SMEM_GLINK_FIFO_TX, NULL) != NULL;
++
++	g_asm = kalloc_data(OUR_INTENT_SIZE, Z_WAITOK | Z_ZERO);
++	g_desc = (volatile uint32_t *)mipc_smem_alloc(SMEM_GLINK_DESC, 32);
++	g_tx = (volatile uint8_t *)mipc_smem_alloc(SMEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
++	if (g_asm == NULL || g_desc == NULL || g_tx == NULL) {
++		MLOG("step W5 stop: glink setup failed (asm %d desc %d tx %d)", g_asm != NULL, g_desc != NULL, g_tx != NULL);
++		return ENOMEM;
++	}
++	MLOG("step W5 glink: descriptor 478 %s, TX FIFO 479 %s (%u bytes); desc %#x %#x %#x %#x",
++	    desc_existed ? "made by the modem" : "ours", tx_existed ? "already there" : "ours", GLINK_TX_SIZE,
++	    g_desc[0], g_desc[1], g_desc[2], g_desc[3]);
++	g_desc[2] = 0;                              /* rx tail (qcom_glink_smem.c:306) */
++	g_desc[1] = 0;                              /* tx head (qcom_glink_smem.c:307) */
++	__asm__ volatile("dsb sy" ::: "memory");
++	send_cmd(CMD_VERSION, 1, g_features);
++	return 0;
++}
++
++/* one pass; the modem thread calls it every millisecond with the time since glink_start */
++void
++glink_poll(uint32_t ms)
++{
++	g_ms = ms;
++	if (g_stopped || g_desc == NULL) {
++		return;
++	}
++	if (g_rx == NULL) {
++		uint32_t sz = 0;
++		volatile uint8_t *rx = (volatile uint8_t *)mipc_smem_get(SMEM_GLINK_FIFO_RX, &sz);
++		if (rx != NULL && sz >= 64) {
++			g_rx = rx;
++			g_rx_len = sz;
++			MLOG("step W5 t=%u ms: modem RX FIFO 480, %u bytes", ms, sz);
++		}
++	}
++	for (int i = 0; i < 64 && g_rx != NULL && !g_stopped && rx_one(); i++) {
++	}
++	txq_pump();
++	if (chan_up() && !g_intents_sent) {
++		advertise_intents(OUR_INTENTS, OUR_INTENT_SIZE);
++		g_intents_sent = true;
++		MLOG("step W5 t=%u ms: IPCRTR open both ways, %u intents sent", ms, OUR_INTENTS);
++	}
++	if (chan_up() && !q_hello_sent) {
++		struct qrtr_ctrl c = { QRTR_TYPE_HELLO, 0, 0, 0, 0 };
++		q_hello_sent = true;
++		qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, qrtr_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++		MLOG("step W5 t=%u ms: sent qrtr HELLO to node %#x", ms, qrtr_modem_node);
++	}
++	/* nobody opened IPCRTR after 2 s: open it from our side (topaz) */
++	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
++		MLOG("step W5 t=%u ms: modem did not open IPCRTR, opening it", ms);
++		send_open();
++	}
++}
++
++bool
++glink_ready(void)
++{
++	return chan_up() && q_hello_rx && q_srv_count > 0;
++}
++
++void
++glink_summary(void)
++{
++	MLOG("step W5 summary: rx %u msgs, tx %u, IPCRTR %s, modem intents %u, txq %u drops %u; qrtr v%u node %#x "
++	    "hello %u, %u services, %u RESUME_TX%s",
++	    g_rx_msgs, g_tx_msgs, chan_up() ? "UP" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
++	    q_ver, qrtr_modem_node, q_hello_rx, q_srv_count, q_resumes, g_stopped ? ", RX STOPPED" : "");
++	for (unsigned i = 0; i < q_srv_count; i++) {
++		MLOG("step W5   service %#x:%#x node %u port %#x %s", q_srv[i].svc, q_srv[i].inst, q_srv[i].node,
++		    q_srv[i].port, svc_name(q_srv[i].svc));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index e360d7b..9a9adae 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -273,7 +273,7 @@ modem_load_verified_layout(void)
+ 	return true;
+ }
+ 
+-static void
++static bool
+ modem_wait_ready(void)
+ {
+ 	uint32_t state, last = 0;
+@@ -292,17 +292,58 @@ modem_wait_ready(void)
+ 			}
+ 			if (state & 1u) {
+ 				MLOG("step W4 FAIL: modem signaled fatal");
+-				return;
++				return false;
+ 			}
+ 			if (state & 2u) {
+ 				MLOG("step W4 PASS: modem signaled READY");
+-				return;
++				return true;
+ 			}
+ 		}
+ 		sweet_modem_sleep_ms(20);
+ 	}
+ 	sweet_smem_mpss_diag("timeout");
+ 	MLOG("step W4 timeout: READY absent, slave-kernel %s %#x", seen ? "last" : "unavailable", last);
++	return false;
++}
++
++/*
++ * W5: GLINK over SMEM + QRTR (sweet_glink.c), polled every millisecond for 30 s right after READY.
++ * PASS = IPCRTR open both ways, the modem's QRTR HELLO, and at least one NEW_SERVER. The modem's
++ * fatal bit is checked every 100 ms. WLFW (0x45) is not expected before W6's host services.
++ */
++static void
++rung_w5(void)
++{
++	uint64_t t0 = sweet_modem_ms();
++	uint32_t ms = 0, last_check = 0, state;
++	bool summarized = false;
++
++	if (glink_start() != 0) {
++		return;
++	}
++	while (ms < 30000) {
++		glink_poll(ms);
++		if (ms - last_check >= 100) {
++			last_check = ms;
++			if (sweet_smem_mpss_state(&state) && (state & 1u)) {
++				MLOG("step W5 FAIL: modem signaled fatal at t=%u ms (slave-kernel %#x)", ms, state);
++				glink_summary();
++				return;
++			}
++		}
++		if (!summarized && ms >= 10000) {
++			glink_summary();
++			summarized = true;
++		}
++		sweet_modem_sleep_ms(1);
++		ms = (uint32_t)(sweet_modem_ms() - t0);
++	}
++	glink_summary();
++	if (glink_ready()) {
++		MLOG("step W5 PASS: GLINK IPCRTR up, QRTR HELLO from node %u, services listed", qrtr_modem_node);
++	} else {
++		MLOG("step W5 FAIL: no complete GLINK/QRTR handshake in 30 s (see summary)");
++	}
+ }
+ 
+ /* PIL service and argument descriptors follow the Qualcomm SCM PAS ABI. */
+@@ -360,7 +401,9 @@ rung_w3(void)
+ 			status = sweet_modem_scm(SCM_FN(2, 5), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+ 			MLOG("step W4 auth_and_reset: transport %#llx result %#llx", status, result);
+ 			if (!status && !result) {
+-				modem_wait_ready();
++				if (modem_wait_ready() && sweet_modem_level >= 5) {
++					rung_w5();
++				}
+ 				goto release;
+ 			}
+ 		}
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+index 160762b..f847954 100644
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -29,6 +29,9 @@ void sweet_smem_dump(void);
+ bool sweet_smem_mpss_empty(void);
+ bool sweet_smem_mpss_state(uint32_t *state);
+ bool sweet_smem_mpss_smp2p_out(void);
++void *mipc_smem_get(uint16_t item, uint32_t *size);
++void *mipc_smem_alloc(uint16_t item, uint32_t size);
++void mipc_kick_glink(void);
+ static volatile uint8_t *mpss_part;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -255,6 +258,7 @@ sweet_smem_mpss_state(uint32_t *state)
+ #define IPCC_REG_SEND_ID        0x0cu
+ #define IPCC_CLIENT_MPSS        2u
+ #define IPCC_SIGNAL_SMP2P       2u
++#define IPCC_SIGNAL_GLINK_QMP   0u
+ #define SMP2P_MAX_ENTRY         16u
+ #define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)   /* struct smp2p_smem_item = 340 */
+ #define SMP2P_FEATURE_SSR_ACK   1u
+@@ -340,18 +344,9 @@ smp2p_out_entry(volatile uint8_t *item, uint16_t idx, const char *name)
+ 	smem_wr32(e, 16, 0);
+ }
+ 
+-/* qcom_smem_alloc_private + qcom_smp2p_alloc_outbound_item + outbound entries + kick */
+-bool
+-sweet_smem_mpss_smp2p_out(void)
++static bool
++smem_mpss_map_hw(void)
+ {
+-	volatile uint8_t *part = mpss_part;
+-	uint32_t data, need = sizeof(struct smem_priv_entry) + ((SMP2P_ITEM_SIZE + 7u) & ~7u);
+-	bool ok = false;
+-
+-	if (!part) {
+-		printf("SWEET SMEM: smp2p out: no mpss partition mapped\n");
+-		return false;
+-	}
+ 	if (!tcsr_mutex) {
+ 		tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, (SMEM_HWLOCK_ID + 1) * TCSR_MUTEX_STRIDE);
+ 	}
+@@ -359,22 +354,42 @@ sweet_smem_mpss_smp2p_out(void)
+ 		ipcc = (volatile uint8_t *)ml_io_map(IPCC_PA, 0x1000);
+ 	}
+ 	if (!tcsr_mutex || !ipcc) {
+-		printf("SWEET SMEM: smp2p out: map failed (tcsr %d ipcc %d)\n", tcsr_mutex != NULL, ipcc != NULL);
++		printf("SWEET SMEM: map failed (tcsr %d ipcc %d)\n", tcsr_mutex != NULL, ipcc != NULL);
+ 		return false;
+ 	}
+-	if (smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL)) {
+-		printf("SWEET SMEM: smp2p out: item %u already exists, not touching it\n", SMEM_ITEM_SMP2P_OUT);
+-		return false;
++	return true;
++}
++
++/*
++ * qcom_smem_alloc_private(): append an uncached item under hwlock 3, zeroed. Returns the data offset
++ * of the item in the mpss partition (0 on failure). *existed = true when the item was already there
++ * (then nothing is written: the remote made it, as MPSS does with GLINK's 478).
++ */
++static uint32_t
++smem_mpss_alloc(uint16_t item, uint32_t size, bool *existed)
++{
++	volatile uint8_t *part = mpss_part;
++	uint32_t aligned = (size + 7u) & ~7u, need = sizeof(struct smem_priv_entry) + aligned, data;
++	bool ok = false;
++
++	*existed = false;
++	if (!part || !smem_mpss_map_hw()) {
++		return 0;
++	}
++	if ((data = smem_mpss_find(item, NULL)) != 0) {
++		*existed = true;
++		return data;
+ 	}
+ 	boolean_t intr = ml_set_interrupts_enabled(FALSE);
+ 	if (smem_hwlock()) {
+ 		uint32_t free_uncached = smem_rd32(part, 12), free_cached = smem_rd32(part, 16);
+-		if (free_uncached + need <= free_cached && !smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL)) {
+-			uint32_t aligned = need - sizeof(struct smem_priv_entry);
++		if ((data = smem_mpss_find(item, NULL)) != 0) {
++			*existed = true;
++		} else if (free_uncached + need <= free_cached && free_cached <= smem_rd32(part, 8)) {
+ 			smem_wr16(part, free_uncached, SMEM_CANARY);
+-			smem_wr16(part, free_uncached + 2, SMEM_ITEM_SMP2P_OUT);
++			smem_wr16(part, free_uncached + 2, item);
+ 			smem_wr32(part, free_uncached + 4, aligned);
+-			smem_wr16(part, free_uncached + 8, (uint16_t)(aligned - SMP2P_ITEM_SIZE));
++			smem_wr16(part, free_uncached + 8, (uint16_t)(aligned - size));
+ 			smem_wr16(part, free_uncached + 10, 0);
+ 			smem_wr32(part, free_uncached + 12, 0);
+ 			for (uint32_t o = 0; o < aligned; o += 4) {
+@@ -384,17 +399,63 @@ sweet_smem_mpss_smp2p_out(void)
+ 			smem_wr32(part, 12, free_uncached + need);
+ 			ok = true;
+ 		} else {
+-			printf("SWEET SMEM: smp2p out: no room (free %#x..%#x need %#x) or item raced in\n",
+-			    free_uncached, free_cached, need);
++			printf("SWEET SMEM: alloc %u: no room (free %#x..%#x need %#x)\n", item, free_uncached, free_cached, need);
+ 		}
+ 		smem_hwunlock();
+ 	}
+ 	ml_set_interrupts_enabled(intr);
+-	if (!ok || !(data = smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL))) {
+-		return false;
++	if (*existed) {
++		return data;
++	}
++	return ok ? smem_mpss_find(item, NULL) : 0;
++}
++
++static void
++ipcc_kick(uint32_t client, uint32_t signal)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	smem_wr32(ipcc, IPCC_REG_SEND_ID, (client << 16) | signal);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* sweet_modem.h interface for sweet_glink.c (W5) */
++void *
++mipc_smem_get(uint16_t item, uint32_t *size)
++{
++	uint32_t data = mpss_part ? smem_mpss_find(item, size) : 0;
++	return data ? (void *)(uintptr_t)(mpss_part + data) : NULL;
++}
++
++void *
++mipc_smem_alloc(uint16_t item, uint32_t size)
++{
++	bool existed;
++	uint32_t data = smem_mpss_alloc(item, size, &existed);
++	return data ? (void *)(uintptr_t)(mpss_part + data) : NULL;
++}
++
++/* glink_modem mboxes = <&ipcc_mproc IPCC_CLIENT_MPSS IPCC_MPROC_SIGNAL_GLINK_QMP>: lito.dtsi:2633-2634, qcom,ipcc.h:10 */
++void
++mipc_kick_glink(void)
++{
++	if (ipcc) {
++		ipcc_kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_GLINK_QMP);
+ 	}
++}
++
++/* qcom_smp2p_alloc_outbound_item + outbound entries + kick */
++bool
++sweet_smem_mpss_smp2p_out(void)
++{
++	bool existed;
++	uint32_t data = smem_mpss_alloc(SMEM_ITEM_SMP2P_OUT, SMP2P_ITEM_SIZE, &existed);
+ 
+-	volatile uint8_t *item = part + data;
++	if (!data || existed) {
++		printf("SWEET SMEM: smp2p out: item %u %s\n", SMEM_ITEM_SMP2P_OUT,
++		    existed ? "already exists, not touching it" : "could not be allocated");
++		return false;
++	}
++	volatile uint8_t *item = mpss_part + data;
+ 	smem_wr32(item, 0, 0x504d5324u);                       /* "$SMP" */
+ 	smem_wr32(item, 4, SMP2P_FEATURE_SSR_ACK << 8);         /* version 0 until the end, features */
+ 	smem_wr16(item, 8, HOST_APPS);                          /* local pid */
+@@ -411,8 +472,7 @@ sweet_smem_mpss_smp2p_out(void)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	printf("SWEET SMEM: smp2p out: item %u at +%#x, entries master-kernel ipa; kicking IPCC client %u signal %u\n",
+ 	    SMEM_ITEM_SMP2P_OUT, data, IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
+-	smem_wr32(ipcc, IPCC_REG_SEND_ID, (IPCC_CLIENT_MPSS << 16) | IPCC_SIGNAL_SMP2P);
+-	__asm__ volatile("dsb sy" ::: "memory");
++	ipcc_kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
+ 	printf("SWEET SMEM: smp2p out: kick done\n");
+ 	return true;
+ }
