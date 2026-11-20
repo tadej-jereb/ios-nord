@@ -1,0 +1,205 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 3f4bc66..078e120 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -86,26 +86,6 @@ sweet_modem_alloc_contig(size_t size, uint64_t *pa)
+ 	return (void *)va;
+ }
+ 
+-/* as sweet_modem_alloc_contig, but every page below 4 GiB */
+-void *
+-sweet_modem_alloc_contig_low(size_t size, uint64_t *pa)
+-{
+-	vm_offset_t va = 0;
+-	ppnum_t pn;
+-
+-	size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
+-	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, (ppnum_t)((1ull << 32) >> PAGE_SHIFT) - 1, 0,
+-	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		return NULL;
+-	}
+-	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+-	if (!pn || ((uint64_t)pn << PAGE_SHIFT) + size > (1ull << 32)) {
+-		return NULL;
+-	}
+-	*pa = ((uint64_t)pn << PAGE_SHIFT);
+-	return (void *)va;
+-}
+-
+ /*
+  * One SIP SCM call (the same convention bsd/dev/sweet_gpu.c's gpu_scm_pas uses on this phone: x0 = 1 is
+  * "interrupted, resume with the token in x6", -12 is "busy"). a5 is the 4th argument register x5.
+@@ -240,6 +220,7 @@ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern bool sweet_smem_mpss_state(uint32_t *state);
+ extern void sweet_smem_mpss_diag(const char *tag);
+ extern bool sweet_smem_mpss_smp2p_out(void);
++extern void sweet_smem_mpss_crash_reason(void);
+ 
+ /*
+  * This rung supports the verified Nord firmware placement. The MDT was
+@@ -312,6 +293,7 @@ modem_wait_ready(void)
+ 			}
+ 			if (state & 1u) {
+ 				MLOG("step W4 FAIL: modem signaled fatal");
++				sweet_smem_mpss_crash_reason();
+ 				return false;
+ 			}
+ 			if (state & 2u) {
+@@ -352,6 +334,7 @@ rung_w5(void)
+ 			last_check = ms;
+ 			if (sweet_smem_mpss_state(&state) && (state & 1u)) {
+ 				MLOG("step W5 FAIL: modem signaled fatal at t=%u ms (slave-kernel %#x)", ms, state);
++				sweet_smem_mpss_crash_reason();
+ 				glink_summary();
+ 				if (sweet_modem_level >= 6) {
+ 					msvc_summary();
+diff --git a/bsd/dev/sweet_modem.h b/bsd/dev/sweet_modem.h
+index bd10557..475aedc 100644
+--- a/bsd/dev/sweet_modem.h
++++ b/bsd/dev/sweet_modem.h
+@@ -64,7 +64,6 @@ int  mdt_open_seg(uint32_t index, struct mfw_file *f);
+ /* ---- sweet_modem.c ---- */
+ void sweet_modem_start(void);                           /* hook at the end of sweet_ufs_init() */
+ void *sweet_modem_alloc_contig(size_t size, uint64_t *pa);  /* wired, zeroed, physically contiguous */
+-void *sweet_modem_alloc_contig_low(size_t size, uint64_t *pa); /* same, below 4 GiB */
+ void sweet_modem_to_memory(void *va, size_t size);      /* dc civac + dsb */
+ uint64_t sweet_modem_scm(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4,
+     uint64_t a5, uint64_t *x1_out);
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index cf9f03d..a4cc5db 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -27,6 +27,7 @@
+ #include <sys/errno.h>
+ #include <kern/kalloc.h>
+ #include <dev/sweet_modem.h>
++#include <arm/memory_types.h>
+ 
+ extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
+@@ -544,6 +545,16 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
+ /* ---------------------------------------------------------------- rmtfs (read-only) */
+ 
+ #define RMTFS_BUF_SIZE      MODEM_RMTFS_SIZE    /* 0x280000, lito.dtsi:2227 */
++/*
++ * Where the buffer lives. Linux allocates it with dma_alloc_coherent below 4 GiB (msm_sharedmem.c:178; the
++ * iovec addresses are 32-bit). XNU here manages only the high bank (hw.memsize 0xfff00000 at 0x180000000,
++ * 2026-11-20), so the buffer is a fixed piece of the low bank that nothing uses under XNU: free RAM between
++ * modem_wlan_region (0x8c000000+0xf800000) and cdsp_sec_regions@9f400000 (lito.dtsi reserved-memory), clear
++ * of 0x9b800000 where the modem MDT addresses its hash segment. Choice, not a vendor value: UNVERIFIED that
++ * nothing else touches it (the shim copies its payload to the high bank; ABL's load buffers are dead by then).
++ */
++#define RMTFS_BUF_PA        0x9c000000ull
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ #define SCM_SVC_MP          0x0Cu
+ #define MEM_PROT_ASSIGN_ID  0x16u
+ #define VMID_HLOS           0x3u
+@@ -651,7 +662,7 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			} else {
+ 				uint8_t *dst = rmtfs_va + (e[1] - rmtfs_pa);
+ 				ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512, dst, bytes) == 0;
+-				sweet_modem_to_memory(dst, bytes);
++				__asm__ volatile("dsb sy" ::: "memory");
+ 				rmtfs_reads++;
+ 			}
+ 		}
+@@ -663,13 +674,16 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 	}
+ 	case 4: {                                   /* ALLOC_BUFF */
+ 		if (rmtfs_pa == 0) {
+-			uint64_t pa = 0;
+-			uint8_t *va = sweet_modem_alloc_contig_low(RMTFS_BUF_SIZE, &pa);
+-			if (va != NULL) {
+-				sweet_modem_to_memory(va, RMTFS_BUF_SIZE);
+-				if (rmtfs_assign_to_modem(pa, RMTFS_BUF_SIZE)) {
+-					rmtfs_va = va;          /* the modem shares it from now on: never freed */
+-					rmtfs_pa = pa;
++			/* write-combined like the W4 modem loader's mapping: plain loads/stores, no cache to clean */
++			uint8_t *va = (uint8_t *)ml_io_map_unmappable(RMTFS_BUF_PA, RMTFS_BUF_SIZE, VM_WIMG_WCOMB);
++			if (va == NULL) {
++				MLOG("step W6 rmtfs: mapping %#llx failed", RMTFS_BUF_PA);
++			} else {
++				bzero(va, RMTFS_BUF_SIZE);
++				__asm__ volatile("dsb sy" ::: "memory");
++				if (rmtfs_assign_to_modem(RMTFS_BUF_PA, RMTFS_BUF_SIZE)) {
++					rmtfs_va = va;          /* shared with the modem from now on: never unmapped */
++					rmtfs_pa = RMTFS_BUF_PA;
+ 				}
+ 			}
+ 		}
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+index f847954..a4b5a66 100644
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -32,6 +32,7 @@ bool sweet_smem_mpss_smp2p_out(void);
+ void *mipc_smem_get(uint16_t item, uint32_t *size);
+ void *mipc_smem_alloc(uint16_t item, uint32_t size);
+ void mipc_kick_glink(void);
++void sweet_smem_mpss_crash_reason(void);
+ static volatile uint8_t *mpss_part;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -418,6 +419,63 @@ ipcc_kick(uint32_t client, uint32_t signal)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * The modem's crash reason: SMEM item 421 (qcom,mss qcom,smem-id = <421>, lito.dtsi:2881), which the
++ * vendor PIL reads with qcom_smem_get(QCOM_SMEM_HOST_ANY, ...): the global partition, hosts 0xfffe/0xfffe
++ * (anonbeat1 0113 found its WPSS crash item there). Read-only; prints printable characters only.
++ */
++#define SMEM_GLOBAL_HOST        0xfffeu
++#define SMEM_ITEM_MPSS_SFR      421u
++void
++sweet_smem_mpss_crash_reason(void)
++{
++	volatile uint8_t *glob = NULL;
++
++	if (!smem_base || !smem_magic(smem_base, SMEM_TABLE_OFF, "$TOC")) {
++		return;
++	}
++	uint32_t n = smem_rd32(smem_base, SMEM_TABLE_OFF + 8);
++	for (uint32_t i = 0; i < n && i < SMEM_ITEMS_MAX; i++) {
++		uint32_t e = SMEM_TABLE_OFF + sizeof(struct smem_pt) + i * sizeof(struct smem_pt_entry);
++		uint32_t off = smem_rd32(smem_base, e), size = smem_rd32(smem_base, e + 4);
++		if (smem_rd16(smem_base, e + 12) == SMEM_GLOBAL_HOST && smem_rd16(smem_base, e + 14) == SMEM_GLOBAL_HOST &&
++		    off != 0 && off < SMEM_SIZE && size <= SMEM_SIZE - off) {
++			glob = smem_base + off;
++		}
++	}
++	if (!glob || !smem_magic(glob, 0, "$PRT")) {
++		printf("SWEET SMEM: crash reason: no global partition\n");
++		return;
++	}
++	uint32_t end = smem_rd32(glob, 12);
++	for (uint32_t pos = sizeof(struct smem_part_hdr); pos + sizeof(struct smem_priv_entry) <= end;) {
++		if (smem_rd16(glob, pos) != SMEM_CANARY) {
++			break;
++		}
++		uint32_t size = smem_rd32(glob, pos + 4);
++		uint32_t data = pos + sizeof(struct smem_priv_entry) + smem_rd16(glob, pos + 10);
++		if (data > end || size > end - data) {
++			break;
++		}
++		if (smem_rd16(glob, pos + 2) == SMEM_ITEM_MPSS_SFR) {
++			char text[201];
++			uint32_t k = 0;
++			for (uint32_t j = 0; j < size && k < 200; j++) {
++				uint8_t c = glob[data + j];
++				if (c == 0) {
++					break;
++				}
++				text[k++] = smem_namec(c);
++			}
++			text[k] = 0;
++			printf("SWEET SMEM: modem crash reason (item %u, %u B): \"%s\"\n", SMEM_ITEM_MPSS_SFR, size, text);
++			return;
++		}
++		pos = data + size;
++	}
++	printf("SWEET SMEM: crash reason: item %u not in the global partition\n", SMEM_ITEM_MPSS_SFR);
++}
++
+ /* sweet_modem.h interface for sweet_glink.c (W5) */
+ void *
+ mipc_smem_get(uint16_t item, uint32_t *size)
