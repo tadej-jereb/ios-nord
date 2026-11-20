@@ -66,18 +66,19 @@ index bd10557..475aedc 100644
  uint64_t sweet_modem_scm(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4,
      uint64_t a5, uint64_t *x1_out);
 diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
-index cf9f03d..a4cc5db 100644
+index cf9f03d..d5c3120 100644
 --- a/bsd/dev/sweet_modem_svc.c
 +++ b/bsd/dev/sweet_modem_svc.c
-@@ -27,6 +27,7 @@
+@@ -27,6 +27,8 @@
  #include <sys/errno.h>
  #include <kern/kalloc.h>
  #include <dev/sweet_modem.h>
 +#include <arm/memory_types.h>
++#include <vm/pmap.h>                     /* VM_MEM_* behind VM_WIMG_WCOMB, as sweet_modem.c */
  
  extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
  extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
-@@ -544,6 +545,16 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
+@@ -544,6 +546,16 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
  /* ---------------------------------------------------------------- rmtfs (read-only) */
  
  #define RMTFS_BUF_SIZE      MODEM_RMTFS_SIZE    /* 0x280000, lito.dtsi:2227 */
@@ -94,7 +95,7 @@ index cf9f03d..a4cc5db 100644
  #define SCM_SVC_MP          0x0Cu
  #define MEM_PROT_ASSIGN_ID  0x16u
  #define VMID_HLOS           0x3u
-@@ -651,7 +662,7 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+@@ -651,7 +663,7 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
  			} else {
  				uint8_t *dst = rmtfs_va + (e[1] - rmtfs_pa);
  				ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512, dst, bytes) == 0;
@@ -103,7 +104,7 @@ index cf9f03d..a4cc5db 100644
  				rmtfs_reads++;
  			}
  		}
-@@ -663,13 +674,16 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+@@ -663,13 +675,16 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
  	}
  	case 4: {                                   /* ALLOC_BUFF */
  		if (rmtfs_pa == 0) {
