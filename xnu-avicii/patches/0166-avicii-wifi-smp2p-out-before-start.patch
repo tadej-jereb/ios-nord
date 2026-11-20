@@ -1,0 +1,279 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 97f88e5..e360d7b 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -219,6 +219,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern bool sweet_smem_mpss_state(uint32_t *state);
+ extern void sweet_smem_mpss_diag(const char *tag);
++extern bool sweet_smem_mpss_smp2p_out(void);
+ 
+ /*
+  * This rung supports the verified Nord firmware placement. The MDT was
+@@ -347,7 +348,14 @@ rung_w3(void)
+ 	}
+ 	bool prepared = status == 0 && result == 0;
+ 	if (prepared && sweet_modem_level >= 4) {
+-		if (modem_load_verified_layout()) {
++		/* the vendor kernel has our SMP2P item 428 in place long before the modem starts */
++		bool loaded = modem_load_verified_layout();
++		bool out = loaded && sweet_smem_mpss_smp2p_out();
++		if (loaded && !out) {
++			MLOG("step W4 stop: our SMP2P item 428 could not be created; modem not started");
++		}
++		if (out) {
++			sweet_smem_mpss_diag("before start");
+ 			MLOG("step W4 auth_and_reset: starting stock MPSS firmware");
+ 			status = sweet_modem_scm(SCM_FN(2, 5), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+ 			MLOG("step W4 auth_and_reset: transport %#llx result %#llx", status, result);
+diff --git a/bsd/dev/sweet_smem.c b/bsd/dev/sweet_smem.c
+index 13ae251..160762b 100644
+--- a/bsd/dev/sweet_smem.c
++++ b/bsd/dev/sweet_smem.c
+@@ -20,12 +20,15 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ /* bsd/dev/sweet_smem.h is a userland-safe header; keep the tree include-free */
+ void sweet_smem_dump(void);
+ bool sweet_smem_mpss_empty(void);
+ bool sweet_smem_mpss_state(uint32_t *state);
++bool sweet_smem_mpss_smp2p_out(void);
+ static volatile uint8_t *mpss_part;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -229,6 +232,221 @@ sweet_smem_mpss_state(uint32_t *state)
+ 	return false;
+ }
+ 
++/*
++ * W4: our outbound SMP2P item 428 (apps -> MPSS). The vendor kernel creates it at smp2p probe, long
++ * before the modem starts (avicii/smp2p.c:572-669 qcom_smp2p_probe -> alloc_outbound_item, then one
++ * outbound entry per DT child, then a kick). The 2026-11-20 run (logs/phone/20261120-wifi-0165/)
++ * showed MPSS booting and making its own 435 but never READY while 428 did not exist; anonbeat1
++ * (refs/anonbeat1-ios-sweet NOTES.md:1189-1227) got READY in 33 ms after creating it first.
++ *   items 435 in / 428 out, local pid 0, remote pid 1:   lito-smp2p.dtsi:6-14
++ *   our entries "master-kernel", "ipa" (DT order):        lito-smp2p.dtsi:16-30
++ *   doorbell IPCC 0x408000 client 2 (MPSS) signal 2:      lito-smp2p.dtsi:9-12, qcom,ipcc.h:11,21, lito.dtsi:2232-2234
++ *   IPCC_REG_SEND_ID 0x0c = client<<16 | signal:          avicii/qcom_ipcc.c:20,27-28,198 (UNVERIFIED on device)
++ *   SMEM hwlock 3 on the TCSR mutex 0x1f40000, stride 0x1000, owner id 1:
++ *                                                         lito.dtsi:2607-2621, avicii/qcom_hwspinlock.c:20,117
++ *   allocation: qcom_smem_alloc_private (canary, size aligned 8, pad_data, free_uncached += hdr+size)
++ *   item: magic "$SMP", features SSR_ACK (1), version 1 written last: avicii/smp2p.c:53-59,517-529
++ */
++#define TCSR_MUTEX_PA           0x01f40000u
++#define TCSR_MUTEX_STRIDE       0x1000u
++#define SMEM_HWLOCK_ID          3u
++#define HWLOCK_APPS_OWNER       1u
++#define IPCC_PA                 0x00408000u
++#define IPCC_REG_SEND_ID        0x0cu
++#define IPCC_CLIENT_MPSS        2u
++#define IPCC_SIGNAL_SMP2P       2u
++#define SMP2P_MAX_ENTRY         16u
++#define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)   /* struct smp2p_smem_item = 340 */
++#define SMP2P_FEATURE_SSR_ACK   1u
++
++static volatile uint8_t *tcsr_mutex, *ipcc;
++
++static inline void
++smem_wr32(volatile uint8_t *p, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(p + off) = v;
++}
++
++static inline void
++smem_wr16(volatile uint8_t *p, uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(p + off) = v;
++}
++
++/* the data offset of an item in the mpss partition, or 0 */
++static uint32_t
++smem_mpss_find(uint16_t want, uint32_t *size_out)
++{
++	volatile uint8_t *part = mpss_part;
++	uint32_t end = smem_rd32(part, 12);
++
++	if (end > smem_rd32(part, 8)) {
++		return 0;
++	}
++	for (uint32_t pos = sizeof(struct smem_part_hdr); pos + sizeof(struct smem_priv_entry) <= end;) {
++		if (smem_rd16(part, pos) != SMEM_CANARY) {
++			return 0;
++		}
++		uint32_t size = smem_rd32(part, pos + 4);
++		uint32_t data = pos + sizeof(struct smem_priv_entry) + smem_rd16(part, pos + 10);
++		if (data > end || size > end - data) {
++			return 0;
++		}
++		if (smem_rd16(part, pos + 2) == want) {
++			if (size_out) {
++				*size_out = size;
++			}
++			return data;
++		}
++		pos = data + size;
++	}
++	return 0;
++}
++
++static bool
++smem_hwlock(void)
++{
++	volatile uint32_t *reg = (volatile uint32_t *)(tcsr_mutex + SMEM_HWLOCK_ID * TCSR_MUTEX_STRIDE);
++
++	for (unsigned n = 0; n < 100000; n++) {
++		*reg = HWLOCK_APPS_OWNER;
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (*reg == HWLOCK_APPS_OWNER) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("SWEET SMEM: smp2p out: hwlock %u busy, owner %u\n", SMEM_HWLOCK_ID, *reg);
++	return false;
++}
++
++static void
++smem_hwunlock(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(tcsr_mutex + SMEM_HWLOCK_ID * TCSR_MUTEX_STRIDE) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++smp2p_out_entry(volatile uint8_t *item, uint16_t idx, const char *name)
++{
++	volatile uint8_t *e = item + 20 + 20u * idx;
++	size_t n = strlen(name);
++
++	for (unsigned j = 0; j < 16; j++) {
++		e[j] = j < n ? (uint8_t)name[j] : 0;
++	}
++	smem_wr32(e, 16, 0);
++}
++
++/* qcom_smem_alloc_private + qcom_smp2p_alloc_outbound_item + outbound entries + kick */
++bool
++sweet_smem_mpss_smp2p_out(void)
++{
++	volatile uint8_t *part = mpss_part;
++	uint32_t data, need = sizeof(struct smem_priv_entry) + ((SMP2P_ITEM_SIZE + 7u) & ~7u);
++	bool ok = false;
++
++	if (!part) {
++		printf("SWEET SMEM: smp2p out: no mpss partition mapped\n");
++		return false;
++	}
++	if (!tcsr_mutex) {
++		tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, (SMEM_HWLOCK_ID + 1) * TCSR_MUTEX_STRIDE);
++	}
++	if (!ipcc) {
++		ipcc = (volatile uint8_t *)ml_io_map(IPCC_PA, 0x1000);
++	}
++	if (!tcsr_mutex || !ipcc) {
++		printf("SWEET SMEM: smp2p out: map failed (tcsr %d ipcc %d)\n", tcsr_mutex != NULL, ipcc != NULL);
++		return false;
++	}
++	if (smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL)) {
++		printf("SWEET SMEM: smp2p out: item %u already exists, not touching it\n", SMEM_ITEM_SMP2P_OUT);
++		return false;
++	}
++	boolean_t intr = ml_set_interrupts_enabled(FALSE);
++	if (smem_hwlock()) {
++		uint32_t free_uncached = smem_rd32(part, 12), free_cached = smem_rd32(part, 16);
++		if (free_uncached + need <= free_cached && !smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL)) {
++			uint32_t aligned = need - sizeof(struct smem_priv_entry);
++			smem_wr16(part, free_uncached, SMEM_CANARY);
++			smem_wr16(part, free_uncached + 2, SMEM_ITEM_SMP2P_OUT);
++			smem_wr32(part, free_uncached + 4, aligned);
++			smem_wr16(part, free_uncached + 8, (uint16_t)(aligned - SMP2P_ITEM_SIZE));
++			smem_wr16(part, free_uncached + 10, 0);
++			smem_wr32(part, free_uncached + 12, 0);
++			for (uint32_t o = 0; o < aligned; o += 4) {
++				smem_wr32(part, free_uncached + sizeof(struct smem_priv_entry) + o, 0);
++			}
++			__asm__ volatile("dsb sy" ::: "memory");
++			smem_wr32(part, 12, free_uncached + need);
++			ok = true;
++		} else {
++			printf("SWEET SMEM: smp2p out: no room (free %#x..%#x need %#x) or item raced in\n",
++			    free_uncached, free_cached, need);
++		}
++		smem_hwunlock();
++	}
++	ml_set_interrupts_enabled(intr);
++	if (!ok || !(data = smem_mpss_find(SMEM_ITEM_SMP2P_OUT, NULL))) {
++		return false;
++	}
++
++	volatile uint8_t *item = part + data;
++	smem_wr32(item, 0, 0x504d5324u);                       /* "$SMP" */
++	smem_wr32(item, 4, SMP2P_FEATURE_SSR_ACK << 8);         /* version 0 until the end, features */
++	smem_wr16(item, 8, HOST_APPS);                          /* local pid */
++	smem_wr16(item, 10, HOST_MPSS);                         /* remote pid */
++	smem_wr16(item, 12, SMP2P_MAX_ENTRY);                   /* total entries */
++	smem_wr16(item, 14, 0);                                 /* valid entries */
++	smem_wr32(item, 16, 0);                                 /* flags */
++	__asm__ volatile("dsb sy" ::: "memory");
++	item[4] = 1;                                            /* version validates the item */
++	smp2p_out_entry(item, 0, "master-kernel");
++	smp2p_out_entry(item, 1, "ipa");
++	__asm__ volatile("dsb sy" ::: "memory");
++	smem_wr16(item, 14, 2);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SMEM: smp2p out: item %u at +%#x, entries master-kernel ipa; kicking IPCC client %u signal %u\n",
++	    SMEM_ITEM_SMP2P_OUT, data, IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
++	smem_wr32(ipcc, IPCC_REG_SEND_ID, (IPCC_CLIENT_MPSS << 16) | IPCC_SIGNAL_SMP2P);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SMEM: smp2p out: kick done\n");
++	return true;
++}
++
++/* one line per SMP2P item: header fields and every valid entry */
++static void
++smem_smp2p_show(const char *tag, uint16_t want)
++{
++	uint32_t size = 0, data = smem_mpss_find(want, &size);
++
++	if (!data) {
++		printf("SWEET SMEM: %s: smp2p %u absent\n", tag, want);
++		return;
++	}
++	volatile uint8_t *h = mpss_part + data;
++	if (size < 20) {
++		printf("SWEET SMEM: %s: smp2p %u too small (%u)\n", tag, want, size);
++		return;
++	}
++	uint16_t total = smem_rd16(h, 12), valid = smem_rd16(h, 14);
++	printf("SWEET SMEM: %s: smp2p %u magic %#x ver %u feat %#x pid %u->%u entries %u/%u flags %#x\n",
++	    tag, want, smem_rd32(h, 0), h[4], smem_rd32(h, 4) >> 8, smem_rd16(h, 8), smem_rd16(h, 10),
++	    valid, total, smem_rd32(h, 16));
++	for (uint16_t i = 0; i < valid && i < SMP2P_MAX_ENTRY && 20u + 20u * (i + 1u) <= size; i++) {
++		volatile uint8_t *e = h + 20 + 20u * i;
++		char name[17];
++		for (unsigned j = 0; j < 16; j++) {
++			name[j] = smem_namec(e[j]);
++		}
++		name[16] = 0;
++		printf("SWEET SMEM: %s: smp2p %u [%u] \"%s\" = %#x\n", tag, want, i, name, smem_rd32(e, 16));
++	}
++}
++
+ /*
+  * W4 diagnostic: report the apps<->mpss partition as the modem left it, so a
+  * missing READY can be told apart from a partition the firmware never wrote.
+@@ -277,6 +495,8 @@ sweet_smem_mpss_diag(const char *tag)
+ 		    item == SMEM_ITEM_SMP2P_IN ? " <-- smp2p in" : "");
+ 		pos = data + isize;
+ 	}
++	smem_smp2p_show(tag, SMEM_ITEM_SMP2P_OUT);
++	smem_smp2p_show(tag, SMEM_ITEM_SMP2P_IN);
+ }
+ 
+ void
