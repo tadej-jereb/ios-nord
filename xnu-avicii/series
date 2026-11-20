@@ -162,3 +162,4 @@ apply 0166-avicii-wifi-smp2p-out-before-start.patch
 apply 0167-avicii-wifi-w5-glink-qrtr.patch
 apply 0168-avicii-wifi-w6-host-services.patch
 apply 0169-avicii-wifi-w6-rmtfs-low-bank-crash-reason.patch
+apply 0170-avicii-wifi-w6-tftp-from-ram-ufs-uic-diag.patch

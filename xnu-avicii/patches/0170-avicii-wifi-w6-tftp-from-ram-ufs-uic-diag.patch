@@ -1,0 +1,463 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 078e120..dd43843 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -344,6 +344,10 @@ rung_w5(void)
+ 			if (!wlfw && glink_has_service(0x45)) {
+ 				wlfw = true;
+ 				MLOG("step W6 t=%u ms: WLFW (0x45) announced by the modem", ms);
++				/* the verdict now, not at the end of the window: on 0169 the end came 9 min late */
++				if (sweet_modem_level >= 6) {
++					MLOG("step W6 PASS: the modem brought up WLFW (QMI 0x45) at t=%u ms", ms);
++				}
+ 			}
+ 		}
+ 		if (!summarized && ms >= 10000) {
+@@ -365,7 +369,7 @@ rung_w5(void)
+ 	if (sweet_modem_level >= 6) {
+ 		msvc_summary();
+ 		if (wlfw) {
+-			MLOG("step W6 PASS: the modem brought up WLFW (QMI 0x45)");
++			MLOG("step W6 end of the %u s window (PASS line above)", limit / 1000);
+ 		} else {
+ 			MLOG("step W6 FAIL: no WLFW in %u s (see the services summary)", limit / 1000);
+ 		}
+@@ -422,6 +426,9 @@ rung_w3(void)
+ 			MLOG("step W4 stop: our SMP2P item 428 could not be created; modem not started");
+ 		}
+ 		if (out) {
++			if (sweet_modem_level >= 6) {
++				msvc_prepare();         /* tftp files into RAM while the modem is still off */
++			}
+ 			sweet_smem_mpss_diag("before start");
+ 			MLOG("step W4 auth_and_reset: starting stock MPSS firmware");
+ 			status = sweet_modem_scm(SCM_FN(2, 5), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+diff --git a/bsd/dev/sweet_modem.h b/bsd/dev/sweet_modem.h
+index 475aedc..30583c6 100644
+--- a/bsd/dev/sweet_modem.h
++++ b/bsd/dev/sweet_modem.h
+@@ -32,10 +32,16 @@ struct mfw_file {
+ 	uint32_t first;                 /* first cluster */
+ 	uint32_t size;                  /* bytes */
+ 	uint32_t cur_idx, cur_cl;       /* read cursor: cluster index and its cluster number */
++	const uint8_t *ram;             /* the whole file in RAM (mfw_preload), else NULL: read from UFS */
+ };
+ int  mfw_mount(const char *part);                       /* 0 or errno; idempotent */
+ int  mfw_lookup(const char *path, struct mfw_file *f);  /* "image/modem.mdt", case-insensitive */
+-int  mfw_read(struct mfw_file *f, uint64_t off, void *dst, uint32_t len);
++int  mfw_read(struct mfw_file *f, uint64_t off, void *dst, uint32_t len);   /* from RAM when f->ram */
++/* in-RAM index of the whole volume (0170): lookups after it never touch UFS */
++int  mfw_index(void);                                   /* 0 or errno; idempotent */
++uint32_t mfw_index_entries(void);
++/* every file at or under path into RAM; adds to *files / *bytes */
++int  mfw_preload(const char *path, uint32_t *files, uint64_t *bytes);
+ const char *mfw_part(void);
+ const char *mfw_describe(void);                         /* "FAT16 bps 512 spc 8 ..." for the log */
+ 
+@@ -107,6 +113,7 @@ extern bool (*qrtr_data_hook)(uint32_t src_node, uint32_t src_port, uint32_t dst
+ extern void (*qrtr_hello_hook)(void);
+ 
+ /* ---- sweet_modem_svc.c: pd-mapper, tftp, rmtfs (level 6) ---- */
++void msvc_prepare(void);                                /* before the modem starts: tftp files into RAM */
+ void msvc_init(void);
+ void msvc_summary(void);
+ #endif
+diff --git a/bsd/dev/sweet_modem_fw.c b/bsd/dev/sweet_modem_fw.c
+index 79ef585..bcad1ec 100644
+--- a/bsd/dev/sweet_modem_fw.c
++++ b/bsd/dev/sweet_modem_fw.c
+@@ -357,6 +357,222 @@ find_cb(void *ctx, const char *name, const struct mfw_ent *e)
+ 	return 0;
+ }
+ 
++/* ---- in-RAM index (0170) ----
++ * 0169 on the phone: ~21 s after READY every UFS command timed out (UIC error, logs/phone/20261120-wifi-0169),
++ * so the tftp server must not need UFS while the modem runs. The whole volume is indexed once (modem_a backup:
++ * 553 files, 529 directories), and mfw_preload() copies the files the modem fetches into RAM before it starts.
++ */
++#define IDX_MAX_NODES   8192u
++#define IDX_NAMES       (256u << 10)
++#define PRELOAD_MAX     (96ull << 20)           /* modem_a: image/modem_pr 34.4 MB + wlanmdsp.mbn 4.1 MB */
++
++struct mfw_node {
++	uint32_t parent;                        /* node index; node 0 is the root directory */
++	uint32_t name;                          /* offset in fidx.names */
++	uint32_t first, size;
++	bool dir;
++	uint8_t *ram;                           /* the whole file once preloaded */
++};
++
++static struct {
++	bool built;
++	struct mfw_node *n;
++	uint32_t count;
++	char *names;
++	uint32_t names_used;
++	uint64_t ram_bytes;
++} fidx;
++
++static uint8_t idx_empty[1];                    /* the RAM copy of a zero-byte file */
++
++struct idx_ctx {
++	uint32_t parent;
++	bool full;
++};
++
++static int
++idx_cb(void *ctx, const char *name, const struct mfw_ent *e)
++{
++	struct idx_ctx *c = ctx;
++	uint32_t l = (uint32_t)strlen(name) + 1;
++	struct mfw_node *n;
++
++	if (fidx.count >= IDX_MAX_NODES || fidx.names_used + l > IDX_NAMES) {
++		c->full = true;
++		return 1;
++	}
++	n = &fidx.n[fidx.count++];
++	n->parent = c->parent;
++	n->name = fidx.names_used;
++	n->first = e->first;
++	n->size = e->dir ? 0 : e->size;
++	n->dir = e->dir;
++	n->ram = NULL;
++	memcpy(fidx.names + fidx.names_used, name, l);
++	fidx.names_used += l;
++	return 0;
++}
++
++static void
++idx_free(void)
++{
++	if (fidx.n) {
++		kfree_data(fidx.n, IDX_MAX_NODES * sizeof(struct mfw_node));
++	}
++	if (fidx.names) {
++		kfree_data(fidx.names, IDX_NAMES);
++	}
++	bzero(&fidx, sizeof(fidx));
++}
++
++int
++mfw_index(void)
++{
++	if (fidx.built) {
++		return 0;
++	}
++	if (!fat.mounted) {
++		return ENXIO;
++	}
++	fidx.n = kalloc_data(IDX_MAX_NODES * sizeof(struct mfw_node), Z_WAITOK | Z_ZERO);
++	fidx.names = kalloc_data(IDX_NAMES, Z_WAITOK | Z_ZERO);
++	if (!fidx.n || !fidx.names) {
++		idx_free();
++		return ENOMEM;
++	}
++	fidx.n[0].dir = true;                    /* the root; its name is "" at offset 0 */
++	fidx.names_used = 1;
++	fidx.count = 1;
++	/* breadth first with the node array as the queue: walks never nest (they share fat.dirbuf) */
++	for (uint32_t i = 0; i < fidx.count; i++) {
++		struct idx_ctx c = { i, false };
++		int rc;
++
++		if (!fidx.n[i].dir || (i != 0 && fidx.n[i].first < 2)) {
++			continue;                       /* a file, or an empty directory */
++		}
++		rc = mfw_walk(i == 0 ? 0 : fidx.n[i].first, idx_cb, &c);
++		if (c.full) {
++			MLOG("step W6 index: more than %u entries or %u name bytes; index not used", IDX_MAX_NODES, IDX_NAMES);
++			idx_free();
++			return ENOSPC;
++		}
++		if (rc > 1) {
++			idx_free();
++			return rc & 0xffff;
++		}
++	}
++	fidx.built = true;
++	return 0;
++}
++
++uint32_t
++mfw_index_entries(void)
++{
++	return fidx.built ? fidx.count - 1 : 0;
++}
++
++static int
++idx_lookup(const char *path, uint32_t *out)
++{
++	uint32_t cur = 0;
++	char comp[64];
++
++	while (*path == '/') {
++		path++;
++	}
++	while (*path) {
++		size_t n = 0;
++		uint32_t found = 0;
++
++		while (path[n] && path[n] != '/') {
++			n++;
++		}
++		if (n == 0 || n >= sizeof(comp) || !fidx.n[cur].dir) {
++			return ENOENT;
++		}
++		memcpy(comp, path, n);
++		comp[n] = 0;
++		/* first match in directory order, as the on-disk walk */
++		for (uint32_t i = 1; i < fidx.count; i++) {
++			if (fidx.n[i].parent == cur && name_eq(fidx.names + fidx.n[i].name, comp)) {
++				found = i;
++				break;
++			}
++		}
++		if (found == 0) {
++			return ENOENT;
++		}
++		cur = found;
++		path += n;
++		while (*path == '/') {
++			path++;
++		}
++	}
++	*out = cur;
++	return 0;
++}
++
++static bool
++idx_under(uint32_t i, uint32_t top)
++{
++	for (uint32_t hops = 0; hops < IDX_MAX_NODES; hops++) {
++		if (i == top) {
++			return true;
++		}
++		if (i == 0) {
++			return false;
++		}
++		i = fidx.n[i].parent;
++	}
++	return false;
++}
++
++int
++mfw_preload(const char *path, uint32_t *files, uint64_t *bytes)
++{
++	uint32_t top;
++	int error;
++
++	if (!fidx.built) {
++		return ENXIO;
++	}
++	if ((error = idx_lookup(path, &top)) != 0) {
++		return error;
++	}
++	for (uint32_t i = 1; i < fidx.count; i++) {
++		struct mfw_node *n = &fidx.n[i];
++		uint8_t *d;
++
++		if (n->dir || n->ram != NULL || !idx_under(i, top)) {
++			continue;
++		}
++		if (fidx.ram_bytes + n->size > PRELOAD_MAX) {
++			MLOG("step W6 preload: %s would pass %llu MB; stopped", fidx.names + n->name, PRELOAD_MAX >> 20);
++			return EFBIG;
++		}
++		if (n->size == 0) {
++			d = idx_empty;
++		} else {
++			struct mfw_file f = { .first = n->first, .size = n->size, .cur_idx = 0, .cur_cl = n->first, .ram = NULL };
++			d = kalloc_data(n->size, Z_WAITOK);
++			if (d == NULL) {
++				return ENOMEM;
++			}
++			if ((error = mfw_read(&f, 0, d, n->size)) != 0) {
++				MLOG("step W6 preload: reading %s (%u B) failed: %d", fidx.names + n->name, n->size, error);
++				kfree_data(d, n->size);
++				return error;
++			}
++		}
++		n->ram = d;
++		fidx.ram_bytes += n->size;
++		(*files)++;
++		*bytes += n->size;
++	}
++	return 0;
++}
++
+ /* "image/modem.mdt" -> file (or directory, size 0) */
+ static int
+ mfw_lookup_ent(const char *path, struct mfw_ent *out)
+@@ -408,9 +624,19 @@ int
+ mfw_lookup(const char *path, struct mfw_file *f)
+ {
+ 	struct mfw_ent e;
+-	int error = mfw_lookup_ent(path, &e);
++	const uint8_t *ram = NULL;
++	int error;
+ 
+-	if (error) {
++	if (fidx.built) {
++		uint32_t i;
++		if ((error = idx_lookup(path, &i)) != 0) {
++			return error;
++		}
++		e.first = fidx.n[i].first;
++		e.size = fidx.n[i].size;
++		e.dir = fidx.n[i].dir;
++		ram = fidx.n[i].ram;
++	} else if ((error = mfw_lookup_ent(path, &e)) != 0) {
+ 		return error;
+ 	}
+ 	if (e.dir) {
+@@ -420,6 +646,7 @@ mfw_lookup(const char *path, struct mfw_file *f)
+ 	f->size = e.size;
+ 	f->cur_idx = 0;
+ 	f->cur_cl = e.first;
++	f->ram = ram;
+ 	return 0;
+ }
+ 
+@@ -453,6 +680,10 @@ mfw_read(struct mfw_file *f, uint64_t off, void *dst, uint32_t len)
+ 	if (off > f->size || len > f->size - off) {
+ 		return EINVAL;
+ 	}
++	if (f->ram != NULL) {
++		memcpy(dst, f->ram + off, len);
++		return 0;
++	}
+ 	while (done < len) {
+ 		uint64_t pos = off + done;
+ 		uint32_t idx = (uint32_t)(pos / fat.csize), in = (uint32_t)(pos % fat.csize);
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index d5c3120..8755401 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -26,6 +26,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
+ #include <dev/sweet_modem.h>
+ #include <arm/memory_types.h>
+ #include <vm/pmap.h>                     /* VM_MEM_* behind VM_WIMG_WCOMB, as sweet_modem.c */
+@@ -42,6 +43,12 @@ extern int scnprintf(char *, size_t, const char *, ...) __printflike(3, 4);
+ 
+ static uint32_t s_ms;
+ static unsigned pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err;
++static unsigned tftp_not_ram;
++/*
++ * sweetwifitftp (0170): 1 (default) = tftp serves only files preloaded into RAM before the modem starts, so
++ * UFS stays idle on the modem thread while the modem runs; 0 = read modem_a on demand (0169 behaviour).
++ */
++static uint32_t tftp_ram = 1;
+ 
+ /* ---------------------------------------------------------------- QMI encoding */
+ 
+@@ -438,6 +445,14 @@ tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 			tftp_close(s);
+ 			return;
+ 		}
++		if (tftp_ram && s->f.ram == NULL) {
++			tftp_not_ram++;
++			MLOG("step W6 t=%u ms: tftp RRQ %s: on %s but not preloaded; refused (UFS stays idle)", s_ms, path,
++			    mfw_part());
++			tftp_error(s, 1, "file not found");
++			tftp_close(s);
++			return;
++		}
+ 		s->fat = true;
+ 		s->size = s->f.size;
+ 		MLOG("step W6 t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", s_ms, path, s->seek, s->rsize,
+@@ -758,6 +773,44 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 	return false;
+ }
+ 
++/* what the modem fetched over tftp on 0169 (logs/phone/20261120-wifi-0169): all of it lives under these */
++static const char *const preload_paths[] = {
++	"image/modem_pr",                       /* so/, mcfg/ (carrier configs): 34.4 MB on the modem_a backup */
++	"image/wlanmdsp.mbn",                   /* the WLAN PD firmware, 4.1 MB */
++};
++
++void
++msvc_prepare(void)
++{
++	uint64_t t0 = sweet_modem_ms(), bytes = 0;
++	uint32_t files = 0;
++	int error;
++
++	PE_parse_boot_argn("sweetwifitftp", &tftp_ram, sizeof(tftp_ram));
++	if (tftp_ram == 0) {
++		MLOG("step W6 tftp: sweetwifitftp=0: files read from %s on demand (0169 behaviour)", mfw_part());
++		return;
++	}
++	if ((error = mfw_index()) != 0) {
++		MLOG("step W6 tftp: index of %s failed (%d); reading on demand instead", mfw_part(), error);
++		tftp_ram = 0;
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(preload_paths) / sizeof(preload_paths[0]); i++) {
++		error = mfw_preload(preload_paths[i], &files, &bytes);
++		if (error == ENOENT) {
++			MLOG("step W6 tftp: %s is not on %s", preload_paths[i], mfw_part());
++		} else if (error != 0) {
++			MLOG("step W6 tftp: preload of %s failed (%d); reading on demand instead", preload_paths[i], error);
++			tftp_ram = 0;
++			return;
++		}
++	}
++	MLOG("step W6 tftp: %s indexed (%u entries), %u files / %llu bytes preloaded in %llu ms; "
++	    "tftp will not touch UFS while the modem runs", mfw_part(), mfw_index_entries(), files, bytes,
++	    sweet_modem_ms() - t0);
++}
++
+ void
+ msvc_init(void)
+ {
+@@ -768,8 +821,9 @@ msvc_init(void)
+ void
+ msvc_summary(void)
+ {
+-	MLOG("step W6 services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes kept in RAM); rmtfs reads %u, "
+-	    "writes %u (dropped, never written to the phone), errors %u, buffer %#llx",
+-	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err, rmtfs_pa);
++	MLOG("step W6 services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u not preloaded, %u writes kept in RAM, "
++	    "%s); rmtfs reads %u, writes %u (dropped, never written to the phone), errors %u, buffer %#llx",
++	    pd_reqs, tftp_reqs, tftp_missing, tftp_not_ram, tftp_writes, tftp_ram ? "from RAM" : "from UFS",
++	    rmtfs_reads, rmtfs_writes, rmtfs_err, rmtfs_pa);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7f920ea..0a48205 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -63,6 +63,13 @@ extern void sweet_gpu_init(void);
+ #define REG_IE          0x24
+ #define REG_HCS         0x30
+ #define REG_HCE         0x34
++/* UIC error codes, read-to-clear (UFSHCI JESD223 register map, = Linux ufshci.h REG_UIC_ERROR_CODE_*;
++ * not checked against a local copy): PHY adapter, data link, network, transport, DME */
++#define REG_UECPA       0x38
++#define REG_UECDL       0x3c
++#define REG_UECN        0x40
++#define REG_UECT        0x44
++#define REG_UECDME      0x48
+ #define REG_UTRLBA      0x50
+ #define REG_UTRLBAU     0x54
+ #define REG_UTRLDBR     0x58
+@@ -299,9 +306,13 @@ again:
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			uint32_t is = ufs_rd(REG_IS), hcs = ufs_rd(REG_HCS);
++			/* 0169 + modem: is 0x4 (UIC error) at the first timeout; say which layer (0170) */
++			uint32_t pa = ufs_rd(REG_UECPA), dl = ufs_rd(REG_UECDL), nl = ufs_rd(REG_UECN);
++			uint32_t tl = ufs_rd(REG_UECT), dme = ufs_rd(REG_UECDME);
+ 			ufs_retire();
+ 			printf("SWEET UFS: command 0x%02x timed out: is 0x%x hcs 0x%x"
+-			    " attempt %u\n", cdb[0], is, hcs, attempt);
++			    " attempt %u uic pa 0x%x dl 0x%x n 0x%x t 0x%x dme 0x%x\n", cdb[0], is, hcs, attempt,
++			    pa, dl, nl, tl, dme);
+ 			if (attempt++ < UFS_RETRIES) {
+ 				goto again;
+ 			}
