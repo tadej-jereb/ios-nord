@@ -166,3 +166,4 @@ apply 0170-avicii-wifi-w6-tftp-from-ram-ufs-uic-diag.patch
 apply 0171-avicii-wifi-w7-wlfw-client.patch
 apply 0172-avicii-wifi-w7-vendor-flow-rails-ramdump.patch
 apply 0173-avicii-wifi-w7-rails-first-serve-session.patch
+apply 0174-avicii-wifi-w7-cx-mx-voltage-arg.patch

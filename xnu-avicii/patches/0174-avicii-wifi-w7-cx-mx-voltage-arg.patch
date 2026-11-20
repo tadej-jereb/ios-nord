@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index 81b9d3c..139f900 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -914,13 +914,19 @@ static struct mfw_file w_bdf;
+ static const char *w_step = "WLFW not seen";
+ static uint32_t w_flow, w_rails = 1, w_max_restarts = 3;   /* sweetwlfw, sweetwlfwrails, sweetwlfwrestarts */
+ static uint32_t w_assign;                                  /* sweetwlfwassign (0173) */
++/*
++ * sweetwlfwcxmv (0174): the vdd-cx-mx (L1A) vote. Default 352 mV = stock (no voltage set, init-voltage). 0172 got
++ * no FW_READY and no pin-connect result with it; Bergamota's WCN3990 ran at 0.8 V and icnss.c:118's table default
++ * is 752 mV (L1A range 352..952 mV, lito-regulators.dtsi:101-107). Clamped to that range.
++ */
++static uint32_t w_cx_mv = 352;
+ static bool w_rails_done, w_gave_up;
+ 
+ /* icnss_hw_power_on() for avicii: see the 0172 notes above for every value */
+ static void
+ w_rails_on(void)
+ {
+-	static const struct { const char *res, *name; unsigned mv; } r[] = {
++	struct { const char *res, *name; unsigned mv; } r[] = {
+ 		{ "ldoa1",  "vdd-cx-mx (L1A)",    352 },
+ 		{ "ldoa14", "vdd-1.8-xo (L14A)",  1800 },
+ 		{ "ldoc2",  "vdd-1.3-rfa (L2C)",  1304 },
+@@ -934,6 +940,7 @@ w_rails_on(void)
+ 		return;
+ 	}
+ 	w_rails_done = true;
++	r[0].mv = MAX(352u, MIN(w_cx_mv, 952u));
+ 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
+ 		int error = EBUSY;
+ 		for (unsigned t = 0; t < 20 && error == EBUSY; t++) {
+@@ -1497,6 +1504,7 @@ msvc_init(void)
+ 		PE_parse_boot_argn("sweetwlfwrails", &w_rails, sizeof(w_rails));
+ 		PE_parse_boot_argn("sweetwlfwrestarts", &w_max_restarts, sizeof(w_max_restarts));
+ 		PE_parse_boot_argn("sweetwlfwassign", &w_assign, sizeof(w_assign));
++		PE_parse_boot_argn("sweetwlfwcxmv", &w_cx_mv, sizeof(w_cx_mv));
+ 		MLOG("step W7: WLFW client, %s flow, rails %s, MSA assign %s, at most %u WLAN PD restarts",
+ 		    w_flow ? "ath10k/topaz" : "vendor icnss", !w_rails ? "off" : w_flow ? "on at WLFW arrival" :
+ 		    "on after CAP", w_flow && w_assign ? "on" : "off", w_max_restarts);
