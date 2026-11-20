@@ -1,0 +1,166 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index 0c711d6..fa7eb50 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -315,13 +315,43 @@ modem_wait_ready(void)
+  * modem over the same QRTR; PASS = the modem announces WLFW (QMI 0x45). The fatal bit is checked every 100 ms.
+  * W7 (sweetwifi>=7): our WLFW client (sweet_modem_svc.c) runs the handshake; PASS = the FW_READY indication.
+  */
++/* the verdicts at the end of the W5/W6/W7 window */
++static void
++w5_window_end(uint32_t limit, bool wlfw, bool fw_ready)
++{
++	glink_summary();
++	if (glink_ready()) {
++		MLOG("step W5 PASS: GLINK IPCRTR up, QRTR HELLO from node %u, services listed", qrtr_modem_node);
++	} else {
++		MLOG("step W5 FAIL: no complete GLINK/QRTR handshake (see summary)");
++	}
++	if (sweet_modem_level >= 6) {
++		msvc_summary();
++		if (wlfw) {
++			MLOG("step W6 end of the %u s window (PASS line above)", limit / 1000);
++		} else {
++			MLOG("step W6 FAIL: no WLFW in %u s (see the services summary)", limit / 1000);
++		}
++	}
++	if (sweet_modem_level >= 7 && !fw_ready) {
++		MLOG("step W7 FAIL: no FW_READY in %u s, stopped at: %s", limit / 1000, msvc_wlfw_step());
++	}
++}
++
++/*
++ * 0173: at level >= 7 the modem is served for the whole session (sweetwifiserve=1, default there; topaz 0122
++ * modem_watch=0): after the window nothing answered the modem any more (0172: no FW_READY in 60 s). The window
++ * verdicts are still printed at its end; a late FW_READY prints its PASS line when it comes.
++ */
+ static void
+ rung_w5(void)
+ {
+ 	uint64_t t0;
+ 	uint32_t ms = 0, last_check = 0, state, limit = sweet_modem_level >= 6 ? 60000 : 30000;
+-	bool summarized = false, wlfw = false, fw_ready = false;
++	uint32_t serve = sweet_modem_level >= 7 ? 1 : 0, next_summary = 300000;
++	bool summarized = false, wlfw = false, fw_ready = false, ended = false;
+ 
++	PE_parse_boot_argn("sweetwifiserve", &serve, sizeof(serve));
+ 	if (sweet_modem_level >= 6) {
+ 		msvc_init();
+ 	}
+@@ -329,7 +359,7 @@ rung_w5(void)
+ 		return;
+ 	}
+ 	t0 = sweet_modem_ms();
+-	while (ms < limit) {
++	for (;;) {
+ 		glink_poll(ms);
+ 		if (ms - last_check >= 100) {
+ 			last_check = ms;
+@@ -365,25 +395,21 @@ rung_w5(void)
+ 			}
+ 			summarized = true;
+ 		}
+-		sweet_modem_sleep_ms(1);
+-		ms = (uint32_t)(sweet_modem_ms() - t0);
+-	}
+-	glink_summary();
+-	if (glink_ready()) {
+-		MLOG("step W5 PASS: GLINK IPCRTR up, QRTR HELLO from node %u, services listed", qrtr_modem_node);
+-	} else {
+-		MLOG("step W5 FAIL: no complete GLINK/QRTR handshake (see summary)");
+-	}
+-	if (sweet_modem_level >= 6) {
+-		msvc_summary();
+-		if (wlfw) {
+-			MLOG("step W6 end of the %u s window (PASS line above)", limit / 1000);
+-		} else {
+-			MLOG("step W6 FAIL: no WLFW in %u s (see the services summary)", limit / 1000);
++		if (!ended && ms >= limit) {
++			ended = true;
++			w5_window_end(limit, wlfw, fw_ready);
++			if (!serve) {
++				return;
++			}
++			MLOG("step W5: window over; still serving the modem (sweetwifiserve=1)");
+ 		}
+-	}
+-	if (sweet_modem_level >= 7 && !fw_ready) {
+-		MLOG("step W7 FAIL: no FW_READY in %u s, stopped at: %s", limit / 1000, msvc_wlfw_step());
++		if (ended && ms >= next_summary) {
++			next_summary += 300000;
++			glink_summary();
++			msvc_summary();
++		}
++		sweet_modem_sleep_ms(ended ? 2 : 1);
++		ms = (uint32_t)(sweet_modem_ms() - t0);
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index f91df29..81b9d3c 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -874,6 +874,13 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+  *  - DYNAMIC_FEATURE_MASK 0x3B, TLV 0x10 u64 = 0x01 (icnss.c:61,72; icnss_qmi.c:938-985);
+  *  - a REJUVENATE indication (0x39) is answered with REJUVENATE_ACK (0x3A, no TLVs; icnss_qmi.c:869-903).
+  * After sweetwlfwrestarts (default 3) WLAN PD restarts we stop answering WLFW, so a crash loop cannot run on.
++ *
++ * 0173, after 0172 on the phone (logs/phone/20261120-wifi-0172): the vendor order + rails gave no crash but no
++ * FW_READY in 60 s. Bergamota reached FW READY on the same chip (WCN3990, bdwlan.bin 26328 B, board 0xff) with the
++ * rails voted BEFORE the handshake and the ath10k order with BDF + cal_report (refs/bergamota/WIFI_IOS26.md:812-875).
++ * 0171 ran that order with the chip unpowered and the PD crashed right after cal_report. So sweetwlfw=1 now votes
++ * the rails when WLFW arrives, and the MSA hyp-assign (refused on avicii, -2/0x56; stock never does it) is off
++ * unless sweetwlfwassign=1.
+  */
+ #define PORT_WLFWC          0x4004u             /* our QMI client port towards WLFW */
+ #define QMI_IND             4
+@@ -906,6 +913,7 @@ static uint64_t w_cap_retry_ms;
+ static struct mfw_file w_bdf;
+ static const char *w_step = "WLFW not seen";
+ static uint32_t w_flow, w_rails = 1, w_max_restarts = 3;   /* sweetwlfw, sweetwlfwrails, sweetwlfwrestarts */
++static uint32_t w_assign;                                  /* sweetwlfwassign (0173) */
+ static bool w_rails_done, w_gave_up;
+ 
+ /* icnss_hw_power_on() for avicii: see the 0172 notes above for every value */
+@@ -1143,7 +1151,8 @@ w_on_msa_info(const uint8_t *d, uint32_t len, bool assign)
+ 	const uint8_t *v = qm_find(d, len, 0x03, &l);
+ 	uint32_t n = (v != NULL && l >= 1) ? v[0] : 0;
+ 
+-	MLOG("step W7: %u MSA region(s)%s", n, assign ? "" : "; not assigned (no qcom,hyp_enabled, icnss.c:185)");
++	MLOG("step W7: %u MSA region(s)%s", n, assign ? "" : "; not assigned (no qcom,hyp_enabled, icnss.c:185; "
++	    "sweetwlfwassign=1 to try)");
+ 	if (assign) {
+ 		sweet_modem_sleep_ms(20);               /* ath10k: give the modem time before the XPU update */
+ 	}
+@@ -1195,6 +1204,9 @@ wlfw_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port)
+ 	}
+ 	w_node = node;
+ 	w_port = port;
++	if (w_flow != 0) {
++		w_rails_on();                           /* 0173: before the handshake, as Bergamota */
++	}
+ 	MLOG("step W7 t=%u ms: WLFW inst %#x node %u port %#x: ind_register (%s flow)", s_ms, inst, node, port,
+ 	    w_flow ? "ath10k/topaz" : "vendor icnss");
+ 	if (wm_new(&m, WLFW_IND_REGISTER)) {
+@@ -1284,7 +1296,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 	case WLFW_MSA_INFO:
+ 		MLOG("step W7 t=%u ms: msa_info %s err %u", s_ms, ok ? "ok" : "FAILED", err);
+ 		if (ok) {
+-			w_on_msa_info(d, len, w_flow != 0);
++			w_on_msa_info(d, len, w_flow != 0 && w_assign != 0);
+ 			w_simple(WLFW_MSA_READY, "msa_ready sent");
+ 		} else {
+ 			w_step = "msa_info FAILED";
+@@ -1484,8 +1496,10 @@ msvc_init(void)
+ 		PE_parse_boot_argn("sweetwlfw", &w_flow, sizeof(w_flow));
+ 		PE_parse_boot_argn("sweetwlfwrails", &w_rails, sizeof(w_rails));
+ 		PE_parse_boot_argn("sweetwlfwrestarts", &w_max_restarts, sizeof(w_max_restarts));
+-		MLOG("step W7: WLFW client, %s flow, rails %s, at most %u WLAN PD restarts", w_flow ? "ath10k/topaz" :
+-		    "vendor icnss", w_rails ? "on after CAP" : "off", w_max_restarts);
++		PE_parse_boot_argn("sweetwlfwassign", &w_assign, sizeof(w_assign));
++		MLOG("step W7: WLFW client, %s flow, rails %s, MSA assign %s, at most %u WLAN PD restarts",
++		    w_flow ? "ath10k/topaz" : "vendor icnss", !w_rails ? "off" : w_flow ? "on at WLFW arrival" :
++		    "on after CAP", w_flow && w_assign ? "on" : "off", w_max_restarts);
+ 		qrtr_server_hook = wlfw_server;
+ 	}
+ }
