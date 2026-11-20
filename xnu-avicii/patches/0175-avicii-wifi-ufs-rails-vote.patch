@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+index fa7eb50..d15923f 100644
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -413,6 +413,44 @@ rung_w5(void)
+ 	}
+ }
+ 
++/*
++ * 0175: our own RPMh votes for the UFS rails before the modem starts (sweetufsrails=1, default). On 0169, 0170 and
++ * 0173 the UFS link dropped (UIC PA lane + DL PA_INIT errors) right after the modem finished its carrier-config
++ * walk, ~21-28 s after READY. Linux's ufshcd/PHY drivers vote these rails; ours never did, so UFS ran on whatever
++ * was left from the bootloader. Hypothesis (UNVERIFIED): the modem votes a shared rail and later drops it; with no
++ * apps vote RPMh then turns it off. Values from the live FDT ufshc@1d84000 (logs/dumps/run-20261112-195027):
++ * vcc = pm8150a_l7 "ldoc7" at vcc-voltage-level min 2950 mV; vdda-pll / vddp-ref-clk = pm8150_l9 "ldoa9" at
++ * qcom,vddp-ref-clk-max-uV 1200 mV. vccq2 = pm8150_s4 (smpa4, voted by touch) and vdda-phy = pm8150_l5 (ldoa5,
++ * voted 880 mV by the USB PHY) already have our votes.
++ */
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++static void
++ufs_rails_vote(void)
++{
++	static const struct { const char *res, *what; unsigned mv; } r[] = {
++		{ "ldoc7", "UFS vcc (L7C)", 2950 },
++		{ "ldoa9", "UFS vdda-pll/ref-clk (L9A)", 1200 },
++	};
++	uint32_t on = 1;
++
++	PE_parse_boot_argn("sweetufsrails", &on, sizeof(on));
++	if (!on) {
++		MLOG("step W4 ufs rails: sweetufsrails=0, not voted");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		int error = EBUSY;
++		for (unsigned t = 0; t < 20 && error == EBUSY; t++) {
++			error = sweet_rpmh_vreg_enable(r[i].res, r[i].mv);
++			if (error == EBUSY) {
++				sweet_modem_sleep_ms(1);
++			}
++		}
++		MLOG("step W4 ufs rails: %s %s %u mV: %s (%d)", r[i].what, r[i].res, r[i].mv, error ? "FAILED" : "on", error);
++	}
++}
++
+ /* PIL service and argument descriptors follow the Qualcomm SCM PAS ABI. */
+ static void
+ rung_w3(void)
+@@ -466,6 +504,7 @@ rung_w3(void)
+ 			if (sweet_modem_level >= 6) {
+ 				msvc_prepare();         /* tftp files into RAM while the modem is still off */
+ 			}
++			ufs_rails_vote();
+ 			sweet_smem_mpss_diag("before start");
+ 			MLOG("step W4 auth_and_reset: starting stock MPSS firmware");
+ 			status = sweet_modem_scm(SCM_FN(2, 5), 1, MODEM_PAS_ID, 0, 0, 0, &result);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index f9d65a3..92f8eec 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -418,6 +418,16 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 			printf("SWEET RPMH: %s expects %u..%u mV\n", res, lo, hi);
+ 			return EINVAL;
+ 		}
++	} else if (!strcmp(res, "ldoc7") || !strcmp(res, "ldoa9")) {
++		/*
++		 * avicii UFS (live FDT ufshc@1d84000, 0175): vcc = pm8150a_l7 "ldoc7" 2700..3304 mV, vcc-voltage-level
++		 * 2950..2960 mV; vdda-pll + vddp-ref-clk = pm8150_l9 "ldoa9" 1152..1320 mV, ref-clk 1152..1200 mV.
++		 */
++		unsigned lo = res[3] == 'c' ? 2700 : 1152, hi = res[3] == 'c' ? 3304 : 1320;
++		if (mv < lo || mv > hi) {
++			printf("SWEET RPMH: %s expects %u..%u mV\n", res, lo, hi);
++			return EINVAL;
++		}
+ 	} else if (!strcmp(res, "ldoa1") || !strcmp(res, "ldoa14") || !strcmp(res, "ldoc2") ||
+ 	    !strcmp(res, "ldoc10")) {
+ 		/*
