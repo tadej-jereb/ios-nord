@@ -168,3 +168,4 @@ apply 0172-avicii-wifi-w7-vendor-flow-rails-ramdump.patch
 apply 0173-avicii-wifi-w7-rails-first-serve-session.patch
 apply 0174-avicii-wifi-w7-cx-mx-voltage-arg.patch
 apply 0175-avicii-wifi-ufs-rails-vote.patch
+apply 0176-avicii-ufs-fail-fast-when-gone.patch

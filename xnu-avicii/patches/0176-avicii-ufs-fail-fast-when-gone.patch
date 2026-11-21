@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0a48205..2fcec36 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -127,6 +127,14 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	/*
++	 * 0176: the device is gone (BUG_AUDIT F-REC-01/02). Once set, every command fails at once with
++	 * ENXIO instead of four 5 s timeouts under the disk mutex. This driver cannot restart the link
++	 * (no UIC/PHY code), so it is never cleared. boot-arg sweetufsgone=0 keeps the old retry-forever.
++	 */
++	bool gone;
++	bool gone_check;                        /* boot-arg sweetufsgone, default 1 */
++	uint32_t timeouts_in_row;               /* commands that ran out of timeout retries, back to back */
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -175,6 +183,18 @@ ufs_retire(void)
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+ }
+ 
++/* 0176: called with sweet_ufs_lock held (every ufs_scsi caller holds it). Logs once. */
++static void
++ufs_mark_gone(const char *why, uint32_t hcs)
++{
++	if (su.gone) {
++		return;
++	}
++	su.gone = true;
++	printf("SWEET UFS: device gone (%s, hcs 0x%x): every later command fails with ENXIO;"
++	    " boot-arg sweetufsgone=0 keeps retrying\n", why, hcs);
++}
++
+ /* Response UPIU: response at 6, status at 7, residual at 12, fixed sense at 34. */
+ #define UPIU_STATUS_CHECK       0x02
+ #define UPIU_STATUS_BUSY        0x08
+@@ -237,6 +257,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+ 	unsigned attempt = 0;
+ 
++	if (su.gone) {
++		return ENXIO;
++	}
+ again:
+ 	assert(len <= BOUNCE_SIZE);
+ 	bzero(utrd, sizeof(*utrd));
+@@ -313,9 +336,25 @@ again:
+ 			printf("SWEET UFS: command 0x%02x timed out: is 0x%x hcs 0x%x"
+ 			    " attempt %u uic pa 0x%x dl 0x%x n 0x%x t 0x%x dme 0x%x\n", cdb[0], is, hcs, attempt,
+ 			    pa, dl, nl, tl, dme);
++			/*
++			 * 0176: the 0169/0170 logs show hcs 0x10f -> 0x108 at the link drop (device present
++			 * and list ready both gone), then 84 identical timeouts. A doorbell rung with DP or
++			 * UTRLRDY clear is never answered, and the slot staying busy after retire is the same.
++			 */
++			bool link_gone = (hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY) ||
++			    (ufs_rd(REG_UTRLDBR) & 1);
++			if (su.gone_check && link_gone) {
++				ufs_mark_gone("link down at timeout", hcs);
++				return ENXIO;
++			}
+ 			if (attempt++ < UFS_RETRIES) {
+ 				goto again;
+ 			}
++			/* Link looks up but nothing answers: two such commands in a row is a dead device. */
++			if (su.gone_check && ++su.timeouts_in_row >= 2) {
++				ufs_mark_gone("two commands timed out in a row", hcs);
++				return ENXIO;
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -331,6 +370,7 @@ again:
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	su.timeouts_in_row = 0;                 /* the device answered, whatever it said */
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -1047,6 +1087,9 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufssync", &syncwrites, sizeof(syncwrites));
+ 	su.fua = (fua == 1);
+ 	su.syncwrites = (syncwrites == 1);
++	uint32_t gone_check = 1;
++	PE_parse_boot_argn("sweetufsgone", &gone_check, sizeof(gone_check));
++	su.gone_check = (gone_check != 0);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -1310,6 +1353,7 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
++	uint32_t fails = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+@@ -1347,10 +1391,22 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			error = ufs_sync_cache();
+ 		}
+ 		lck_mtx_unlock(&sweet_ufs_lock);
++		/*
++		 * 0176: one failed write used to end the thread for the boot (BUG_AUDIT F-REC-04). Retry on
++		 * the next period (pos restarts from flushed, so nothing is skipped); stop only when the
++		 * device is gone, since then every write fails at once anyway.
++		 */
+ 		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
++			if (su.gone) {
++				printf("SWEET LOG: write failed (%d), device gone, stopping\n", error);
++				return;
++			}
++			if (++fails == 1 || (fails % 10) == 0) {
++				printf("SWEET LOG: write failed (%d), %u in a row, retrying next period\n", error, fails);
++			}
++			continue;
+ 		}
++		fails = 0;
+ 		flushed = total;
+ 	}
+ }
+@@ -1373,7 +1429,12 @@ sweet_log_panic_flush(void)
+ 	    su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
++	if (su.gone) {
++		printf("SWEET LOG: panic flush skipped: UFS device gone\n");
++		return;
++	}
+ 	if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++		printf("SWEET LOG: panic flush skipped: UFS lock busy\n");
+ 		return;
+ 	}
+ 	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
