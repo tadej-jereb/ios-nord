@@ -1,0 +1,434 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2992684..9d1e743 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -130,11 +130,14 @@ static struct {
+ 	/*
+ 	 * 0176: the device is gone (BUG_AUDIT F-REC-01/02). Once set, every command fails at once with
+ 	 * ENXIO instead of four 5 s timeouts under the disk mutex. This driver cannot restart the link
+-	 * (no UIC/PHY code), so it is never cleared. boot-arg sweetufsgone=0 keeps the old retry-forever.
++	 * and it is never cleared. 0178 tries a link restart first (boot-arg sweetufsrestart=N) and only
++	 * marks the device gone once that fails or the N restarts are used. sweetufsgone=0 keeps the old retry-forever.
+ 	 */
+ 	bool gone;
+ 	bool gone_check;                        /* boot-arg sweetufsgone, default 1 */
+ 	uint32_t timeouts_in_row;               /* commands that ran out of timeout retries, back to back */
++	uint32_t restarts_left;                 /* 0178: boot-arg sweetufsrestart, link restarts still allowed */
++	uint32_t restarts_done;
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -203,6 +206,340 @@ ufs_mark_gone(const char *why, uint32_t hcs)
+ 	    " boot-arg sweetufsgone=0 keeps retrying\n", why, hcs);
+ }
+ 
++/*
++ * 0178: restart the link after it drops (boot-arg sweetufsrestart=N: at most N restarts per boot,
++ * default 0 = off, 0176/0177 behaviour). The W7 boots drop it with is 0x4 (UIC error), pa 0x80000011,
++ * dl 0x8000e003: dl bit 0x2000 is PA_INIT, which the vendor driver treats as fatal and answers with a
++ * host reset (ufshcd.c reset_and_restore). This is that reset, minus the parts we cannot do yet:
++ *
++ *   HCE 1 -> 0 -> 1 (UniPro stack reset), DME_LINKSTARTUP (lands in PWM-G1), back to the gear ABL left.
++ *
++ * No GCC block reset and no PHY calibration (the vendor runs both from hce_enable_notify): the QMP PHY
++ * keeps ABL's calibration, which only holds if the drop did not reset the PHY. No device reset and no
++ * NOP OUT / fDeviceInit: the device itself was not reset, the retried command proves the path.
++ *
++ * Nothing here is a number we chose. At take-over, while ABL's link works, ufs_link_snapshot() reads
++ * the DME attributes the vendor sets around link startup and power mode change, the Qualcomm host
++ * registers its cfg_timers path writes, and PA_PWRMODE. The restart puts back exactly those values.
++ *
++ * Register offsets, UIC opcodes and attribute IDs: vendor kernel LineageOS android_kernel_oneplus_sm7250
++ * @3b1173b, drivers/scsi/ufs/ufshci.h:72-75 (UIC regs), :140-175 (IS/HCS bits), :303-326 (MIB, opcodes),
++ * unipro.h:100-194 (PA_ and DME_ IDs), ufs-qcom.h:24-26,57-77,164-176 (vendor regs and VS attributes),
++ * ufshcd.c:230 (500 ms UIC timeout), :249 (3 link startup attempts), :5581-5689 (power mode sequence),
++ * :5845-5935 (HCE stop/start), ufs-qcom.c:619-728 (link startup hooks).
++ */
++#define REG_UIC_CMD             0x90
++#define REG_UIC_ARG1            0x94
++#define REG_UIC_ARG2            0x98
++#define REG_UIC_ARG3            0x9c
++#define HCS_UCRDY               (1u << 3)
++#define HCS_UPMCRS(h)           (((h) >> 8) & 7u)
++#define UPMCRS_PWR_LOCAL        1u
++#define IS_UE                   0x4u
++#define IS_UPMS                 0x10u
++#define IS_UCCS                 0x400u
++#define UIC_DME_GET             0x01u
++#define UIC_DME_SET             0x02u
++#define UIC_LINK_STARTUP        0x16u
++#define UIC_MIB(a)              ((uint32_t)(a) << 16)
++#define UIC_MIB_SEL(a, s)       (((uint32_t)(a) << 16) | ((uint32_t)(s) & 0xffffu))
++#define UIC_TIMEOUT_US          500000u
++#define LINK_STARTUP_TRIES      3u
++#define PA_PWRMODE              0x1571u
++#define MPHY_TX_FSM_STATE       0x41u
++#define TX_FSM_HIBERN8          1u
++
++/* Replayed after HCE enable, before DME_LINKSTARTUP (ufs_qcom_link_startup_pre_change). */
++static const struct ufs_attr {
++	uint16_t id;
++	const char *name;
++} ufs_pre_attrs[] = {
++	{ 0x155e, "PA_LOCAL_TX_LCC_ENABLE" },
++	{ 0xd002, "DME_VS_CORE_CLK_CTRL" },
++	{ 0x9000, "PA_VS_CONFIG_REG1" },
++	{ 0x9004, "PA_VS_CLK_CFG_REG" },
++	{ 0xa00b, "DL_VS_CLK_CFG" },
++},
++/* Replayed after link startup, before PA_PWRMODE (ufshcd_change_power_mode). */
++    ufs_pwr_attrs[] = {
++	{ 0x1583, "PA_RXGEAR" },
++	{ 0x1580, "PA_ACTIVERXDATALANES" },
++	{ 0x1584, "PA_RXTERMINATION" },
++	{ 0x1568, "PA_TXGEAR" },
++	{ 0x1560, "PA_ACTIVETXDATALANES" },
++	{ 0x1569, "PA_TXTERMINATION" },
++	{ 0x156a, "PA_HSSERIES" },
++	{ 0x15d3, "PA_PEERRXHSADAPTINITIAL" },
++	{ 0x15d4, "PA_TXHSADAPTTYPE" },
++	{ 0x15b0, "PA_PWRMODEUSERDATA0" },
++	{ 0x15b1, "PA_PWRMODEUSERDATA1" },
++	{ 0x15b2, "PA_PWRMODEUSERDATA2" },
++	{ 0x15b3, "PA_PWRMODEUSERDATA3" },
++	{ 0x15b4, "PA_PWRMODEUSERDATA4" },
++	{ 0x15b5, "PA_PWRMODEUSERDATA5" },
++	{ 0xd041, "DME_LocalFC0ProtectionTimeOutVal" },
++	{ 0xd042, "DME_LocalTC0ReplayTimeOutVal" },
++	{ 0xd043, "DME_LocalAFC0ReqTimeOutVal" },
++};
++/* Qualcomm host registers (SYS1CLK_1US, TX_SYMBOL_CLK_NS_US, RETRY_TIMER, PA_LINK_STARTUP_TIMER, CFG1, CFG2, AH8_CFG). */
++static const uint32_t ufs_vendor_regs[] = { 0xc0, 0xc4, 0xd0, 0xd8, 0xdc, 0xe0, 0xfc };
++
++#define N_PRE   (sizeof(ufs_pre_attrs) / sizeof(ufs_pre_attrs[0]))
++#define N_PWR   (sizeof(ufs_pwr_attrs) / sizeof(ufs_pwr_attrs[0]))
++#define N_VREG  (sizeof(ufs_vendor_regs) / sizeof(ufs_vendor_regs[0]))
++
++static struct {
++	uint32_t pre[N_PRE], pwr[N_PWR], vreg[N_VREG];
++	uint32_t pre_ok, pwr_ok;                /* bit i: attribute i was read at take-over */
++	uint32_t pwrmode;
++	uint32_t hce;
++} ufs_snap;
++
++/* One UIC command, polled. Returns 0, EBUSY (not ready), ETIMEDOUT or EIO (nonzero result). */
++static int
++ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
++{
++	unsigned i;
++
++	for (i = 0; i < UIC_TIMEOUT_US && !(ufs_rd(REG_HCS) & HCS_UCRDY); i++) {
++		delay(1);
++	}
++	if (!(ufs_rd(REG_HCS) & HCS_UCRDY)) {
++		return EBUSY;
++	}
++	ufs_wr(REG_IS, IS_UCCS | IS_UPMS);
++	ufs_wr(REG_UIC_ARG1, arg1);
++	ufs_wr(REG_UIC_ARG2, 0);
++	ufs_wr(REG_UIC_ARG3, arg3);
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UIC_CMD, cmd);
++	for (i = 0; i < UIC_TIMEOUT_US && !(ufs_rd(REG_IS) & IS_UCCS); i++) {
++		delay(1);
++	}
++	if (!(ufs_rd(REG_IS) & IS_UCCS)) {
++		return ETIMEDOUT;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	if (ufs_rd(REG_UIC_ARG2) & 0xff) {
++		return EIO;
++	}
++	if (out) {
++		*out = ufs_rd(REG_UIC_ARG3);
++	}
++	return 0;
++}
++
++static int
++ufs_dme_get(uint32_t mib, uint32_t *v)
++{
++	return ufs_uic(UIC_DME_GET, mib, 0, v);
++}
++
++static int
++ufs_dme_set(uint32_t mib, uint32_t v)
++{
++	return ufs_uic(UIC_DME_SET, mib, v, NULL);
++}
++
++/*
++ * Called once at take-over with the lock held, only when sweetufsrestart > 0. Read-only DME_GETs on
++ * ABL's working link. Without the gear attributes and PA_PWRMODE a restart could not get back to ABL's
++ * speed, so restarts are turned off then.
++ */
++static void
++ufs_link_snapshot(void)
++{
++	unsigned i;
++	int err;
++
++	ufs_snap.hce = ufs_rd(REG_HCE);
++	for (i = 0; i < N_VREG; i++) {
++		ufs_snap.vreg[i] = ufs_rd(ufs_vendor_regs[i]);
++	}
++	for (i = 0; i < N_PRE; i++) {
++		if (!ufs_dme_get(UIC_MIB(ufs_pre_attrs[i].id), &ufs_snap.pre[i])) {
++			ufs_snap.pre_ok |= 1u << i;
++		}
++	}
++	for (i = 0; i < N_PWR; i++) {
++		if (!ufs_dme_get(UIC_MIB(ufs_pwr_attrs[i].id), &ufs_snap.pwr[i])) {
++			ufs_snap.pwr_ok |= 1u << i;
++		}
++	}
++	err = ufs_dme_get(UIC_MIB(PA_PWRMODE), &ufs_snap.pwrmode);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	printf("SWEET UFS: link snapshot: hce 0x%x pwrmode 0x%x (err %d) rx gear %u lanes %u tx gear %u"
++	    " lanes %u series %u; read %u/%u pre, %u/%u power attributes\n", ufs_snap.hce, ufs_snap.pwrmode,
++	    err, ufs_snap.pwr[0], ufs_snap.pwr[1], ufs_snap.pwr[3], ufs_snap.pwr[4], ufs_snap.pwr[6],
++	    (unsigned)__builtin_popcount(ufs_snap.pre_ok), (unsigned)N_PRE,
++	    (unsigned)__builtin_popcount(ufs_snap.pwr_ok), (unsigned)N_PWR);
++	printf("SWEET UFS: link snapshot: vendor c0 0x%x c4 0x%x d0 0x%x d8 0x%x dc 0x%x e0 0x%x fc 0x%x\n",
++	    ufs_snap.vreg[0], ufs_snap.vreg[1], ufs_snap.vreg[2], ufs_snap.vreg[3], ufs_snap.vreg[4],
++	    ufs_snap.vreg[5], ufs_snap.vreg[6]);
++	/* gears, lanes, terminations, series (entries 0-6) are what the power mode change needs */
++	if (err || (ufs_snap.pwr_ok & 0x7f) != 0x7f) {
++		printf("SWEET UFS: link snapshot incomplete, link restart off\n");
++		su.restarts_left = 0;
++	}
++}
++
++/* Point the host at our request list and start it. Never ring a doorbell unless this returned 0. */
++static int
++ufs_start_list(void)
++{
++	uint64_t list = su.dma_pa + DMA_UTRL;
++
++	ufs_wr(REG_IE, 0);                      /* polled operation */
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	ufs_wr(REG_UTRLRSR, 0);
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(ufs_rd(REG_UTRLRSR) & 1)) {
++		printf("SWEET UFS: host did not take our request list\n");
++		return EIO;
++	}
++	return 0;
++}
++
++/* HCE 1 -> 0 -> 1, then put back the vendor registers and the pre-link attributes. */
++static int
++ufs_hce_cycle(void)
++{
++	unsigned i;
++	uint32_t v;
++	int err;
++
++	ufs_wr(REG_HCE, 0);
++	for (i = 0; i < 1000 && (ufs_rd(REG_HCE) & 1); i++) {
++		delay(10);
++	}
++	if (ufs_rd(REG_HCE) & 1) {
++		printf("SWEET UFS: restart: HCE did not clear\n");
++		return EIO;
++	}
++	ufs_wr(REG_HCE, 1);
++	delay(1000);                            /* HCE reads 1 -> 0 -> 1 while the host initialises */
++	for (i = 0; i < 100 && !(ufs_rd(REG_HCE) & 1); i++) {
++		delay(1000);
++	}
++	if (!(ufs_rd(REG_HCE) & 1)) {
++		printf("SWEET UFS: restart: HCE did not come back\n");
++		return EIO;
++	}
++	ufs_wr(REG_IE, 0);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	for (i = 0; i < N_VREG; i++) {
++		v = ufs_rd(ufs_vendor_regs[i]);
++		if (v != ufs_snap.vreg[i]) {
++			printf("SWEET UFS: restart: vendor 0x%x was 0x%x after HCE, back to 0x%x\n",
++			    ufs_vendor_regs[i], v, ufs_snap.vreg[i]);
++			ufs_wr(ufs_vendor_regs[i], ufs_snap.vreg[i]);
++		}
++	}
++	/* The vendor checks the PHY went DISABLED -> HIBERN8 here (ufs_qcom_check_hibern8); we log it. */
++	v = 0xff;
++	err = ufs_dme_get(UIC_MIB_SEL(MPHY_TX_FSM_STATE, 0), &v);
++	printf("SWEET UFS: restart: HCE back, tx fsm %u (err %d, %u = hibern8)\n", v, err, TX_FSM_HIBERN8);
++	for (i = 0; i < N_PRE; i++) {
++		if ((ufs_snap.pre_ok & (1u << i)) &&
++		    (err = ufs_dme_set(UIC_MIB(ufs_pre_attrs[i].id), ufs_snap.pre[i]))) {
++			printf("SWEET UFS: restart: set %s failed (%d)\n", ufs_pre_attrs[i].name, err);
++		}
++	}
++	return 0;
++}
++
++/* Called with sweet_ufs_lock held, slot 0 retired. Returns 0 with the link back at ABL's power mode. */
++static int
++ufs_link_restart(void)
++{
++	unsigned i, t;
++	uint32_t hcs = 0;
++	int err = EIO;
++
++	for (t = 0; t < LINK_STARTUP_TRIES; t++) {
++		if ((err = ufs_hce_cycle())) {
++			continue;
++		}
++		err = ufs_uic(UIC_LINK_STARTUP, 0, 0, NULL);
++		hcs = ufs_rd(REG_HCS);
++		printf("SWEET UFS: restart: link startup try %u: err %d hcs 0x%x is 0x%x pa 0x%x dl 0x%x\n",
++		    t + 1, err, hcs, ufs_rd(REG_IS), ufs_rd(REG_UECPA), ufs_rd(REG_UECDL));
++		if (!err && !(hcs & HCS_DP)) {
++			err = ENXIO;                    /* link up but no device: the vendor gives up here too */
++			break;
++		}
++		if (!err) {
++			break;
++		}
++	}
++	if (err) {
++		return err;
++	}
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++
++	/* PWM-G1 now; go back to ABL's mode (ufshcd_change_power_mode order). */
++	for (i = 0; i < N_PWR; i++) {
++		if ((ufs_snap.pwr_ok & (1u << i)) &&
++		    (err = ufs_dme_set(UIC_MIB(ufs_pwr_attrs[i].id), ufs_snap.pwr[i]))) {
++			printf("SWEET UFS: restart: set %s failed (%d)\n", ufs_pwr_attrs[i].name, err);
++		}
++	}
++	err = ufs_dme_set(UIC_MIB(PA_PWRMODE), ufs_snap.pwrmode);
++	for (i = 0; !err && i < UIC_TIMEOUT_US && !(ufs_rd(REG_IS) & IS_UPMS); i++) {
++		delay(1);
++	}
++	hcs = ufs_rd(REG_HCS);
++	if (!err && (!(ufs_rd(REG_IS) & IS_UPMS) || HCS_UPMCRS(hcs) != UPMCRS_PWR_LOCAL)) {
++		err = EIO;
++	}
++	printf("SWEET UFS: restart: power mode 0x%x: err %d is 0x%x upmcrs %u\n", ufs_snap.pwrmode, err,
++	    ufs_rd(REG_IS), HCS_UPMCRS(hcs));
++	if (err) {
++		return err;
++	}
++	if ((err = ufs_start_list())) {
++		return err;
++	}
++	hcs = ufs_rd(REG_HCS);
++	if ((hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY)) {
++		printf("SWEET UFS: restart: list not ready, hcs 0x%x\n", hcs);
++		return EIO;
++	}
++	/* Read-to-clear: start the next drop's report from zero. */
++	(void)ufs_rd(REG_UECPA);
++	(void)ufs_rd(REG_UECDL);
++	(void)ufs_rd(REG_UECN);
++	(void)ufs_rd(REG_UECT);
++	(void)ufs_rd(REG_UECDME);
++	return 0;
++}
++
++/* 0178: one restart if any are left. true = the link is back, retry the command. */
++static bool
++ufs_try_restart(const char *why, uint32_t hcs)
++{
++	if (su.restarts_left == 0) {
++		return false;
++	}
++	su.restarts_left--;
++	su.restarts_done++;
++	uint64_t t0 = mach_absolute_time(), ns;
++	printf("SWEET UFS: link restart %u (%s, hcs 0x%x), %u left\n", su.restarts_done, why, hcs,
++	    su.restarts_left);
++	int err = ufs_link_restart();
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET UFS: link restart %u %s (%d) in %llu ms\n", su.restarts_done,
++	    err ? "FAILED" : "ok", err, ns / NSEC_PER_MSEC);
++	if (err) {
++		return false;
++	}
++	su.timeouts_in_row = 0;
++	return true;
++}
++
+ /* Response UPIU: response at 6, status at 7, residual at 12, fixed sense at 34. */
+ #define UPIU_STATUS_CHECK       0x02
+ #define UPIU_STATUS_BUSY        0x08
+@@ -352,14 +689,30 @@ again:
+ 			bool link_gone = (hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY) ||
+ 			    (ufs_rd(REG_UTRLDBR) & 1);
+ 			if (su.gone_check && link_gone) {
++				if (ufs_try_restart("link down at timeout", hcs)) {
++					attempt = 0;
++					goto again;
++				}
+ 				ufs_mark_gone("link down at timeout", hcs);
+ 				return ENXIO;
+ 			}
++			/*
++			 * 0178: every W7 drop so far timed out with is 0x4 (UIC error) and hcs 0x10f; retrying
++			 * that only spends 20 s per command before the two-in-a-row rule fires. Restart at once.
++			 */
++			if (su.gone_check && (is & IS_UE) && ufs_try_restart("UIC error at timeout", hcs)) {
++				attempt = 0;
++				goto again;
++			}
+ 			if (attempt++ < UFS_RETRIES) {
+ 				goto again;
+ 			}
+ 			/* Link looks up but nothing answers: two such commands in a row is a dead device. */
+ 			if (su.gone_check && ++su.timeouts_in_row >= 2) {
++				if (ufs_try_restart("two commands timed out in a row", hcs)) {
++					attempt = 0;
++					goto again;
++				}
+ 				ufs_mark_gone("two commands timed out in a row", hcs);
+ 				return ENXIO;
+ 			}
+@@ -730,20 +1083,8 @@ ufs_take_over_host(void)
+ 		    su.dma_pa);
+ 		return ENXIO;
+ 	}
+-	ufs_wr(REG_IE, 0);                      /* polled operation */
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));
+-	ufs_wr(REG_UTRLRSR, 0);
+-	uint64_t list = su.dma_pa + DMA_UTRL;
+-	ufs_wr(REG_UTRLBA, (uint32_t)list);
+-	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+-	ufs_wr(REG_UTRLRSR, 1);
+ 	/* Never ring a doorbell unless the host uses our list. */
+-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+-		printf("SWEET UFS: host did not take our request list\n");
+-		return EIO;
+-	}
+-	return 0;
++	return ufs_start_list();
+ }
+ 
+ static int
+@@ -1098,6 +1439,9 @@ sweet_ufs_init(void)
+ 	uint32_t gone_check = 1;
+ 	PE_parse_boot_argn("sweetufsgone", &gone_check, sizeof(gone_check));
+ 	su.gone_check = (gone_check != 0);
++	uint32_t restarts = 0;
++	PE_parse_boot_argn("sweetufsrestart", &restarts, sizeof(restarts));
++	su.restarts_left = su.gone_check ? MIN(restarts, 16u) : 0;     /* 0178; needs the 0176 gone checks */
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -1115,6 +1459,9 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++	if (!error && su.restarts_left) {
++		ufs_link_snapshot();            /* 0178: ABL's link settings, before any command can need a restart */
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
