@@ -1,0 +1,208 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9d1e743..fa1d12f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -295,16 +295,31 @@ static struct {
+ 	uint32_t hce;
+ } ufs_snap;
+ 
+-/* One UIC command, polled. Returns 0, EBUSY (not ready), ETIMEDOUT or EIO (nonzero result). */
+-static int
+-ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
++/*
++ * 0179: wait until (reg & mask) != 0, by the clock. 0178 counted delay(1) calls, and on the phone
++ * 500000 of them took ~8 s instead of 0.5 s (three link startup tries: 24 s under the disk lock).
++ */
++static bool
++ufs_wait_set(uint32_t reg, uint32_t mask, uint32_t us)
+ {
+-	unsigned i;
++	uint64_t deadline;
+ 
+-	for (i = 0; i < UIC_TIMEOUT_US && !(ufs_rd(REG_HCS) & HCS_UCRDY); i++) {
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while (!(ufs_rd(reg) & mask)) {
++		if (mach_absolute_time() > deadline) {
++			return (ufs_rd(reg) & mask) != 0;
++		}
+ 		delay(1);
+ 	}
+-	if (!(ufs_rd(REG_HCS) & HCS_UCRDY)) {
++	return true;
++}
++
++/* One UIC command, polled. Returns 0, EBUSY (not ready), ETIMEDOUT or EIO (nonzero result). */
++static int
++ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
++{
++	if (!ufs_wait_set(REG_HCS, HCS_UCRDY, UIC_TIMEOUT_US)) {
+ 		return EBUSY;
+ 	}
+ 	ufs_wr(REG_IS, IS_UCCS | IS_UPMS);
+@@ -313,10 +328,7 @@ ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
+ 	ufs_wr(REG_UIC_ARG3, arg3);
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_UIC_CMD, cmd);
+-	for (i = 0; i < UIC_TIMEOUT_US && !(ufs_rd(REG_IS) & IS_UCCS); i++) {
+-		delay(1);
+-	}
+-	if (!(ufs_rd(REG_IS) & IS_UCCS)) {
++	if (!ufs_wait_set(REG_IS, IS_UCCS, UIC_TIMEOUT_US)) {
+ 		return ETIMEDOUT;
+ 	}
+ 	ufs_wr(REG_IS, IS_UCCS);
+@@ -451,6 +463,111 @@ ufs_hce_cycle(void)
+ 	return 0;
+ }
+ 
++/*
++ * 0179: one device-management UPIU in slot 0, no data (NOP OUT or QUERY REQUEST). The 0178 boot showed
++ * link startup resets the device (sense 6/29/00 on the first command after it), and then every LU
++ * answers 2/04/02 until the host sets fDeviceInit, as ufshcd_probe_hba does after every link startup:
++ * ufshcd_verify_dev_init (NOP OUT, 10 tries, 30 ms each, ufshcd.c:233-235) and ufshcd_complete_dev_init
++ * (SET FLAG fDeviceInit, then READ FLAG until the device clears it, 5 s, ufshcd.c:5728-5770).
++ * UPIU layout: vendor ufs.h:95-131,474-483 and include/uapi/scsi/ufs/ufs.h:9,90-91 (same commit as 0178);
++ * header bytes 0-3 = type, flags, LUN, tag; byte 5 = query function; bytes 12-15 = opcode, IDN, index,
++ * selector; response byte 6 = response code, value big-endian at bytes 20-23 (flag = bit 0 of byte 23).
++ * The UTRD is the one ufs_scsi builds (command type UFS storage, as ufshcd.c:3578-3580 for UFSHCI > 1.0).
++ */
++#define UPIU_NOP_OUT            0x00
++#define UPIU_NOP_IN             0x20
++#define UPIU_QUERY_REQ          0x16
++#define UPIU_QUERY_RSP          0x36
++#define QUERY_FN_READ           0x01
++#define QUERY_FN_WRITE          0x81
++#define QUERY_OP_READ_FLAG      0x05
++#define QUERY_OP_SET_FLAG       0x06
++#define FLAG_FDEVICEINIT        0x01
++
++static int
++ufs_devcmd(uint8_t type, uint8_t fn, uint8_t op, uint8_t idn, uint32_t timeout_ms, uint8_t *resp_type,
++    uint8_t *flag)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = type;
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = fn;
++	ucd->cmd[12] = op;
++	ucd->cmd[13] = idn;
++	utrd->dw0 = (1u << 28) | (1u << 24);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UTRLDBR, 1);
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime((uint64_t)timeout_ms * NSEC_PER_MSEC, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_retire();
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	*resp_type = ucd->resp[0];
++	if (flag) {
++		*flag = ucd->resp[23] & 1;
++	}
++	if ((utrd->dw2 & 0xff) || ucd->resp[6]) {
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++ufs_device_init(void)
++{
++	uint8_t rt = 0, flag = 1;
++	int err = ETIMEDOUT;
++	unsigned i;
++
++	for (i = 0; i < 10 && err == ETIMEDOUT; i++) {
++		err = ufs_devcmd(UPIU_NOP_OUT, 0, 0, 0, 30, &rt, NULL);
++	}
++	if (err || rt != UPIU_NOP_IN) {
++		printf("SWEET UFS: restart: NOP OUT failed (%d, upiu 0x%x, %u tries)\n", err, rt, i);
++		return err ? err : EIO;
++	}
++	for (i = 0; i < 3 && (err = ufs_devcmd(UPIU_QUERY_REQ, QUERY_FN_WRITE, QUERY_OP_SET_FLAG,
++	    FLAG_FDEVICEINIT, 1500, &rt, NULL)); i++) {
++	}
++	if (err || rt != UPIU_QUERY_RSP) {
++		printf("SWEET UFS: restart: set fDeviceInit failed (%d, upiu 0x%x)\n", err, rt);
++		return err ? err : EIO;
++	}
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	do {
++		err = ufs_devcmd(UPIU_QUERY_REQ, QUERY_FN_READ, QUERY_OP_READ_FLAG, FLAG_FDEVICEINIT, 1500,
++		    &rt, &flag);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (!err && flag) {
++			delay(1000);
++		}
++	} while ((err || flag) && ns < 5ull * NSEC_PER_SEC);
++	printf("SWEET UFS: restart: device init: NOP ok, fDeviceInit %s after %llu ms (err %d)\n",
++	    flag ? "STILL SET" : "cleared", ns / NSEC_PER_MSEC, err);
++	return (err || flag) ? (err ? err : ETIMEDOUT) : 0;
++}
++
+ /* Called with sweet_ufs_lock held, slot 0 retired. Returns 0 with the link back at ABL's power mode. */
+ static int
+ ufs_link_restart(void)
+@@ -488,8 +605,8 @@ ufs_link_restart(void)
+ 		}
+ 	}
+ 	err = ufs_dme_set(UIC_MIB(PA_PWRMODE), ufs_snap.pwrmode);
+-	for (i = 0; !err && i < UIC_TIMEOUT_US && !(ufs_rd(REG_IS) & IS_UPMS); i++) {
+-		delay(1);
++	if (!err) {
++		(void)ufs_wait_set(REG_IS, IS_UPMS, UIC_TIMEOUT_US);
+ 	}
+ 	hcs = ufs_rd(REG_HCS);
+ 	if (!err && (!(ufs_rd(REG_IS) & IS_UPMS) || HCS_UPMCRS(hcs) != UPMCRS_PWR_LOCAL)) {
+@@ -514,7 +631,7 @@ ufs_link_restart(void)
+ 	(void)ufs_rd(REG_UECN);
+ 	(void)ufs_rd(REG_UECT);
+ 	(void)ufs_rd(REG_UECDME);
+-	return 0;
++	return ufs_device_init();
+ }
+ 
+ /* 0178: one restart if any are left. true = the link is back, retry the command. */
+@@ -534,6 +651,11 @@ ufs_try_restart(const char *why, uint32_t hcs)
+ 	printf("SWEET UFS: link restart %u %s (%d) in %llu ms\n", su.restarts_done,
+ 	    err ? "FAILED" : "ok", err, ns / NSEC_PER_MSEC);
+ 	if (err) {
++		/*
++		 * 0179: the 0178 boot went on ringing doorbells after a failed restart (1130 ocs 0xf lines):
++		 * the HCE reset had stopped the request list. The link is known dead, so the device is gone.
++		 */
++		ufs_mark_gone("link restart failed", ufs_rd(REG_HCS));
+ 		return false;
+ 	}
+ 	su.timeouts_in_row = 0;
+@@ -704,6 +826,9 @@ again:
+ 				attempt = 0;
+ 				goto again;
+ 			}
++			if (su.gone) {
++				return ENXIO;           /* 0179: that restart failed */
++			}
+ 			if (attempt++ < UFS_RETRIES) {
+ 				goto again;
+ 			}

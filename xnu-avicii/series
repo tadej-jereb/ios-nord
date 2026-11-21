@@ -171,3 +171,4 @@ apply 0175-avicii-wifi-ufs-rails-vote.patch
 apply 0176-avicii-ufs-fail-fast-when-gone.patch
 apply 0177-avicii-ufs-retire-wait-msa-bound.patch
 apply 0178-avicii-ufs-link-restart.patch
+apply 0179-avicii-ufs-restart-device-init.patch
