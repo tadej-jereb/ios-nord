@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_modem_svc.c b/bsd/dev/sweet_modem_svc.c
+index 139f900..7438d97 100644
+--- a/bsd/dev/sweet_modem_svc.c
++++ b/bsd/dev/sweet_modem_svc.c
+@@ -1171,7 +1171,8 @@ w_on_msa_info(const uint8_t *d, uint32_t len, bool assign)
+ 		memcpy(&addr, e, 8);
+ 		memcpy(&size, e + 8, 4);
+ 		MLOG("step W7:  MSA region %u: %#llx + %#x secure %u", i, addr, size, (unsigned)e[12]);
+-		if (addr < WLFW_MSA_BASE || addr + size > WLFW_MSA_BASE + WLFW_MSA_SIZE) {
++		/* 0177: no addr + size (a u64 addr near 2^64 wraps it past the check) */
++		if (addr < WLFW_MSA_BASE || size > WLFW_MSA_SIZE || addr - WLFW_MSA_BASE > WLFW_MSA_SIZE - size) {
+ 			MLOG("step W7:  out of the MSA window %#llx+%#llx, skipped", WLFW_MSA_BASE, WLFW_MSA_SIZE);
+ 			continue;
+ 		}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2fcec36..2992684 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -179,6 +179,14 @@ ufs_retire(void)
+ 	}
+ 	if (ufs_rd(REG_UTRLDBR) & 1) {
+ 		ufs_wr(REG_UTRLCLR, ~1u);
++		/*
++		 * 0177: the controller drops the doorbell bit only once the clear has taken effect.
++		 * 0176 reads UTRLDBR right after this to decide "device gone", so wait (up to 10 ms)
++		 * instead of judging a clear that is still in flight.
++		 */
++		for (int i = 0; i < 100 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++			delay(100);
++		}
+ 	}
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+ }
